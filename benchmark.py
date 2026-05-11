@@ -147,9 +147,9 @@ def run_one_seed(optimizer_cls, opt_kwargs, cfg, seed, track_gates=False):
 # Multi-seed runner
 # ---------------------------------------------------------------------------
 
-def run_experiment(cfg):
+def run_experiment(cfg, gate_type="snr"):
     snr_kwargs = dict(
-        lr=cfg.lr, weight_decay=cfg.weight_decay, gate="soft", rho=0.99,
+        lr=cfg.lr, weight_decay=cfg.weight_decay, gate=gate_type, rho=0.99,
         alpha="finite", batch_size=cfg.batch_size, dataset_size=cfg.n_train,
     )
     adam_kwargs = dict(lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -185,7 +185,7 @@ def plot_band(ax, steps, data, label, color, alpha=0.25):
 # Figures
 # ---------------------------------------------------------------------------
 
-def make_figures(snr_results, adam_results, cfg, out_dir):
+def make_figures(snr_results, adam_results, cfg, out_dir, gate_type="snr"):
     os.makedirs(out_dir, exist_ok=True)
     eval_every = 10
     steps = list(range(0, cfg.n_steps, eval_every))
@@ -201,17 +201,21 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
     snr_perr = to_stack(snr_results, "param_errors")
     adam_perr = to_stack(adam_results, "param_errors")
 
+    gate_label = gate_type.upper()
+    snr_name = f"SNRAdamW ({gate_label})"
+    suffix = f"_{gate_type}"
+
     # ---- Figure 1: Main 2x2 comparison ----
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     fig.suptitle(
-        f"SNRAdamW vs AdamW: Sparse Regression  "
+        f"{snr_name} vs AdamW: Sparse Regression  "
         f"(d={cfg.d}, k={cfg.k}, n={cfg.n_train}, noise={cfg.sigma_noise}, "
         f"{cfg.n_seeds} seeds)",
         fontsize=13, fontweight="bold",
     )
 
     ax = axes[0, 0]
-    plot_band(ax, steps, snr_train, "SNRAdamW", "tab:blue")
+    plot_band(ax, steps, snr_train, snr_name, "tab:blue")
     plot_band(ax, steps, adam_train, "AdamW", "tab:orange")
     ax.axhline(irreducible, ls="--", color="gray", alpha=0.6,
                label=f"Irreducible ({irreducible:.0f})")
@@ -223,7 +227,7 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
     ax = axes[0, 1]
     snr_excess = snr_test - irreducible
     adam_excess = adam_test - irreducible
-    plot_band(ax, steps, snr_excess, "SNRAdamW", "tab:blue")
+    plot_band(ax, steps, snr_excess, snr_name, "tab:blue")
     plot_band(ax, steps, adam_excess, "AdamW", "tab:orange")
     ax.axhline(0, ls="--", color="gray", alpha=0.4)
     ax.set_ylabel("Excess Test MSE")
@@ -232,7 +236,7 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
     ax.legend(fontsize=9)
 
     ax = axes[1, 0]
-    plot_band(ax, steps, snr_perr, "SNRAdamW", "tab:blue")
+    plot_band(ax, steps, snr_perr, snr_name, "tab:blue")
     plot_band(ax, steps, adam_perr, "AdamW", "tab:orange")
     ax.set_ylabel("||w - w*||")
     ax.set_xlabel("Step")
@@ -246,21 +250,22 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
     plot_band(ax, steps, snr_ng, f"Noise params ({cfg.d - cfg.k})", "tab:red")
     ax.set_ylabel("Mean Gate Value")
     ax.set_xlabel("Step")
-    ax.set_title("(d) SNRAdamW Gate Values")
+    ax.set_title(f"(d) {snr_name} Gate Values")
     ax.legend(fontsize=9)
     ax.set_ylim(-0.05, 1.05)
 
     plt.tight_layout()
-    path = os.path.join(out_dir, "benchmark_main.png")
+    path = os.path.join(out_dir, f"benchmark_main{suffix}.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved: {path}")
 
     # ---- Figure 2: Weight scatter (seed 0) ----
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle("Weight Recovery (seed 0)", fontsize=13, fontweight="bold")
+    fig.suptitle(f"Weight Recovery - {snr_name} vs AdamW (seed 0)",
+                 fontsize=13, fontweight="bold")
     for ax, res, name, color in [
-        (axes[0], snr_results[0], "SNRAdamW", "tab:blue"),
+        (axes[0], snr_results[0], snr_name, "tab:blue"),
         (axes[1], adam_results[0], "AdamW", "tab:orange"),
     ]:
         w = res.final_weights
@@ -281,20 +286,20 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
 
     plt.tight_layout()
-    path = os.path.join(out_dir, "benchmark_weights.png")
+    path = os.path.join(out_dir, f"benchmark_weights{suffix}.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved: {path}")
 
     # ---- Figure 3: Summary bars ----
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
-    fig.suptitle("Final Metrics (mean +/- std across seeds)",
+    fig.suptitle(f"Final Metrics - {snr_name} vs AdamW (mean +/- std, {cfg.n_seeds} seeds)",
                  fontsize=13, fontweight="bold")
 
     snr_final_ex = snr_excess[:, -1]
     adam_final_ex = adam_excess[:, -1]
     ax = axes[0]
-    ax.bar(["SNRAdamW", "AdamW"],
+    ax.bar([snr_name, "AdamW"],
            [snr_final_ex.mean(), adam_final_ex.mean()],
            yerr=[snr_final_ex.std(), adam_final_ex.std()],
            color=["tab:blue", "tab:orange"], capsize=8)
@@ -303,7 +308,7 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
 
     snr_pe = snr_perr[:, -1]; adam_pe = adam_perr[:, -1]
     ax = axes[1]
-    ax.bar(["SNRAdamW", "AdamW"],
+    ax.bar([snr_name, "AdamW"],
            [snr_pe.mean(), adam_pe.mean()],
            yerr=[snr_pe.std(), adam_pe.std()],
            color=["tab:blue", "tab:orange"], capsize=8)
@@ -313,7 +318,7 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
     snr_nm = torch.tensor([r.final_weights[noise_mask].norm().item() for r in snr_results])
     adam_nm = torch.tensor([r.final_weights[noise_mask].norm().item() for r in adam_results])
     ax = axes[2]
-    ax.bar(["SNRAdamW", "AdamW"],
+    ax.bar([snr_name, "AdamW"],
            [snr_nm.mean(), adam_nm.mean()],
            yerr=[snr_nm.std(), adam_nm.std()],
            color=["tab:blue", "tab:orange"], capsize=8)
@@ -321,7 +326,7 @@ def make_figures(snr_results, adam_results, cfg, out_dir):
     ax.set_title("(c) Noise Feature Mass")
 
     plt.tight_layout()
-    path = os.path.join(out_dir, "benchmark_summary.png")
+    path = os.path.join(out_dir, f"benchmark_summary{suffix}.png")
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved: {path}")
@@ -340,23 +345,27 @@ if __name__ == "__main__":
           f"batch={cfg.batch_size}, steps={cfg.n_steps}, seeds={cfg.n_seeds}")
     print()
 
-    print("Running experiments...")
-    snr_results, adam_results = run_experiment(cfg)
-    print()
-
-    print("Generating figures...")
-    make_figures(snr_results, adam_results, cfg, out_dir)
-    print()
-
     irreducible = cfg.sigma_noise ** 2
-    snr_ex = to_stack(snr_results, "test_losses")[:, -1] - irreducible
-    adam_ex = to_stack(adam_results, "test_losses")[:, -1] - irreducible
-    print(f"Final excess test MSE:")
-    print(f"  SNRAdamW: {snr_ex.mean():.4f} +/- {snr_ex.std():.4f}")
-    print(f"  AdamW:    {adam_ex.mean():.4f} +/- {adam_ex.std():.4f}")
 
-    snr_pe = to_stack(snr_results, "param_errors")[:, -1]
-    adam_pe = to_stack(adam_results, "param_errors")[:, -1]
-    print(f"Final parameter error ||w - w*||:")
-    print(f"  SNRAdamW: {snr_pe.mean():.4f} +/- {snr_pe.std():.4f}")
-    print(f"  AdamW:    {adam_pe.mean():.4f} +/- {adam_pe.std():.4f}")
+    for gate_type in ["snr", "soft"]:
+        print(f"=== gate={gate_type!r} ===")
+        print("Running experiments...")
+        snr_results, adam_results = run_experiment(cfg, gate_type=gate_type)
+        print()
+
+        print("Generating figures...")
+        make_figures(snr_results, adam_results, cfg, out_dir, gate_type=gate_type)
+        print()
+
+        snr_ex = to_stack(snr_results, "test_losses")[:, -1] - irreducible
+        adam_ex = to_stack(adam_results, "test_losses")[:, -1] - irreducible
+        print(f"Final excess test MSE:")
+        print(f"  SNRAdamW ({gate_type}): {snr_ex.mean():.4f} +/- {snr_ex.std():.4f}")
+        print(f"  AdamW:                  {adam_ex.mean():.4f} +/- {adam_ex.std():.4f}")
+
+        snr_pe = to_stack(snr_results, "param_errors")[:, -1]
+        adam_pe = to_stack(adam_results, "param_errors")[:, -1]
+        print(f"Final parameter error ||w - w*||:")
+        print(f"  SNRAdamW ({gate_type}): {snr_pe.mean():.4f} +/- {snr_pe.std():.4f}")
+        print(f"  AdamW:                  {adam_pe.mean():.4f} +/- {adam_pe.std():.4f}")
+        print()
