@@ -92,7 +92,7 @@ def compute_gate(
     m_hat: Tensor,
     s_hat: Tensor,
     *,
-    gate: GateType = "soft",
+    gate: GateType = "snr",
     alpha: float = 1.0,
     lambda_pop: float = 1.0,
     gate_eps: float = 1e-12,
@@ -157,7 +157,7 @@ class SNRAdamW(Optimizer):
         optimizer = SNRAdamW(
             model.parameters(),
             lr=3e-4,
-            gate="soft",          # "soft" paper default, "snr" smoother shrinker, or "hard"
+            gate="snr",           # "snr" (default), "soft" (paper Algorithm 1), or "hard"
             lambda_pop=1.0,
             alpha="online",       # or "finite" with batch_size + dataset_size
             rho=0.99,
@@ -193,7 +193,7 @@ class SNRAdamW(Optimizer):
         eps: float = 1e-8,
         gate_eps: float = 1e-12,
         weight_decay: float = 0.0,
-        gate: GateType = "soft",
+        gate: GateType = "snr",
         lambda_pop: float = 1.0,
         alpha: AlphaSpec = "online",
         batch_size: Optional[int] = None,

@@ -34,7 +34,7 @@ class TestSNRAdamWConstruction:
     def test_default_construction(self):
         model = nn.Linear(5, 1)
         opt = SNRAdamW(model.parameters())
-        assert opt.defaults["gate"] == "soft"
+        assert opt.defaults["gate"] == "snr"
         assert opt.defaults["alpha"] == "online"
 
     @pytest.mark.parametrize("gate", ["soft", "snr", "hard"])

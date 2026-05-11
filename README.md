@@ -45,14 +45,22 @@ Three gating strategies are available via the `gate` parameter:
 
 | Gate     | Formula | Notes |
 |----------|---------|-------|
-| `"soft"` | `relu(m^2 - a*s) / (relu(m^2 - a*s) + l*s + eps)` | Paper default (Algorithm 1) |
-| `"snr"`  | `m^2 / (m^2 + l*s + eps)` | Smoother SNR shrinker |
+| `"snr"`  | `m^2 / (m^2 + l*s + eps)` | **Default.** Smooth SNR shrinker, robust out of the box |
+| `"soft"` | `relu(m^2 - a*s) / (relu(m^2 - a*s) + l*s + eps)` | Paper Algorithm 1. Has hard threshold floor at `m^2 = a*s` |
 | `"hard"` | `1[m^2 > a*s]` | Binary gate for ablations |
 
 Where `m` = bias-corrected first moment, `s` = bias-corrected gradient variance EMA, `a` = alpha, `l` = lambda_pop.
 
+> **Why `"snr"` is the default instead of the paper's `"soft"`:** The soft gate has a hard
+> threshold floor — when `m^2 < alpha * s`, the gate is exactly zero. In practice this can
+> shut down too many parameters, especially in overparameterized models where most gradients
+> are noisy. The SNR gate degrades gracefully: every parameter gets an update proportional to
+> its signal-to-noise ratio, with no cliff. It is also less sensitive to `alpha` and
+> `lambda_pop`, making it easier to use without tuning. Use `gate="soft"` if you want the
+> paper's exact Algorithm 1 formulation.
+
 ```python
-optimizer = SNRAdamW(model.parameters(), lr=3e-4, gate="snr")
+optimizer = SNRAdamW(model.parameters(), lr=3e-4, gate="soft")  # paper default
 ```
 
 ## Finite-dataset correction
@@ -118,7 +126,7 @@ if stats:
 | `eps` | `float` | `1e-8` | Adam denominator epsilon |
 | `gate_eps` | `float` | `1e-12` | Gate denominator epsilon |
 | `weight_decay` | `float` | `0.0` | Decoupled weight decay |
-| `gate` | `"soft" \| "snr" \| "hard"` | `"soft"` | Gate type |
+| `gate` | `"soft" \| "snr" \| "hard"` | `"snr"` | Gate type (see Gate types) |
 | `lambda_pop` | `float` | `1.0` | Population-risk scaling factor |
 | `alpha` | `float \| "online" \| "finite"` | `"online"` | Leave-one-out coefficient |
 | `batch_size` | `int \| None` | `None` | Required when `alpha="finite"` |
