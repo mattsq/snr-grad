@@ -19,6 +19,11 @@ class TestResolveAlpha:
         assert result == float(value)
         assert isinstance(result, float)
 
+    @pytest.mark.parametrize("value", [-1, -0.5, -100])
+    def test_negative_alpha_raises(self, value):
+        with pytest.raises(ValueError, match="non-negative"):
+            resolve_alpha(value)
+
     @pytest.mark.parametrize("key", ["online", "fresh", "fresh_batch"])
     def test_online_aliases(self, key):
         assert resolve_alpha(key) == 1.0

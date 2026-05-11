@@ -62,6 +62,8 @@ def resolve_alpha(
             Training-set size, required for finite-dataset alpha unless set on optimizer group.
     """
     if isinstance(alpha, (float, int)):
+        if alpha < 0:
+            raise ValueError(f"Numeric alpha must be non-negative, got {alpha}.")
         return float(alpha)
 
     key = alpha.lower()

@@ -20,7 +20,7 @@ uv pip install -e .
 
 ## Quick start
 
-`SNRAdamW` is a drop-in replacement for `torch.optim.AdamW`:
+`SNRAdamW` can be used in place of `torch.optim.AdamW` in standard training loops:
 
 ```python
 from snr_grad import SNRAdamW
@@ -71,14 +71,24 @@ optimizer = SNRAdamW(
 
 ## Exact gradient variance
 
-If you have access to per-sample gradients, you can supply exact variance estimates instead of relying on the streaming EMA:
+If you have access to per-sample gradients (e.g. via `torch.func.vmap`), you can supply exact variance estimates instead of relying on the streaming EMA:
 
 ```python
 from snr_grad import per_sample_variance_term
+import torch.func as F
 
-# per_sample_grads: [batch, *param_shape]
-var_term = per_sample_variance_term(per_sample_grads)
-optimizer.step(grad_variances={param: var_term})
+# Compute per-example gradients with vmap
+def compute_loss(params, buffers, sample, target):
+    prediction = torch.func.functional_call(model, (params, buffers), (sample.unsqueeze(0),))
+    return loss_fn(prediction, target.unsqueeze(0))
+
+ft_compute = F.grad(compute_loss)
+ft_compute_vmap = F.vmap(ft_compute, in_dims=(None, None, 0, 0))
+per_sample_grads = ft_compute_vmap(params, buffers, batch_inputs, batch_targets)
+
+# Build grad_variances dict for each parameter
+grad_variances = {p: per_sample_variance_term(g) for p, g in zip(model.parameters(), per_sample_grads.values())}
+optimizer.step(grad_variances=grad_variances)
 ```
 
 ## Diagnostics
@@ -119,6 +129,14 @@ if stats:
 - **`resolve_alpha(alpha, *, batch_size, dataset_size)`** -- Resolve an alpha spec to a float.
 - **`compute_gate(m_hat, s_hat, *, gate, alpha, lambda_pop, gate_eps)`** -- Compute the gate tensor from bias-corrected moments.
 - **`per_sample_variance_term(per_sample_grads)`** -- Compute exact diagonal variance from per-example gradients.
+
+## Scope
+
+This package implements the **diagonal SNR / population-risk gated AdamW update** (Algorithm 1 from the paper). It does not implement:
+
+- Automatic per-example gradient computation (use `torch.func.vmap` and pass results via `grad_variances`)
+- Multi-epoch total-variation corrections for replayed batches
+- The full leave-one-out estimator pipeline (only the derived diagonal gate is implemented)
 
 ## Citation
 
