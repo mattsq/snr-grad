@@ -6,14 +6,16 @@ The gate suppresses parameter updates that are dominated by gradient noise, allo
 
 ## Installation
 
+Install directly from GitHub:
+
 ```bash
-uv pip install snr-grad
+uv pip install git+https://github.com/mattsq/snr-grad.git
 ```
 
-Or install from source:
+Or clone and install in editable mode for development:
 
 ```bash
-git clone https://github.com/<your-org>/snr-grad.git
+git clone https://github.com/mattsq/snr-grad.git
 cd snr-grad
 uv pip install -e .
 ```
