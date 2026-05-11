@@ -388,3 +388,115 @@ class SNRAdamW(Optimizer):
             self.last_stats = None
 
         return loss
+
+
+def _newton_schulz_orthogonalize(matrix: Tensor, *, steps: int = 5, eps: float = 1e-7) -> Tensor:
+    """Approximate UV^T (semi-orthogonal factor) with Newton-Schulz iteration."""
+    if matrix.ndim != 2:
+        raise ValueError("_newton_schulz_orthogonalize expects a 2D tensor.")
+
+    m = matrix
+    transposed = False
+    if m.shape[0] < m.shape[1]:
+        m = m.t()
+        transposed = True
+
+    norm = m.norm() + eps
+    y = m / norm
+    eye = torch.eye(y.shape[1], dtype=y.dtype, device=y.device)
+    for _ in range(steps):
+        yty = y.transpose(0, 1) @ y
+        y = 0.5 * y @ (3.0 * eye - yty)
+
+    if transposed:
+        y = y.t()
+    return y
+
+
+class SNRMuon(Optimizer):
+    """SNR-gated Muon-style optimizer for 2D parameters + AdamW fallback for others."""
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "snr",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        batch_size: Optional[int] = None,
+        dataset_size: Optional[int] = None,
+        maximize: bool = False,
+        muon_ns_steps: int = 5,
+        muon_mode: Literal["post", "pre"] = "post",
+    ):
+        defaults = dict(
+            lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
+            gate=gate, lambda_pop=lambda_pop, alpha=alpha, batch_size=batch_size,
+            dataset_size=dataset_size, maximize=maximize, muon_ns_steps=muon_ns_steps,
+            muon_mode=muon_mode,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Any] = None) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            maximize = group["maximize"]
+            alpha_value = resolve_alpha(group["alpha"], batch_size=group.get("batch_size"), dataset_size=group.get("dataset_size"))
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if maximize:
+                    g = -g
+                st = self.state[p]
+                if len(st) == 0:
+                    st["step"] = 0
+                    st["exp_avg"] = torch.zeros_like(p)
+                    st["exp_avg_sq"] = torch.zeros_like(p)
+                    st["exp_grad_var"] = torch.zeros_like(p)
+                st["step"] += 1
+                t = st["step"]
+
+                m = st["exp_avg"]
+                v = st["exp_avg_sq"]
+                s = st["exp_grad_var"]
+                m_prev = m.clone()
+
+                s.mul_(rho).addcmul_(g - m_prev, g - m_prev, value=1.0 - rho)
+                m.mul_(beta1).add_(g, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+
+                m_hat = m / (1.0 - beta1**t)
+                v_hat = v / (1.0 - beta2**t)
+                s_hat = s / (1.0 - rho**t)
+                q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+
+                if wd != 0:
+                    p.add_(p, alpha=-lr * wd)
+
+                base_update = m_hat / (v_hat.sqrt() + eps)
+                if p.ndim == 2:
+                    if group["muon_mode"] == "pre":
+                        update = _newton_schulz_orthogonalize(q * base_update, steps=group["muon_ns_steps"])
+                    else:
+                        update = q * _newton_schulz_orthogonalize(base_update, steps=group["muon_ns_steps"])
+                else:
+                    update = q * base_update
+                p.add_(update, alpha=-lr)
+        return loss
