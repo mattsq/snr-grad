@@ -123,10 +123,11 @@ if stats:
 ## Citation
 
 ```bibtex
-@article{snr2025,
-    title   = {Population-Risk Preconditioners for SGD},
+@article{litman2026theory,
+    title   = {A Theory of Generalization in Deep Learning},
+    author  = {Litman, Elon and Guo, Gabe},
     journal = {arXiv preprint arXiv:2605.01172},
-    year    = {2025},
+    year    = {2026},
 }
 ```
 
