@@ -101,6 +101,28 @@ grad_variances = {p: per_sample_variance_term(g) for p, g in zip(model.parameter
 optimizer.step(grad_variances=grad_variances)
 ```
 
+
+## Experimental extension: `SNRMuon`
+
+This repo now includes an experimental hybrid optimizer that combines SNR gating with Muon-style orthogonalization for 2D parameters:
+
+- `muon_mode="post"` (default): `q ⊙ Ortho(update)`
+- `muon_mode="pre"`: `Ortho(q ⊙ update)`
+
+Non-2D parameters (biases, norms, vectors) fall back to SNR-gated AdamW-style updates.
+
+```python
+from snr_grad import SNRMuon
+
+optimizer = SNRMuon(
+    model.parameters(),
+    lr=3e-4,
+    gate="snr",
+    muon_mode="post",
+    muon_ns_steps=5,
+)
+```
+
 ## Diagnostics
 
 Enable `track_stats=True` (the default) to inspect gate behaviour after each step:
