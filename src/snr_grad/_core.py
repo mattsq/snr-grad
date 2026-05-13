@@ -500,3 +500,205 @@ class SNRMuon(Optimizer):
                     update = q * base_update
                 p.add_(update, alpha=-lr)
         return loss
+
+
+class RotatedSNRAdamW(Optimizer):
+    """SOAP-style rotated-basis SNRAdamW for 2D parameters (AdamW fallback otherwise)."""
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.95),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "soft",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        basis_beta: float = 0.95,
+        basis_update_interval: int = 50,
+        maximize: bool = False,
+    ):
+        defaults = dict(
+            lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
+            gate=gate, lambda_pop=lambda_pop, alpha=alpha, basis_beta=basis_beta,
+            basis_update_interval=basis_update_interval, maximize=maximize,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Any] = None) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            maximize = group["maximize"]
+            alpha_value = resolve_alpha(group["alpha"])
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if maximize:
+                    g = -g
+                if g.is_sparse:
+                    raise RuntimeError("RotatedSNRAdamW does not support sparse gradients.")
+
+                st = self.state[p]
+                if len(st) == 0:
+                    st["step"] = 0
+                    if p.ndim == 2:
+                        o, i = p.shape
+                        st["L_cov"] = torch.eye(o, device=p.device, dtype=torch.float32)
+                        st["R_cov"] = torch.eye(i, device=p.device, dtype=torch.float32)
+                        st["QL"] = torch.eye(o, device=p.device, dtype=torch.float32)
+                        st["QR"] = torch.eye(i, device=p.device, dtype=torch.float32)
+                        st["M_c"] = torch.zeros_like(p, dtype=torch.float32)
+                        st["V_c"] = torch.zeros_like(p, dtype=torch.float32)
+                        st["S_c"] = torch.zeros_like(p, dtype=torch.float32)
+                    else:
+                        st["exp_avg"] = torch.zeros_like(p)
+                        st["exp_avg_sq"] = torch.zeros_like(p)
+                        st["exp_grad_var"] = torch.zeros_like(p)
+
+                st["step"] += 1
+                t = st["step"]
+
+                if wd != 0:
+                    p.add_(p, alpha=-lr * wd)
+
+                if p.ndim != 2:
+                    m, v, s = st["exp_avg"], st["exp_avg_sq"], st["exp_grad_var"]
+                    m_prev = m.clone()
+                    s.mul_(rho).addcmul_(g - m_prev, g - m_prev, value=1 - rho)
+                    m.mul_(beta1).add_(g, alpha=1 - beta1)
+                    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                    m_hat = m / (1 - beta1**t)
+                    v_hat = v / (1 - beta2**t)
+                    s_hat = s / (1 - rho**t)
+                    q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    p.add_(q * m_hat / (v_hat.sqrt() + eps), alpha=-lr)
+                    continue
+
+                G = g.float()
+                basis_beta = group["basis_beta"]
+                st["L_cov"].mul_(basis_beta).add_(G @ G.t(), alpha=1 - basis_beta)
+                st["R_cov"].mul_(basis_beta).add_(G.t() @ G, alpha=1 - basis_beta)
+
+                if t % group["basis_update_interval"] == 0:
+                    QL_old, QR_old = st["QL"], st["QR"]
+                    _, QL_new = torch.linalg.eigh(st["L_cov"])
+                    _, QR_new = torch.linalg.eigh(st["R_cov"])
+                    A = QL_new.t() @ QL_old
+                    B = QR_old.t() @ QR_new
+                    st["M_c"] = A @ st["M_c"] @ B
+                    st["S_c"] = A.square() @ st["S_c"] @ B.square()
+                    st["V_c"] = A.square() @ st["V_c"] @ B.square()
+                    st["QL"], st["QR"] = QL_new, QR_new
+
+                QL, QR = st["QL"], st["QR"]
+                Gc = QL.t() @ G @ QR
+                M, V, S = st["M_c"], st["V_c"], st["S_c"]
+                M_prev = M.clone()
+                S.mul_(rho).addcmul_(Gc - M_prev, Gc - M_prev, value=1 - rho)
+                M.mul_(beta1).add_(Gc, alpha=1 - beta1)
+                V.mul_(beta2).addcmul_(Gc, Gc, value=1 - beta2)
+
+                M_hat = M / (1 - beta1**t)
+                V_hat = V / (1 - beta2**t)
+                S_hat = S / (1 - rho**t)
+                q = compute_gate(M_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                Uc = q * M_hat / (V_hat.sqrt() + eps)
+                update = QL @ Uc @ QR.t()
+                p.add_(update.to(dtype=p.dtype), alpha=-lr)
+        return loss
+
+
+class SpectralSNRMuon(Optimizer):
+    """SVD-basis SNR gating with diagonal or full spectral coefficients."""
+
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag"):
+        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Any] = None) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if g.is_sparse:
+                    raise RuntimeError("SpectralSNRMuon does not support sparse gradients.")
+                if p.ndim != 2:
+                    continue
+                st = self.state[p]
+                if len(st) == 0:
+                    st["step"] = 0
+                    st["M"] = torch.zeros_like(p, dtype=torch.float32)
+                    if group["mode"] == "diag":
+                        r = min(p.shape)
+                        st["a"] = torch.zeros(r, device=p.device)
+                        st["s"] = torch.zeros(r, device=p.device)
+                        st["v"] = torch.zeros(r, device=p.device)
+                    else:
+                        r = min(p.shape)
+                        st["A"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                        st["S"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                        st["V"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                st["step"] += 1
+                t = st["step"]
+                G = g.float()
+                M = st["M"]
+                M.mul_(group["momentum"]).add_(G, alpha=1 - group["momentum"])
+                U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+                V = Vh.t()
+                C = U.t() @ G @ V
+                b1, b2 = group["betas"]
+                rho = group["rho"]
+                alpha_value = resolve_alpha(group["alpha"])
+                if group["mode"] == "diag":
+                    c = C.diag()
+                    a, s, v = st["a"], st["s"], st["v"]
+                    a_prev = a.clone()
+                    s.mul_(rho).addcmul_(c - a_prev, c - a_prev, value=1 - rho)
+                    a.mul_(b1).add_(c, alpha=1 - b1)
+                    v.mul_(b2).addcmul_(c, c, value=1 - b2)
+                    a_hat = a / (1 - b1**t)
+                    s_hat = s / (1 - rho**t)
+                    v_hat = v / (1 - b2**t)
+                    q = compute_gate(a_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    if group["variant"] == "muon_spectral_gate":
+                        d = q
+                    else:
+                        d = q * a_hat / (v_hat.sqrt() + group["eps"])
+                    D = U @ torch.diag(d) @ V.t()
+                else:
+                    A, S, Vst = st["A"], st["S"], st["V"]
+                    A_prev = A.clone()
+                    S.mul_(rho).addcmul_(C - A_prev, C - A_prev, value=1 - rho)
+                    A.mul_(b1).add_(C, alpha=1 - b1)
+                    Vst.mul_(b2).addcmul_(C, C, value=1 - b2)
+                    A_hat = A / (1 - b1**t)
+                    S_hat = S / (1 - rho**t)
+                    V_hat = Vst / (1 - b2**t)
+                    q = compute_gate(A_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    coeff = q if group["variant"] == "muon_spectral_gate" else q * A_hat / (V_hat.sqrt() + group["eps"])
+                    D = U @ coeff @ V.t()
+                if group["weight_decay"] != 0:
+                    p.add_(p, alpha=-group["lr"] * group["weight_decay"])
+                p.add_(D.to(dtype=p.dtype), alpha=-group["lr"])
+        return loss
