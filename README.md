@@ -216,7 +216,7 @@ Metrics tracked: relative Frobenius error, left/right singular subspace alignmen
 
 ## Diagnostics
 
-Enable `track_stats=True` (the default) to inspect gate behaviour after each step:
+Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):
 
 ```python
 stats = optimizer.last_stats  # SNRAdamWStats or None
@@ -245,7 +245,7 @@ if stats:
 | `batch_size` | `int \| None` | `None` | Required when `alpha="finite"` |
 | `dataset_size` | `int \| None` | `None` | Required when `alpha="finite"` |
 | `maximize` | `bool` | `False` | Maximize the objective instead of minimizing |
-| `track_stats` | `bool` | `True` | Collect per-step gate diagnostics |
+| `track_stats` | `bool` | `False` | Collect per-step gate diagnostics |
 
 ### Helper functions
 

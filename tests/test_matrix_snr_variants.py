@@ -31,3 +31,12 @@ def test_spectral_snr_muon_diag_and_full_run():
         opt = SpectralSNRMuon(model.parameters(), lr=1e-3, mode=mode, variant="adam_spectral_gate")
         _run_steps(model, opt)
         assert not torch.equal(before, model[0].weight.detach())
+
+
+def test_spectral_snr_muon_updates_non_2d_params_via_fallback():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 8, bias=True), nn.ReLU(), nn.Linear(8, 1, bias=True))
+    before_bias = model[0].bias.detach().clone()
+    opt = SpectralSNRMuon(model.parameters(), lr=1e-3, mode="diag", variant="adam_spectral_gate")
+    _run_steps(model, opt)
+    assert not torch.equal(before_bias, model[0].bias.detach())

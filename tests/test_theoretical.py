@@ -91,6 +91,22 @@ class TestGateBoundaries:
 
 class TestSNRGateIdentity:
 
+    def test_snr_gate_half_at_boundary_when_lambda_one(self):
+        """At m^2 = alpha*s and lambda_pop=1, snr gate is exactly 1/2."""
+        alpha = 2.0
+        s_hat = torch.tensor([3.0])
+        m_hat = torch.tensor([(alpha * s_hat.item()) ** 0.5])
+        q = compute_gate(m_hat, s_hat, gate="snr", alpha=alpha, lambda_pop=1.0)
+        assert q.item() == pytest.approx(0.5, abs=1e-8)
+
+    def test_snr_gate_changes_with_alpha(self):
+        """Finite alpha must affect the snr gate."""
+        m_hat = torch.tensor([2.0])
+        s_hat = torch.tensor([1.0])
+        q_alpha1 = compute_gate(m_hat, s_hat, gate="snr", alpha=1.0, lambda_pop=1.0)
+        q_alpha3 = compute_gate(m_hat, s_hat, gate="snr", alpha=3.0, lambda_pop=1.0)
+        assert q_alpha3.item() < q_alpha1.item()
+
     def test_snr_formula_batch(self):
         """Verify the SNR gate matches its closed-form for random inputs."""
         torch.manual_seed(123)

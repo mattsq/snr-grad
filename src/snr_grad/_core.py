@@ -112,7 +112,7 @@ def compute_gate(
         return delta / (delta + lambda_pop * s_hat + gate_eps)
 
     if gate == "snr":
-        return m2 / (m2 + lambda_pop * s_hat + gate_eps)
+        return m2 / (m2 + alpha * lambda_pop * s_hat + gate_eps)
 
     raise ValueError(f"Unknown gate: {gate!r}. Expected 'soft', 'snr', or 'hard'.")
 
@@ -199,7 +199,7 @@ class SNRAdamW(Optimizer):
         batch_size: Optional[int] = None,
         dataset_size: Optional[int] = None,
         maximize: bool = False,
-        track_stats: bool = True,
+        track_stats: bool = False,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -319,9 +319,8 @@ class SNRAdamW(Optimizer):
                 step_num: int = state["step"]
 
                 # Paper's variance state uses previous first moment m_{t-1}.
-                m_prev = exp_avg.clone()
-
-                exp_grad_var.mul_(rho).addcmul_(grad - m_prev, grad - m_prev, value=1.0 - rho)
+                grad_minus_m_prev = grad - exp_avg
+                exp_grad_var.mul_(rho).addcmul_(grad_minus_m_prev, grad_minus_m_prev, value=1.0 - rho)
 
                 exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
@@ -643,33 +642,53 @@ class SpectralSNRMuon(Optimizer):
                 g = p.grad.detach()
                 if g.is_sparse:
                     raise RuntimeError("SpectralSNRMuon does not support sparse gradients.")
-                if p.ndim != 2:
-                    continue
                 st = self.state[p]
                 if len(st) == 0:
                     st["step"] = 0
-                    st["M"] = torch.zeros_like(p, dtype=torch.float32)
-                    if group["mode"] == "diag":
-                        r = min(p.shape)
-                        st["a"] = torch.zeros(r, device=p.device)
-                        st["s"] = torch.zeros(r, device=p.device)
-                        st["v"] = torch.zeros(r, device=p.device)
+                    if p.ndim == 2:
+                        st["M"] = torch.zeros_like(p, dtype=torch.float32)
+                        if group["mode"] == "diag":
+                            r = min(p.shape)
+                            st["a"] = torch.zeros(r, device=p.device)
+                            st["s"] = torch.zeros(r, device=p.device)
+                            st["v"] = torch.zeros(r, device=p.device)
+                        else:
+                            r = min(p.shape)
+                            st["A"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                            st["S"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                            st["V"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
                     else:
-                        r = min(p.shape)
-                        st["A"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
-                        st["S"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
-                        st["V"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                        st["exp_avg"] = torch.zeros_like(p)
+                        st["exp_avg_sq"] = torch.zeros_like(p)
+                        st["exp_grad_var"] = torch.zeros_like(p)
+
                 st["step"] += 1
                 t = st["step"]
+                b1, b2 = group["betas"]
+                rho = group["rho"]
+                alpha_value = resolve_alpha(group["alpha"])
+
+                if p.ndim != 2:
+                    m, v, s = st["exp_avg"], st["exp_avg_sq"], st["exp_grad_var"]
+                    g_minus_m_prev = g - m
+                    s.mul_(rho).addcmul_(g_minus_m_prev, g_minus_m_prev, value=1 - rho)
+                    m.mul_(b1).add_(g, alpha=1 - b1)
+                    v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                    m_hat = m / (1 - b1**t)
+                    v_hat = v / (1 - b2**t)
+                    s_hat = s / (1 - rho**t)
+                    q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    if group["weight_decay"] != 0:
+                        p.add_(p, alpha=-group["lr"] * group["weight_decay"])
+                    p.add_(q * m_hat / (v_hat.sqrt() + group["eps"]), alpha=-group["lr"])
+                    continue
+
                 G = g.float()
                 M = st["M"]
                 M.mul_(group["momentum"]).add_(G, alpha=1 - group["momentum"])
                 U, _, Vh = torch.linalg.svd(M, full_matrices=False)
                 V = Vh.t()
                 C = U.t() @ G @ V
-                b1, b2 = group["betas"]
-                rho = group["rho"]
-                alpha_value = resolve_alpha(group["alpha"])
                 if group["mode"] == "diag":
                     c = C.diag()
                     a, s, v = st["a"], st["s"], st["v"]
