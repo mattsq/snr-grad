@@ -31,7 +31,11 @@ Outputs PNG figures in the benchmarks/ directory.
 """
 
 import os
+import argparse
+import json
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List
 
 import torch
@@ -552,49 +556,19 @@ def make_figures(results_rotated, results_aligned, cfg, W_star, U_true, V_true, 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cfg = HardBenchmarkConfig()
+    ap = argparse.ArgumentParser(); ap.add_argument("--sweep-config", type=str, default=None); ap.add_argument("--sweep-out", type=str, default=None); args = ap.parse_args()
+    cfg = HardBenchmarkConfig(); sweep_cfg={}
+    if args.sweep_config:
+        sweep_cfg = json.loads(Path(args.sweep_config).read_text()); cfg.n_seeds=1; cfg.n_steps=int(sweep_cfg.get("n_steps", cfg.n_steps)); cfg.lr=float(sweep_cfg.get("lr", cfg.lr)); cfg.weight_decay=float(sweep_cfg.get("weight_decay", cfg.weight_decay)); cfg.batch_size=int(sweep_cfg.get("batch_size", cfg.batch_size))
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
-
-    print("=" * 70)
-    print("HARD BENCHMARK: Low-Rank Matrix Recovery with Anisotropic Inputs")
-    print("=" * 70)
-    print(f"  d={cfg.d}, rank={cfg.rank}, n_train={cfg.n_train}, "
-          f"cond_number={cfg.cond_number}")
-    print(f"  noise={cfg.sigma_noise}, batch={cfg.batch_size}, "
-          f"steps={cfg.n_steps}, seeds={cfg.n_seeds}")
-    print(f"  true singular values: {cfg.singular_values[:cfg.rank]}")
-    print()
-
-    print("--- CONDITION 1: Rotated (random) subspace ---")
     results_rotated, W_star, U_true, V_true, s_true = run_condition(cfg, aligned=False)
-    print()
-
-    print("--- CONDITION 2: Axis-aligned subspace ---")
     results_aligned, _, _, _, _ = run_condition(cfg, aligned=True)
-    print()
-
-    print("Generating figures...")
-    make_figures(results_rotated, results_aligned, cfg, W_star, U_true, V_true, s_true, out_dir)
-    print()
-
-    # Print summary table
-    print("=" * 70)
-    print("SUMMARY: Final Relative Frobenius Error (||W-W*||/||W*||)")
-    print("=" * 70)
-    print(f"{'Optimizer':<25s} {'Aligned':>18s} {'Rotated':>18s} {'Gap':>10s}")
-    print("-" * 70)
+    if not sweep_cfg: make_figures(results_rotated, results_aligned, cfg, W_star, U_true, V_true, s_true, out_dir)
+    rows=[]
     for name in results_rotated.keys():
         a = to_stack(results_aligned[name], "frob_errors")[:, -1]
         r = to_stack(results_rotated[name], "frob_errors")[:, -1]
-        gap = r.mean() - a.mean()
-        print(f"  {name:<23s} {a.mean():.4f} +/- {a.std():.4f}  "
-              f"{r.mean():.4f} +/- {r.std():.4f}  {gap:+.4f}")
-    print()
-
-    print("SUMMARY: Final Left Subspace Alignment")
-    print("-" * 70)
-    for name in results_rotated.keys():
-        a = to_stack(results_aligned[name], "left_alignments")[:, -1]
-        r = to_stack(results_rotated[name], "left_alignments")[:, -1]
-        print(f"  {name:<23s} {a.mean():.4f} +/- {a.std():.4f}  "
-              f"{r.mean():.4f} +/- {r.std():.4f}")
+        rows.append({"optimizer":name, "aligned_frob": float(a.mean().item()), "rotated_frob": float(r.mean().item())})
+    if args.sweep_out:
+        with open(args.sweep_out, "w", newline="") as f:
+            w=csv.DictWriter(f, fieldnames=["optimizer","aligned_frob","rotated_frob"]); w.writeheader(); w.writerows(rows)

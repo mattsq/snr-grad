@@ -175,6 +175,119 @@ Benchmarks on synthetic low-rank matrix recovery with anisotropic inputs reveal 
 
 The matrix-basis optimizers are **preconditioners**: they add value when there is structured sparsity in the gradient covariance eigenbasis. When signal is uniformly distributed across parameters, standard per-coordinate `SNRAdamW` is preferred.
 
+
+## Experimental design playbook: finding ideal SNR settings
+
+This section outlines a rigorous experiment program to identify strong default SNR parameters, understand when they transfer, and map interactions with optimizer, schedule, and data properties.
+
+### 1) Core hypotheses to test
+
+1. There is no single globally-optimal `lambda_pop` / `alpha`; best settings depend on gradient noise scale, effective batch size, and data anisotropy.
+2. `gate="snr"` should be more robust across tasks than `"soft"`/`"hard"`, with slightly lower peak performance in highly structured regimes.
+3. Matrix-aware variants (`RotatedSNRAdamW`, `SpectralSNRMuon`) should dominate only when gradient covariance is strongly structured and low-rank.
+4. Finite-dataset correction (`alpha="finite"`) should help most in small-`n`, high-reuse regimes and can over-regularize in large-`n` settings.
+
+### 2) Factor space (what to sweep)
+
+Use a staged DOE (design of experiments) strategy:
+
+- **Stage A (screening):** broad Latin-hypercube / Sobol exploration.
+- **Stage B (interaction):** factorial sweeps around top 10--20% configs.
+- **Stage C (local refinement):** Bayesian optimization per task family.
+
+Recommended factors:
+
+- **SNR-specific:**
+  - `gate` ∈ {`snr`, `soft`, `hard`}
+  - `lambda_pop` ∈ logspace [1e-3, 1e2]
+  - `alpha` ∈ {`online`, `finite`, numeric logspace [1e-3, 10]}
+  - `rho` ∈ {0.9, 0.95, 0.99, 0.995, 0.999}
+  - `gate_eps` ∈ {1e-14, 1e-12, 1e-10}
+- **Base optimizer/training:**
+  - `lr` (log sweep), `weight_decay`, `betas`, `eps`
+  - scheduler type (cosine, linear, constant), warmup ratio
+  - gradient clipping threshold, EMA/SWA on/off
+- **Batching/noise controls:**
+  - batch size, gradient accumulation, label noise, augmentation strength
+- **Model/data structure:**
+  - parameter count vs sample size ratio (overparameterization index)
+  - input covariance condition number and feature correlation
+  - target sparsity / low-rankness / rotation (aligned vs rotated signal)
+
+### 3) Benchmark matrix (tasks x regimes)
+
+For each domain, define low/medium/high-noise and low/medium/high-data regimes.
+
+- **Synthetic controlled tasks** (must-have for mechanism clarity):
+  - sparse linear regression (already in `benchmark.py`)
+  - low-rank matrix recovery with anisotropy + random rotations (`benchmark_hard.py`)
+  - heteroscedastic noise variants (feature-dependent variance)
+- **Vision:** CIFAR-10/100 with ResNet-18/50 at multiple data fractions (10%, 50%, 100%).
+- **NLP:** small transformer on WikiText-103 / OpenWebText subset; vary sequence length and token budget.
+- **Tabular:** medium-scale UCI/OpenML tasks with correlated features.
+
+Use at least 5 seeds for screening, then 10--20 seeds for final confirmation on shortlisted settings.
+
+### 4) Measurement protocol (what to record every run)
+
+Record both quality and mechanism metrics:
+
+- **Primary outcomes:** best validation metric, final test metric, time-to-target, area under learning curve.
+- **Stability:** divergence rate, NaN incidence, worst-seed percentile, variance across seeds.
+- **Efficiency:** tokens/s or samples/s, wall-clock to target, extra optimizer overhead.
+- **Gate diagnostics** (from `track_stats`):
+  - `mean_gate`, gate quantiles, fraction of near-zero gates
+  - layer-wise gate distributions
+  - correlation of gate values with gradient norm and update norm
+- **Noise diagnostics:** estimated gradient noise scale, signal/noise decomposition by layer.
+
+Persist all metrics as structured tables (CSV/Parquet) keyed by: task, seed, step, and full hyperparameter config hash.
+
+### 5) Statistical analysis plan
+
+1. **Hierarchical mixed-effects model** across all runs:
+   - response ~ SNR params + optimizer params + data descriptors + interactions + (1|task) + (1|seed)
+2. **Global sensitivity analysis** (Sobol/functional ANOVA): rank which knobs matter most.
+3. **Partial dependence / ICE plots:** identify monotonic vs non-monotonic ranges for `lambda_pop`, `rho`, and `alpha`.
+4. **Regime clustering:** cluster tasks by gradient covariance statistics and fit per-cluster defaults.
+5. **Pareto frontiers:** accuracy vs wall-clock vs stability; pick defaults on Pareto knee.
+
+### 6) Practical output targets
+
+Produce three deliverables:
+
+- **Universal safe default** (max robustness): e.g., `gate="snr"`, conservative `lambda_pop`, high `rho`.
+- **Regime-conditional defaults** keyed by measurable quantities:
+  - small-data/high-noise
+  - anisotropic low-rank structure
+  - dense isotropic signal
+- **Tuning recipe** (2--3 knobs only): ordered search over `lr` → `lambda_pop` → `rho`, with decision thresholds based on gate diagnostics.
+
+### 7) Minimal reproducible execution plan for this repo
+
+1. Extend existing benchmark scripts to emit per-step CSV logs (loss, metrics, `last_stats`).
+2. Add sweep driver (Hydra/W&B/Optuna) with a shared config schema.
+3. Run Stage A screening on:
+   - `benchmark.py`
+   - `benchmark_spectral.py`
+   - `benchmark_hard.py`
+4. Run Stage B focused factorial sweeps around top configs.
+5. Fit analysis notebooks to produce:
+   - interaction heatmaps (`lambda_pop` x `lr`, `rho` x batch size)
+   - regime recommendation table
+   - confidence intervals for suggested defaults.
+
+### 8) Decision criteria for “ideal” SNR parameters
+
+Treat a setting as ideal only if it is:
+
+- **Consistently strong:** top quartile mean performance across benchmark families.
+- **Stable:** low variance and low failure rate across seeds.
+- **Efficient:** no large wall-clock penalty for the achieved gain.
+- **Interpretable:** gate statistics align with expected noise suppression behavior.
+
+This prevents overfitting to one benchmark and yields deployable parameter guidance.
+
 ## Benchmarks
 
 The repo includes three benchmark scripts that can be run to reproduce all figures:
