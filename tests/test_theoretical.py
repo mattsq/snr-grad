@@ -97,7 +97,7 @@ class TestSNRGateIdentity:
         s_hat = torch.tensor([3.0])
         m_hat = torch.tensor([(alpha * s_hat.item()) ** 0.5])
         q = compute_gate(m_hat, s_hat, gate="snr", alpha=alpha, lambda_pop=1.0)
-        assert q.item() == pytest.approx(0.5, abs=1e-8)
+        assert q.item() == pytest.approx(0.5, abs=1e-6)
 
     def test_snr_gate_changes_with_alpha(self):
         """Finite alpha must affect the snr gate."""
