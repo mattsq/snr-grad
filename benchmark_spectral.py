@@ -13,7 +13,11 @@ Outputs PNG figures in the benchmarks/ directory.
 """
 
 import os
+import argparse
+import json
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -372,25 +376,18 @@ def make_figures(all_results, cfg, out_dir):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cfg = SpectralBenchmarkConfig()
+    ap = argparse.ArgumentParser(); ap.add_argument("--sweep-config", type=str, default=None); ap.add_argument("--sweep-out", type=str, default=None); args = ap.parse_args()
+    cfg = SpectralBenchmarkConfig(); sweep_cfg = {}
+    if args.sweep_config:
+        sweep_cfg = json.loads(Path(args.sweep_config).read_text()); cfg.n_seeds=1; cfg.n_steps=int(sweep_cfg.get("n_steps", cfg.n_steps)); cfg.lr=float(sweep_cfg.get("lr", cfg.lr)); cfg.weight_decay=float(sweep_cfg.get("weight_decay", cfg.weight_decay)); cfg.batch_size=int(sweep_cfg.get("batch_size", cfg.batch_size))
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
-
-    print("Spectral & Rotated SNR benchmark: Two-layer linear network")
-    print(f"  d_in={cfg.d_in}, d_hidden={cfg.d_hidden}, k={cfg.k}, "
-          f"n_train={cfg.n_train}, noise={cfg.sigma_noise}, "
-          f"batch={cfg.batch_size}, steps={cfg.n_steps}, seeds={cfg.n_seeds}")
-    print()
-
-    print("Running experiments...")
     all_results = run_all(cfg)
-    print()
-
-    print("Generating figures...")
-    make_figures(all_results, cfg, out_dir)
-    print()
-
+    if not sweep_cfg: make_figures(all_results, cfg, out_dir)
     irreducible = cfg.sigma_noise ** 2
-    print("Final excess test MSE:")
+    rows=[]
     for name, results in all_results.items():
         final_ex = to_stack(results, "test_losses")[:, -1] - irreducible
-        print(f"  {name:25s}: {final_ex.mean():.4f} +/- {final_ex.std():.4f}")
+        rows.append({"optimizer":name, "final_excess_test_mse": float(final_ex.mean().item())})
+    if args.sweep_out:
+        with open(args.sweep_out, "w", newline="") as f:
+            w=csv.DictWriter(f, fieldnames=["optimizer","final_excess_test_mse"]); w.writeheader(); w.writerows(rows)

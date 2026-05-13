@@ -12,7 +12,11 @@ Outputs three PNG figures in the benchmarks/ directory.
 """
 
 import os
+import argparse
+import json
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -337,35 +341,36 @@ def make_figures(snr_results, adam_results, cfg, out_dir, gate_type="snr"):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sweep-config", type=str, default=None)
+    ap.add_argument("--sweep-out", type=str, default=None)
+    args = ap.parse_args()
+
     cfg = BenchmarkConfig()
+    sweep_cfg = {}
+    if args.sweep_config:
+        sweep_cfg = json.loads(Path(args.sweep_config).read_text())
+        cfg.n_seeds = 1
+        cfg.n_steps = int(sweep_cfg.get("n_steps", cfg.n_steps))
+        cfg.lr = float(sweep_cfg.get("lr", cfg.lr))
+        cfg.weight_decay = float(sweep_cfg.get("weight_decay", cfg.weight_decay))
+        cfg.batch_size = int(sweep_cfg.get("batch_size", cfg.batch_size))
+
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
-
-    print(f"Sparse regression benchmark (finite dataset, overparameterized)")
-    print(f"  d={cfg.d}, k={cfg.k}, n_train={cfg.n_train}, noise={cfg.sigma_noise}, "
-          f"batch={cfg.batch_size}, steps={cfg.n_steps}, seeds={cfg.n_seeds}")
-    print()
-
+    gate_list = [sweep_cfg.get("gate", "snr")] if sweep_cfg else ["snr", "soft"]
     irreducible = cfg.sigma_noise ** 2
+    summary_rows = []
 
-    for gate_type in ["snr", "soft"]:
-        print(f"=== gate={gate_type!r} ===")
-        print("Running experiments...")
+    for gate_type in gate_list:
         snr_results, adam_results = run_experiment(cfg, gate_type=gate_type)
-        print()
-
-        print("Generating figures...")
-        make_figures(snr_results, adam_results, cfg, out_dir, gate_type=gate_type)
-        print()
-
+        if not sweep_cfg:
+            make_figures(snr_results, adam_results, cfg, out_dir, gate_type=gate_type)
         snr_ex = to_stack(snr_results, "test_losses")[:, -1] - irreducible
         adam_ex = to_stack(adam_results, "test_losses")[:, -1] - irreducible
-        print(f"Final excess test MSE:")
-        print(f"  SNRAdamW ({gate_type}): {snr_ex.mean():.4f} +/- {snr_ex.std():.4f}")
-        print(f"  AdamW:                  {adam_ex.mean():.4f} +/- {adam_ex.std():.4f}")
+        summary_rows.append({"optimizer": f"SNRAdamW-{gate_type}", "final_excess_test_mse": float(snr_ex.mean().item())})
+        summary_rows.append({"optimizer": "AdamW", "final_excess_test_mse": float(adam_ex.mean().item())})
 
-        snr_pe = to_stack(snr_results, "param_errors")[:, -1]
-        adam_pe = to_stack(adam_results, "param_errors")[:, -1]
-        print(f"Final parameter error ||w - w*||:")
-        print(f"  SNRAdamW ({gate_type}): {snr_pe.mean():.4f} +/- {snr_pe.std():.4f}")
-        print(f"  AdamW:                  {adam_pe.mean():.4f} +/- {adam_pe.std():.4f}")
-        print()
+    if args.sweep_out:
+        with open(args.sweep_out, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["optimizer", "final_excess_test_mse"])
+            w.writeheader(); w.writerows(summary_rows)
