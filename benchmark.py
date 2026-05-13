@@ -44,6 +44,9 @@ class BenchmarkConfig:
     lr: float = 3e-3
     weight_decay: float = 0.0  # no WD so the gate must do the work
     signal_magnitude: float = 3.0
+    rho: float = 0.99
+    alpha: object = "finite"
+    lambda_pop: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +156,9 @@ def run_one_seed(optimizer_cls, opt_kwargs, cfg, seed, track_gates=False):
 
 def run_experiment(cfg, gate_type="snr"):
     snr_kwargs = dict(
-        lr=cfg.lr, weight_decay=cfg.weight_decay, gate=gate_type, rho=0.99,
-        alpha="finite", batch_size=cfg.batch_size, dataset_size=cfg.n_train,
+        lr=cfg.lr, weight_decay=cfg.weight_decay, gate=gate_type, rho=cfg.rho,
+        alpha=cfg.alpha, batch_size=cfg.batch_size, dataset_size=cfg.n_train,
+        lambda_pop=cfg.lambda_pop,
     )
     adam_kwargs = dict(lr=cfg.lr, weight_decay=cfg.weight_decay)
 
@@ -355,6 +359,11 @@ if __name__ == "__main__":
         cfg.lr = float(sweep_cfg.get("lr", cfg.lr))
         cfg.weight_decay = float(sweep_cfg.get("weight_decay", cfg.weight_decay))
         cfg.batch_size = int(sweep_cfg.get("batch_size", cfg.batch_size))
+        cfg.rho = float(sweep_cfg.get("rho", cfg.rho))
+        cfg.lambda_pop = float(sweep_cfg.get("lambda_pop", cfg.lambda_pop))
+        if "alpha" in sweep_cfg:
+            a = sweep_cfg["alpha"]
+            cfg.alpha = a if isinstance(a, str) else float(a)
 
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
     gate_list = [sweep_cfg.get("gate", "snr")] if sweep_cfg else ["snr", "soft"]

@@ -20,7 +20,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Union
 
 
 @dataclass
@@ -32,7 +32,7 @@ class TrialConfig:
     rho: float
     lambda_pop: float
     gate: str
-    alpha: str
+    alpha: Union[str, float]
     n_steps: int
     batch_size: int
 
@@ -47,13 +47,17 @@ def log_uniform(lo: float, hi: float, rng: random.Random) -> float:
 
 def screening_space(trials: int, seeds: Iterable[int], rng: random.Random) -> List[TrialConfig]:
     benchmarks = ["benchmark.py", "benchmark_spectral.py", "benchmark_hard.py"]
+    # n_train per benchmark: benchmark.py=100, benchmark_spectral.py=100, benchmark_hard.py=500
+    n_train_map = {"benchmark.py": 100, "benchmark_spectral.py": 100, "benchmark_hard.py": 500}
     gates = ["snr", "soft", "hard"]
     rhos = [0.9, 0.95, 0.99, 0.995, 0.999]
-    alphas = ["online", "finite", "0.1", "0.3", "1.0", "3.0"]
+    alphas: List[Union[str, float]] = ["online", "finite", 0.1, 0.3, 1.0, 3.0]
     out: List[TrialConfig] = []
     for _ in range(trials):
         for benchmark in benchmarks:
             for seed in seeds:
+                n_train = n_train_map[benchmark]
+                valid_batch_sizes = [b for b in [32, 64, 128] if b < n_train]
                 out.append(
                     TrialConfig(
                         benchmark=benchmark,
@@ -65,7 +69,7 @@ def screening_space(trials: int, seeds: Iterable[int], rng: random.Random) -> Li
                         gate=rng.choice(gates),
                         alpha=rng.choice(alphas),
                         n_steps=5000 if benchmark != "benchmark_hard.py" else 8000,
-                        batch_size=rng.choice([32, 64, 128]),
+                        batch_size=rng.choice(valid_batch_sizes),
                     )
                 )
     return out

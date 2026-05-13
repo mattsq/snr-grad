@@ -20,3 +20,6 @@ build/
 Thumbs.db
 *.pdf
 .coverage
+
+# Experiment runs (generated output)
+runs/

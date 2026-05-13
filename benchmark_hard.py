@@ -67,6 +67,9 @@ class HardBenchmarkConfig:
     cond_number: float = 100.0   # condition number of input covariance
     singular_values: tuple = (10.0, 7.0, 5.0, 3.0, 2.0)  # true singular values
     eval_every: int = 20
+    rho: float = 0.99
+    alpha: object = "online"
+    lambda_pop: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -231,22 +234,25 @@ def get_optimizers(cfg):
     return {
         "RotatedSNRAdamW": lambda params: RotatedSNRAdamW(
             params, lr=cfg.lr, weight_decay=cfg.weight_decay,
-            gate="snr", rho=0.99, alpha="online",
-            basis_update_interval=50,
+            gate="snr", rho=cfg.rho, alpha=cfg.alpha,
+            lambda_pop=cfg.lambda_pop, basis_update_interval=50,
         ),
         "Spectral (diag)": lambda params: SpectralSNRMuon(
             params, lr=cfg.lr, weight_decay=cfg.weight_decay,
-            gate="snr", rho=0.99, alpha="online",
+            gate="snr", rho=cfg.rho, alpha=cfg.alpha,
+            lambda_pop=cfg.lambda_pop,
             variant="adam_spectral_gate", mode="diag",
         ),
         "Spectral (full)": lambda params: SpectralSNRMuon(
             params, lr=cfg.lr, weight_decay=cfg.weight_decay,
-            gate="snr", rho=0.99, alpha="online",
+            gate="snr", rho=cfg.rho, alpha=cfg.alpha,
+            lambda_pop=cfg.lambda_pop,
             variant="adam_spectral_gate", mode="full",
         ),
         "SNRAdamW": lambda params: SNRAdamW(
             params, lr=cfg.lr, weight_decay=cfg.weight_decay,
-            gate="snr", rho=0.99, alpha="online",
+            gate="snr", rho=cfg.rho, alpha=cfg.alpha,
+            lambda_pop=cfg.lambda_pop,
         ),
         "AdamW": lambda params: torch.optim.AdamW(
             params, lr=cfg.lr, weight_decay=cfg.weight_decay,
@@ -559,7 +565,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--sweep-config", type=str, default=None); ap.add_argument("--sweep-out", type=str, default=None); args = ap.parse_args()
     cfg = HardBenchmarkConfig(); sweep_cfg={}
     if args.sweep_config:
-        sweep_cfg = json.loads(Path(args.sweep_config).read_text()); cfg.n_seeds=1; cfg.n_steps=int(sweep_cfg.get("n_steps", cfg.n_steps)); cfg.lr=float(sweep_cfg.get("lr", cfg.lr)); cfg.weight_decay=float(sweep_cfg.get("weight_decay", cfg.weight_decay)); cfg.batch_size=int(sweep_cfg.get("batch_size", cfg.batch_size))
+        sweep_cfg = json.loads(Path(args.sweep_config).read_text()); cfg.n_seeds=1; cfg.n_steps=int(sweep_cfg.get("n_steps", cfg.n_steps)); cfg.lr=float(sweep_cfg.get("lr", cfg.lr)); cfg.weight_decay=float(sweep_cfg.get("weight_decay", cfg.weight_decay)); cfg.batch_size=int(sweep_cfg.get("batch_size", cfg.batch_size)); cfg.rho=float(sweep_cfg.get("rho", cfg.rho)); cfg.lambda_pop=float(sweep_cfg.get("lambda_pop", cfg.lambda_pop))
+        if "alpha" in sweep_cfg:
+            a = sweep_cfg["alpha"]; cfg.alpha = a if isinstance(a, str) else float(a)
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "benchmarks")
     results_rotated, W_star, U_true, V_true, s_true = run_condition(cfg, aligned=False)
     results_aligned, _, _, _, _ = run_condition(cfg, aligned=True)
