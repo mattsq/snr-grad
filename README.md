@@ -288,6 +288,55 @@ Treat a setting as ideal only if it is:
 
 This prevents overfitting to one benchmark and yields deployable parameter guidance.
 
+## Hyperparameter tuning notes
+
+Empirical results from controlled sweeps on sparse linear regression (d=200, k=5, n=100, high noise). See `studies/hyperparameter_study/` for full experiment code and data.
+
+### `lambda_pop` (regularization strength)
+
+`lambda_pop` controls how aggressively the gate suppresses noisy parameters. For the SNR gate, `q = 0.5` when `m^2/s = lambda_pop`, so it directly sets the decision boundary.
+
+- **Soft gate:** robust across `lambda_pop` 0.01--2.0 (best around 0.5). Degrades when `lambda_pop >= 10` as it starts suppressing signal.
+- **SNR gate:** U-shaped response; too low (0.01) leaves noise ungated, too high (100) suppresses signal. Best around 5.0 in this regime.
+- The soft gate achieves much better signal/noise separation (noise gates near zero) because its `relu` threshold creates a hard floor. The SNR gate never fully zeros out noise parameters.
+
+### `alpha` (leave-one-out threshold)
+
+`alpha` plays different roles depending on the gate type:
+
+- **Soft gate:** `alpha` sets the threshold `m^2 > alpha * s` below which parameters are fully gated off. Best at `alpha` = 1.0--2.0; too low (0.1) under-thresholds, too high (5.0) over-thresholds and increases variance across seeds.
+- **SNR gate:** `alpha` multiplies `lambda_pop` in the denominator (`alpha * lambda_pop * s`), so it's effectively a second scaling knob. Varying `alpha` with fixed `lambda_pop` produces the same effect as varying `lambda_pop` with fixed `alpha`.
+
+### `rho` (variance EMA decay)
+
+`rho` controls the effective memory window for gradient variance estimation: `1/(1-rho)` steps.
+
+- Higher `rho` gives smoother, lower-variance estimates at the cost of slower adaptation.
+- **Soft gate:** best at `rho` = 0.995. Slight degradation at 0.999 suggests over-smoothing.
+- **SNR gate:** monotonically improves up to `rho` = 0.999 in stationary settings.
+- Under distribution shift, `rho` = 0.999 takes ~250 steps to re-adapt vs ~50 for `rho` = 0.95. Choose lower `rho` if non-stationarity is expected.
+
+### `alpha="finite"` (finite-dataset correction)
+
+The correction `alpha = b/(n-b)` accounts for data reuse in finite datasets:
+
+- **Small datasets (n < 500):** `"online"` (alpha=1.0) slightly outperforms `"finite"` -- the correction over-adjusts when data is scarce.
+- **Large datasets (n >= 2000):** `"finite"` wins (e.g., 10.9 vs 12.5 MSE at n=10000) as the `b/(n-b)` term properly compensates for batch overlap.
+- Rule of thumb: use `alpha="finite"` when `dataset_size / batch_size > 50`.
+
+### Interaction with learning rate
+
+SNR gating benefits increase with higher learning rates. Across 262 sweep trials on three benchmarks, SNR won 84% of trials at `lr > 3e-3` vs 67% at `lr < 1e-3`. Higher learning rates amplify gradient noise, giving the gate more room to suppress noisy updates. If using SNR gating, you can push `lr` slightly higher than you would with plain AdamW.
+
+### Recommended starting points
+
+| Setting | Conservative default | Notes |
+|---------|---------------------|-------|
+| `gate` | `"snr"` | More robust; switch to `"soft"` for peak performance with tuning |
+| `lambda_pop` | 1.0 | Increase for noisier problems, decrease for cleaner signal |
+| `alpha` | `"online"` | Use `"finite"` for large finite datasets with high reuse |
+| `rho` | 0.99 | Increase to 0.995 for stationary problems; decrease to 0.95 for non-stationary |
+
 ## Benchmarks
 
 The repo includes three benchmark scripts that can be run to reproduce all figures:
