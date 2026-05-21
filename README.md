@@ -162,6 +162,35 @@ optimizer = SpectralSNRMuon(
 )
 ```
 
+### Grokfast integration -- Slow-gradient pre-amplification
+
+We have integrated **Grokfast** (a technique that tracks and amplifies slow-varying components of the gradients to accelerate generalization and grokking) into all four optimizer classes: `SNRAdamW`, `SNRMuon`, `RotatedSNRAdamW`, and `SpectralSNRMuon`.
+
+Grokfast operates via a **Pre-Gate Amplification** strategy: the slow-gradient moving average is computed and added to the gradient *before* the moments and SNR gates are calculated. This helps push parameters out of sharp local minima towards flat, broad valleys that generalize better.
+
+To enable Grokfast slow-gradient amplification, pass `grokfast_alpha` and `grokfast_lamb` when initializing any of the optimizers:
+
+```python
+from snr_grad import SNRAdamW
+
+optimizer = SNRAdamW(
+    model.parameters(),
+    lr=1e-3,
+    grokfast_alpha=0.98,  # EMA decay factor for slow-gradient tracking
+    grokfast_lamb=2.0,    # slow-gradient amplification strength
+)
+```
+
+#### Important Guidance: The Underdetermined vs. Overdetermined Trade-off
+
+Based on rigorous regime sweeps on high-dimensional sparse regression, Grokfast slow-gradient amplification exhibits a critical trade-off:
+
+1. **Underdetermined Regime ($n < d$, e.g., small datasets, high noise):**
+   - **Do not use standard Grokfast.** In underdetermined settings, spurious correlations create persistent, static noise-fitting gradients. Grokfast will track and *amplify* this persistent noise-fitting component, leading to severe overfitting.
+   - If Grokfast is required, always pair it with the SNR gate (`grokfast_lamb > 0` and `lambda_pop > 0.0`), which acts as an adaptive filter to block the noise-amplifying updates.
+2. **Overdetermined Regime ($n > d$, e.g., large clean datasets):**
+   - **Highly Recommended.** When training data is abundant, the true signals have consistent, slow-moving gradients while noise cancels out. Grokfast excels in this well-determined regime, dramatically accelerating signal learning and slashing test MSE.
+
 ### When to use which optimizer
 
 Benchmarks on synthetic low-rank matrix recovery with anisotropic inputs reveal clear regimes where each method excels:
