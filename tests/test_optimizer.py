@@ -304,3 +304,46 @@ class TestStateAccumulation:
         assert state["exp_avg"].abs().sum().item() > 0
         assert state["exp_avg_sq"].abs().sum().item() > 0
         assert state["exp_grad_var"].abs().sum().item() > 0
+
+
+# ---------------------------------------------------------------------------
+# Grokfast integration
+# ---------------------------------------------------------------------------
+
+class TestGrokfastSNR:
+
+    def test_grokfast_invalid_params_raises(self):
+        model = nn.Linear(5, 1)
+        with pytest.raises(ValueError, match="Invalid grokfast_alpha"):
+            SNRAdamW(model.parameters(), grokfast_alpha=-0.1)
+        with pytest.raises(ValueError, match="Invalid grokfast_lamb"):
+            SNRAdamW(model.parameters(), grokfast_lamb=-0.5)
+
+    def test_grokfast_g_slow_accumulation(self):
+        model, target = _make_model_and_loss(dim=5)
+        opt = SNRAdamW(model.parameters(), lr=1e-3, grokfast_alpha=0.9, grokfast_lamb=2.0)
+        _do_step(model, target, opt)
+        param = list(model.parameters())[0]
+        state = opt.state[param]
+        assert "g_slow" in state
+        assert state["g_slow"].abs().sum().item() > 0
+
+    def test_grokfast_changes_update(self):
+        # Verify that enabling Grokfast produces different parameter values
+        model1, target1 = _make_model_and_loss(dim=5, seed=42)
+        model2, target2 = _make_model_and_loss(dim=5, seed=42)
+
+        opt1 = SNRAdamW(model1.parameters(), lr=1e-2, grokfast_alpha=0.0, grokfast_lamb=0.0)
+        opt2 = SNRAdamW(model2.parameters(), lr=1e-2, grokfast_alpha=0.9, grokfast_lamb=2.0)
+
+        # Run 5 steps to break the initial scale-invariance of Adam updates
+        for _ in range(5):
+            _do_step(model1, target1, opt1)
+            _do_step(model2, target2, opt2)
+
+        # Parameters should be different
+        p1 = list(model1.parameters())[0]
+        p2 = list(model2.parameters())[0]
+        assert not torch.allclose(p1, p2)
+
+

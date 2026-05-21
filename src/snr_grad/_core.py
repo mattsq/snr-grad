@@ -200,6 +200,8 @@ class SNRAdamW(Optimizer):
         dataset_size: Optional[int] = None,
         maximize: bool = False,
         track_stats: bool = False,
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -219,6 +221,10 @@ class SNRAdamW(Optimizer):
             raise ValueError(f"Invalid lambda_pop: {lambda_pop}")
         if gate not in {"soft", "snr", "hard"}:
             raise ValueError(f"Invalid gate: {gate!r}")
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
 
         defaults = dict(
             lr=lr,
@@ -234,6 +240,8 @@ class SNRAdamW(Optimizer):
             dataset_size=dataset_size,
             maximize=maximize,
             track_stats=track_stats,
+            grokfast_alpha=grokfast_alpha,
+            grokfast_lamb=grokfast_lamb,
         )
         super().__init__(params, defaults)
         self.last_stats: Optional[SNRAdamWStats] = None
@@ -292,6 +300,8 @@ class SNRAdamW(Optimizer):
             )
             maximize = group["maximize"]
             track_stats = group["track_stats"]
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -310,6 +320,13 @@ class SNRAdamW(Optimizer):
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_grad_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in state:
+                        state["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = state["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(grad, alpha=1.0 - grokfast_alpha)
+                    grad = grad + grokfast_lamb * g_slow
 
                 exp_avg: Tensor = state["exp_avg"]
                 exp_avg_sq: Tensor = state["exp_avg_sq"]
@@ -448,12 +465,18 @@ class SNRMuon(Optimizer):
         maximize: bool = False,
         muon_ns_steps: int = 5,
         muon_mode: Literal["post", "pre"] = "post",
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
     ):
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
             gate=gate, lambda_pop=lambda_pop, alpha=alpha, batch_size=batch_size,
             dataset_size=dataset_size, maximize=maximize, muon_ns_steps=muon_ns_steps,
-            muon_mode=muon_mode,
+            muon_mode=muon_mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
         )
         super().__init__(params, defaults)
 
@@ -472,6 +495,8 @@ class SNRMuon(Optimizer):
             wd = group["weight_decay"]
             maximize = group["maximize"]
             alpha_value = resolve_alpha(group["alpha"], batch_size=group.get("batch_size"), dataset_size=group.get("dataset_size"))
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -480,6 +505,13 @@ class SNRMuon(Optimizer):
                 if maximize:
                     g = -g
                 st = self.state[p]
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in st:
+                        st["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = st["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
+                    g = g + grokfast_lamb * g_slow
+
                 if len(st) == 0:
                     st["step"] = 0
                     st["exp_avg"] = torch.zeros_like(p)
@@ -535,11 +567,18 @@ class RotatedSNRAdamW(Optimizer):
         basis_beta: float = 0.95,
         basis_update_interval: int = 50,
         maximize: bool = False,
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
     ):
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
             gate=gate, lambda_pop=lambda_pop, alpha=alpha, basis_beta=basis_beta,
             basis_update_interval=basis_update_interval, maximize=maximize,
+            grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
         )
         super().__init__(params, defaults)
 
@@ -558,6 +597,8 @@ class RotatedSNRAdamW(Optimizer):
             wd = group["weight_decay"]
             maximize = group["maximize"]
             alpha_value = resolve_alpha(group["alpha"])
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -569,6 +610,13 @@ class RotatedSNRAdamW(Optimizer):
                     raise RuntimeError("RotatedSNRAdamW does not support sparse gradients.")
 
                 st = self.state[p]
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in st:
+                        st["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = st["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
+                    g = g + grokfast_lamb * g_slow
+
                 if len(st) == 0:
                     st["step"] = 0
                     if p.ndim == 2:
@@ -641,8 +689,12 @@ class RotatedSNRAdamW(Optimizer):
 class SpectralSNRMuon(Optimizer):
     """SVD-basis SNR gating with diagonal or full spectral coefficients."""
 
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag"):
-        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode)
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0):
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -652,6 +704,8 @@ class SpectralSNRMuon(Optimizer):
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -659,6 +713,13 @@ class SpectralSNRMuon(Optimizer):
                 if g.is_sparse:
                     raise RuntimeError("SpectralSNRMuon does not support sparse gradients.")
                 st = self.state[p]
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in st:
+                        st["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = st["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
+                    g = g + grokfast_lamb * g_slow
+
                 if len(st) == 0:
                     st["step"] = 0
                     if p.ndim == 2:
