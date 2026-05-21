@@ -191,6 +191,29 @@ Based on rigorous regime sweeps on high-dimensional sparse regression, Grokfast 
 2. **Overdetermined Regime ($n > d$, e.g., large clean datasets):**
    - **Highly Recommended.** When training data is abundant, the true signals have consistent, slow-moving gradients while noise cancels out. Grokfast excels in this well-determined regime, dramatically accelerating signal learning and slashing test MSE.
 
+### `MARSSNRAdamW` -- MARS Variance-Reduced SNR Optimizer
+
+Combines **ByteDance's MARS (Make Variance Reduction Shine, ICML 2025)** variance-reduction technique with SNR population-risk gating. It tracks historical gradient differences to construct a variance-reduced gradient direction, L2-clips it to prevent optimization spikes under heavy noise, and filters residual noise via the SNR gate.
+
+Additionally, this optimizer features:
+1. **Configurable 1D Fallback (`optimize_1d`)**: Controls whether 1D parameters (biases, layer norm gains, embedding parameters) are optimized via MARS variance reduction or fall back to standard `SNRAdamW`.
+2. **Optional Caution (`caution`)**: Integrates the "caution" mechanism (from Cautious Optimizers, arXiv:2411.16085) to sign-mask momentum updates based on alignment with the current gradient direction.
+
+```python
+from snr_grad import MARSSNRAdamW
+
+optimizer = MARSSNRAdamW(
+    model.parameters(),
+    lr=1e-3,
+    weight_decay=0.01,
+    gate="snr",             # "snr", "soft", or "hard"
+    gamma=0.025,            # STORM variance reduction scaling factor
+    mars_clip=1.0,          # L2 norm clipping threshold for corrected gradient (optional)
+    optimize_1d=False,      # fallback 1D params to standard SNRAdamW
+    caution=True,           # apply cautious sign-alignment masking
+)
+```
+
 ### When to use which optimizer
 
 Benchmarks on synthetic low-rank matrix recovery with anisotropic inputs reveal clear regimes where each method excels:
@@ -200,6 +223,7 @@ Benchmarks on synthetic low-rank matrix recovery with anisotropic inputs reveal 
 | **Axis-aligned sparsity + anisotropic inputs** | `RotatedSNRAdamW` | Eigenbasis rotation compensates for input covariance mismatch; per-coordinate SNR is confused by correlated gradient noise |
 | **Dense signal (randomly rotated)** | `SNRAdamW` | Signal is distributed across all parameters; per-coordinate gating correctly treats all entries as having signal |
 | **General 2D weights, mild overparameterization** | `SpectralSNRMuon (full)` | Full spectral gating captures cross-singular-value interactions |
+| **High-noise, sparse/stochastic optimization** | `MARSSNRAdamW` | STORM variance-reduction reduces optimization variance, while optional Caution speeds up momentum adaptation under noise |
 | **Non-2D parameters** | `SNRAdamW` | All matrix-basis methods fall back to SNRAdamW for 1D params |
 
 The matrix-basis optimizers are **preconditioners**: they add value when there is structured sparsity in the gradient covariance eigenbasis. When signal is uniformly distributed across parameters, standard per-coordinate `SNRAdamW` is preferred.
@@ -368,13 +392,14 @@ SNR gating benefits increase with higher learning rates. Across 262 sweep trials
 
 ## Benchmarks
 
-The repo includes three benchmark scripts that can be run to reproduce all figures:
+The repo includes benchmark scripts that can be run to reproduce all figures:
 
 ```bash
 python benchmark.py           # SNRAdamW vs AdamW on sparse regression
 python benchmark_muon.py      # SNRMuon vs SNRAdamW vs AdamW (two-layer network)
 python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
+python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
 ```
 
 ### `benchmark.py` -- Core SNR gating evaluation
@@ -404,6 +429,12 @@ Metrics tracked: relative Frobenius error, left/right singular subspace alignmen
 **Key finding:** RotatedSNRAdamW reduces Frobenius error by ~34% vs AdamW in the aligned+anisotropic regime, but per-coordinate methods are ~2x better when the signal is dense (rotated case). This clearly shows the matrix-basis methods are preconditioners for structured problems, not universal improvements.
 
 **Output:** `benchmarks/benchmark_hardrot_*.png`
+
+### `benchmark_mars_snr.py` -- MARS & Cautious SNR evaluation
+
+Sparse linear regression (d=200, k=5 signal features, n=100 training samples, high noise) comparing MARSSNRAdamW (with and without Caution), SNRAdamW, and standard AdamW. Demonstrates how the combination of variance reduction, cautious updating, and SNR gating dramatically improves generalization on noisy regression.
+
+**Output:** `benchmarks/benchmark_mars_curves.png`, `benchmarks/benchmark_mars_weights.png`, `benchmarks/benchmark_mars_summary.png`
 
 ## Diagnostics
 
@@ -437,6 +468,19 @@ if stats:
 | `dataset_size` | `int \| None` | `None` | Required when `alpha="finite"` |
 | `maximize` | `bool` | `False` | Maximize the objective instead of minimizing |
 | `track_stats` | `bool` | `False` | Collect per-step gate diagnostics |
+
+### `MARSSNRAdamW(params, **kwargs)`
+
+Extends `SNRAdamW` with MARS STORM variance reduction and Cautious updating.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `gamma` | `float` | `0.025` | STORM corrected gradient difference scale |
+| `mars_clip` | `float \| None` | `1.0` | Corrected gradient L2 clipping norm |
+| `optimize_1d` | `bool` | `False` | Enable/disable MARS on 1D parameters |
+| `caution` | `bool` | `False` | Enable cautious momentum updates |
+
+Inherits all other parameters from `SNRAdamW`.
 
 ### Helper functions
 
