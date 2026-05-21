@@ -268,12 +268,12 @@ class SNRAdamW(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        gate_sum = 0.0
-        gate_min = float("inf")
-        gate_max = float("-inf")
-        s_sum = 0.0
-        m2_sum = 0.0
-        elem_count = 0
+        gate_sums = []
+        gate_mins = []
+        gate_maxs = []
+        s_sums = []
+        m2_sums = []
+        elem_counts = []
         parameters_seen = 0
 
         for group in self.param_groups:
@@ -364,23 +364,39 @@ class SNRAdamW(Optimizer):
                     q_detached = q.detach()
                     s_detached = s_for_gate.detach()
                     m2_detached = m_hat.detach().square()
-                    n = q_detached.numel()
 
-                    gate_sum += float(q_detached.sum().cpu())
-                    gate_min = min(gate_min, float(q_detached.min().cpu()))
-                    gate_max = max(gate_max, float(q_detached.max().cpu()))
-                    s_sum += float(s_detached.sum().cpu())
-                    m2_sum += float(m2_detached.sum().cpu())
-                    elem_count += n
+                    gate_sums.append(q_detached.sum())
+                    gate_mins.append(q_detached.min())
+                    gate_maxs.append(q_detached.max())
+                    s_sums.append(s_detached.sum())
+                    m2_sums.append(m2_detached.sum())
+                    elem_counts.append(q_detached.numel())
                     parameters_seen += 1
 
-        if elem_count > 0:
+        if parameters_seen > 0:
+            target_device = gate_sums[0].device
+            gate_sums_t = torch.stack([x.to(target_device) for x in gate_sums])
+            gate_mins_t = torch.stack([x.to(target_device) for x in gate_mins])
+            gate_maxs_t = torch.stack([x.to(target_device) for x in gate_maxs])
+            s_sums_t = torch.stack([x.to(target_device) for x in s_sums])
+            m2_sums_t = torch.stack([x.to(target_device) for x in m2_sums])
+            elem_count = sum(elem_counts)
+
+            stats_tensor = torch.stack([
+                gate_sums_t.sum(),
+                gate_mins_t.min(),
+                gate_maxs_t.max(),
+                s_sums_t.sum(),
+                m2_sums_t.sum()
+            ])
+            stats_cpu = stats_tensor.cpu().tolist()
+
             self.last_stats = SNRAdamWStats(
-                mean_gate=gate_sum / elem_count,
-                min_gate=gate_min,
-                max_gate=gate_max,
-                mean_s_hat=s_sum / elem_count,
-                mean_m2=m2_sum / elem_count,
+                mean_gate=stats_cpu[0] / elem_count,
+                min_gate=stats_cpu[1],
+                max_gate=stats_cpu[2],
+                mean_s_hat=stats_cpu[3] / elem_count,
+                mean_m2=stats_cpu[4] / elem_count,
                 parameters_seen=parameters_seen,
             )
         else:
@@ -475,9 +491,9 @@ class SNRMuon(Optimizer):
                 m = st["exp_avg"]
                 v = st["exp_avg_sq"]
                 s = st["exp_grad_var"]
-                m_prev = m.clone()
 
-                s.mul_(rho).addcmul_(g - m_prev, g - m_prev, value=1.0 - rho)
+                g_minus_m = g - m
+                s.mul_(rho).addcmul_(g_minus_m, g_minus_m, value=1.0 - rho)
                 m.mul_(beta1).add_(g, alpha=1.0 - beta1)
                 v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
 
@@ -577,8 +593,8 @@ class RotatedSNRAdamW(Optimizer):
 
                 if p.ndim != 2:
                     m, v, s = st["exp_avg"], st["exp_avg_sq"], st["exp_grad_var"]
-                    m_prev = m.clone()
-                    s.mul_(rho).addcmul_(g - m_prev, g - m_prev, value=1 - rho)
+                    g_minus_m = g - m
+                    s.mul_(rho).addcmul_(g_minus_m, g_minus_m, value=1 - rho)
                     m.mul_(beta1).add_(g, alpha=1 - beta1)
                     v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
                     m_hat = m / (1 - beta1**t)
@@ -607,8 +623,8 @@ class RotatedSNRAdamW(Optimizer):
                 QL, QR = st["QL"], st["QR"]
                 Gc = QL.t() @ G @ QR
                 M, V, S = st["M_c"], st["V_c"], st["S_c"]
-                M_prev = M.clone()
-                S.mul_(rho).addcmul_(Gc - M_prev, Gc - M_prev, value=1 - rho)
+                Gc_minus_M = Gc - M
+                S.mul_(rho).addcmul_(Gc_minus_M, Gc_minus_M, value=1 - rho)
                 M.mul_(beta1).add_(Gc, alpha=1 - beta1)
                 V.mul_(beta2).addcmul_(Gc, Gc, value=1 - beta2)
 
@@ -692,8 +708,8 @@ class SpectralSNRMuon(Optimizer):
                 if group["mode"] == "diag":
                     c = C.diag()
                     a, s, v = st["a"], st["s"], st["v"]
-                    a_prev = a.clone()
-                    s.mul_(rho).addcmul_(c - a_prev, c - a_prev, value=1 - rho)
+                    c_minus_a = c - a
+                    s.mul_(rho).addcmul_(c_minus_a, c_minus_a, value=1 - rho)
                     a.mul_(b1).add_(c, alpha=1 - b1)
                     v.mul_(b2).addcmul_(c, c, value=1 - b2)
                     a_hat = a / (1 - b1**t)
@@ -707,8 +723,8 @@ class SpectralSNRMuon(Optimizer):
                     D = U @ torch.diag(d) @ V.t()
                 else:
                     A, S, Vst = st["A"], st["S"], st["V"]
-                    A_prev = A.clone()
-                    S.mul_(rho).addcmul_(C - A_prev, C - A_prev, value=1 - rho)
+                    C_minus_A = C - A
+                    S.mul_(rho).addcmul_(C_minus_A, C_minus_A, value=1 - rho)
                     A.mul_(b1).add_(C, alpha=1 - b1)
                     Vst.mul_(b2).addcmul_(C, C, value=1 - b2)
                     A_hat = A / (1 - b1**t)

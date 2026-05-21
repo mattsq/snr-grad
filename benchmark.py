@@ -158,7 +158,7 @@ def run_experiment(cfg, gate_type="snr"):
     snr_kwargs = dict(
         lr=cfg.lr, weight_decay=cfg.weight_decay, gate=gate_type, rho=cfg.rho,
         alpha=cfg.alpha, batch_size=cfg.batch_size, dataset_size=cfg.n_train,
-        lambda_pop=cfg.lambda_pop,
+        lambda_pop=cfg.lambda_pop, track_stats=True,
     )
     adam_kwargs = dict(lr=cfg.lr, weight_decay=cfg.weight_decay)
 
