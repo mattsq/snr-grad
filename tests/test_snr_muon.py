@@ -33,3 +33,20 @@ def test_snr_muon_updates_2d_weight():
     opt.step()
 
     assert not torch.equal(before, layer.weight.detach())
+
+
+def test_snr_muon_runs_with_grokfast_enabled():
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.ReLU(), nn.Linear(8, 1))
+    x = torch.randn(16, 8)
+    y = torch.randn(16, 1)
+    opt = SNRMuon(model.parameters(), lr=1e-3, grokfast_alpha=0.9, grokfast_lamb=2.0)
+    for _ in range(3):
+        opt.zero_grad()
+        loss = ((model(x) - y) ** 2).mean()
+        loss.backward()
+        opt.step()
+    param = next(model.parameters())
+    state = opt.state[param]
+    assert "g_slow" in state
+    assert state["step"] == 3
