@@ -79,6 +79,24 @@ optimizer = SNRAdamW(
 
 `alpha` also accepts `"online"` (equivalent to `1.0`, the default) or any numeric value.
 
+## Freezing low-SNR parameters to save backward compute
+
+The gate `q` already suppresses noise-dominated updates, but the backward pass still computes the gradients and stores the activations needed for them. When a parameter's gate sits near zero for many consecutive steps, those resources are wasted. Setting `freeze_low_snr=True` makes the optimizer track an EMA of each parameter's gate and call `p.requires_grad_(False)` once the EMA has been below `freeze_threshold` for `freeze_patience` steps. PyTorch's autograd then propagates `needs_input_grad=False` through the subgraph: when every leaf in a module is frozen, its activations are not retained and its backward kernels do not run. Frozen parameters are re-enabled every `freeze_recheck_interval` steps so they can recover if their signal returns.
+
+```python
+optimizer = SNRAdamW(
+    model.parameters(),
+    lr=3e-4,
+    freeze_low_snr=True,
+    freeze_threshold=0.05,
+    freeze_patience=200,
+    freeze_recheck_interval=1000,
+    freeze_beta=0.99,
+)
+```
+
+The same flag works on all four optimizers (`SNRAdamW`, `SNRMuon`, `RotatedSNRAdamW`, `SpectralSNRMuon`). Each exposes an `opt.count_frozen()` method returning `(parameters_frozen, elements_frozen)`; `SNRAdamW` additionally reports these in `opt.last_stats` when `track_stats=True`. Parameters the user has already set to `requires_grad=False` are not touched by the recheck. `benchmark_freeze.py` compares the freeze and baseline arms on an overparameterized MLP.
+
 ## Exact gradient variance
 
 If you have access to per-sample gradients (e.g. via `torch.func.vmap`), you can supply exact variance estimates instead of relying on the streaming EMA:
