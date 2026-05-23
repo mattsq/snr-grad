@@ -245,6 +245,44 @@ def _count_frozen(optimizer: Optimizer) -> tuple[int, int]:
     return n_params, n_elems
 
 
+def _freeze_state_dict(optimizer: Optimizer) -> dict:
+    """
+    Augment Optimizer.state_dict with the freeze global step counter.
+
+    The recheck cadence depends on optimizer._global_step. Without this, a
+    checkpoint resumed mid-run would restart the cadence at 0.
+    """
+    sd = Optimizer.state_dict(optimizer)
+    sd["_global_step"] = int(getattr(optimizer, "_global_step", 0))
+    return sd
+
+
+def _freeze_load_state_dict(optimizer: Optimizer, state_dict: dict) -> None:
+    """
+    Load Optimizer state and reapply the freeze invariants.
+
+    Two things the base class does not handle for us:
+      1. Restore optimizer._global_step so recheck cadence continues correctly.
+      2. Reapply p.requires_grad_(False) for any param whose restored state
+         says state["frozen"] is True. Without this, fresh parameters arrive
+         with requires_grad=True so the optimizer would think they're frozen
+         while autograd still computes their gradients until the next recheck.
+    """
+    # _global_step is our extension; the base class only reads
+    # "state" and "param_groups", but be explicit and strip it anyway.
+    global_step = int(state_dict.get("_global_step", 0))
+    base_sd = {k: v for k, v in state_dict.items() if k != "_global_step"}
+
+    Optimizer.load_state_dict(optimizer, base_sd)
+    optimizer._global_step = global_step
+
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                p.requires_grad_(False)
+
+
 class SNRAdamW(Optimizer):
     """
     AdamW with the SNR / population-risk gate from arXiv:2605.01172.
@@ -362,6 +400,12 @@ class SNRAdamW(Optimizer):
     def count_frozen(self) -> tuple[int, int]:
         """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
         return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(
@@ -619,6 +663,12 @@ class SNRMuon(Optimizer):
         """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
         return _count_frozen(self)
 
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
+
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
         loss = None
@@ -738,6 +788,12 @@ class RotatedSNRAdamW(Optimizer):
     def count_frozen(self) -> tuple[int, int]:
         """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
         return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -863,6 +919,12 @@ class SpectralSNRMuon(Optimizer):
     def count_frozen(self) -> tuple[int, int]:
         """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
         return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:

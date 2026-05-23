@@ -298,6 +298,131 @@ class TestFreezeStateDictRoundtrip:
         assert st2["below_count"] == below_before
         assert st2["gate_ema"] == pytest.approx(gate_ema_before)
 
+    @pytest.mark.parametrize(
+        "opt_cls",
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon"],
+    )
+    def test_load_restores_requires_grad_false(self, opt_cls):
+        """
+        Fresh model params arrive with requires_grad=True, but if the loaded
+        state says state["frozen"] is True we must reapply requires_grad=False.
+        Otherwise count_frozen() and autograd disagree until the next recheck.
+        """
+        p = _make_2d_param(shape=(5, 5))
+        opt = opt_cls(
+            [p],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=10,
+            freeze_recheck_interval=10_000,
+            freeze_beta=0.5,
+        )
+        _drive_noise_grads(p, opt, n_steps=40)
+        assert opt.state[p]["frozen"] is True
+        assert p.requires_grad is False
+
+        sd = copy.deepcopy(opt.state_dict())
+
+        # Fresh param + optimizer; the fresh param defaults to requires_grad=True.
+        p2 = torch.zeros((5, 5), requires_grad=True)
+        assert p2.requires_grad is True
+        opt2 = opt_cls(
+            [p2],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=10,
+            freeze_recheck_interval=10_000,
+            freeze_beta=0.5,
+        )
+        opt2.load_state_dict(sd)
+
+        # After load: optimizer state says frozen, so autograd must agree.
+        assert opt2.state[p2]["frozen"] is True
+        assert p2.requires_grad is False
+        n_params, n_elems = opt2.count_frozen()
+        assert n_params == 1
+        assert n_elems == p2.numel()
+
+    @pytest.mark.parametrize(
+        "opt_cls",
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon"],
+    )
+    def test_global_step_persists_for_recheck_cadence(self, opt_cls):
+        """
+        Recheck cadence depends on optimizer._global_step. A checkpoint saved
+        mid-cadence must resume with the same counter so the next recheck
+        fires at the correct step.
+        """
+        recheck = 25
+        p = _make_2d_param(shape=(4,))
+        opt = opt_cls(
+            [p],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=5,
+            freeze_recheck_interval=recheck,
+            freeze_beta=0.5,
+        )
+        # Drive to freeze well before the first recheck (step 25).
+        _drive_noise_grads(p, opt, n_steps=15)
+        assert opt._global_step == 15
+        assert opt.state[p]["frozen"] is True
+        assert p.requires_grad is False
+
+        sd = copy.deepcopy(opt.state_dict())
+        assert sd["_global_step"] == 15
+
+        # Fresh optimizer/param, restore.
+        p2 = torch.zeros((4,), requires_grad=True)
+        opt2 = opt_cls(
+            [p2],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=5,
+            freeze_recheck_interval=recheck,
+            freeze_beta=0.5,
+        )
+        opt2.load_state_dict(sd)
+        assert opt2._global_step == 15
+
+        # Step 9 more times: that puts _global_step at 24 -- still pre-recheck.
+        for _ in range(9):
+            opt2.step()  # frozen, no grad, no-op step but _global_step bumps
+        assert opt2._global_step == 24
+        assert p2.requires_grad is False  # still frozen
+
+        # One more step lands on global_step=25, which is the recheck boundary.
+        opt2.step()
+        assert opt2._global_step == 25
+        assert p2.requires_grad is True
+        assert opt2.state[p2]["frozen"] is False
+
+    def test_load_state_dict_backward_compatible(self):
+        """A state_dict missing _global_step (old checkpoint) loads with _global_step=0."""
+        p = torch.zeros((4,), requires_grad=True)
+        opt = SNRAdamW(
+            [p],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=5,
+            freeze_recheck_interval=10,
+            freeze_beta=0.5,
+        )
+        opt._global_step = 7  # pretend a prior run
+        sd = opt.state_dict()
+        sd.pop("_global_step")  # simulate an older checkpoint
+
+        opt2 = SNRAdamW([torch.zeros((4,), requires_grad=True)], lr=1e-3)
+        opt2.load_state_dict(sd)
+        assert opt2._global_step == 0
+
 
 # ---------------------------------------------------------------------------
 # Stats integration
