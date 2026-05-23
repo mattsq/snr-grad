@@ -282,6 +282,59 @@ class TestGrokfastCombo:
 
 
 # ---------------------------------------------------------------------------
+# No-op step guard: counters must not advance when no params have gradients
+# ---------------------------------------------------------------------------
+
+class TestNoOpStepGuard:
+
+    @pytest.mark.parametrize("cls", ALL_SF_CLASSES)
+    def test_step_with_no_grads_does_not_advance_counters(self, cls):
+        model, target = _make_linear()
+        opt = cls(model.parameters(), lr=1e-3)
+        # Do one real step so counters initialize.
+        _train_step(model, target, opt)
+        k_before = opt.param_groups[0]["k"]
+        weight_sum_before = opt.param_groups[0]["weight_sum"]
+        # zero_grad with set_to_none=True clears grads; subsequent step() is a no-op.
+        opt.zero_grad(set_to_none=True)
+        opt.step()
+        assert opt.param_groups[0]["k"] == k_before
+        assert opt.param_groups[0]["weight_sum"] == weight_sum_before
+
+    @pytest.mark.parametrize("cls", ALL_SF_CLASSES)
+    def test_step_with_no_grads_before_first_real_step(self, cls):
+        # No-op step() before any param has ever had a gradient should leave the
+        # group counters absent (or zero) and not raise.
+        model, target = _make_linear()
+        opt = cls(model.parameters(), lr=1e-3)
+        opt.step()
+        assert opt.param_groups[0].get("k", 0) == 0
+        assert opt.param_groups[0]["weight_sum"] == 0.0
+        # A real step afterwards still works.
+        _train_step(model, target, opt)
+        assert opt.param_groups[0]["k"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Sparse-gradient guard
+# ---------------------------------------------------------------------------
+
+class TestSparseGradGuard:
+
+    @pytest.mark.parametrize("cls", ALL_SF_CLASSES)
+    def test_sparse_grad_raises(self, cls):
+        torch.manual_seed(0)
+        p = nn.Parameter(torch.randn(4, 4))
+        opt = cls([p], lr=1e-3)
+        # Manually attach a sparse gradient.
+        indices = torch.tensor([[0, 1], [1, 2]])
+        values = torch.tensor([1.0, 2.0])
+        p.grad = torch.sparse_coo_tensor(indices, values, size=(4, 4))
+        with pytest.raises(RuntimeError, match="sparse"):
+            opt.step()
+
+
+# ---------------------------------------------------------------------------
 # State dict save / load
 # ---------------------------------------------------------------------------
 

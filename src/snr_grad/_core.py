@@ -1061,8 +1061,11 @@ class SNRScheduleFreeAdamW(Optimizer):
             grokfast_alpha = group.get("grokfast_alpha", 0.0)
             grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
-            # Per-group ScheduleFree bookkeeping uses (t+1) since per-param `step` is
-            # incremented below; advance the group's step counter once per group call.
+            # Advance ScheduleFree bookkeeping only when at least one param has a
+            # gradient -- otherwise no-op step() calls would shift the averaging
+            # trajectory for subsequent real updates.
+            if not any(p.grad is not None for p in group["params"]):
+                continue
             if "k" not in group:
                 group["k"] = 0
             group["k"] += 1
@@ -1228,6 +1231,8 @@ class SNRScheduleFreeMuon(Optimizer):
             grokfast_alpha = group.get("grokfast_alpha", 0.0)
             grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
+            if not any(p.grad is not None for p in group["params"]):
+                continue
             if "k" not in group:
                 group["k"] = 0
             group["k"] += 1
@@ -1236,6 +1241,8 @@ class SNRScheduleFreeMuon(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("SNRScheduleFreeMuon does not support sparse gradients.")
                 g = p.grad.detach()
                 if maximize:
                     g = -g
@@ -1371,6 +1378,8 @@ class RotatedSNRScheduleFreeAdamW(Optimizer):
             grokfast_alpha = group.get("grokfast_alpha", 0.0)
             grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
+            if not any(p.grad is not None for p in group["params"]):
+                continue
             if "k" not in group:
                 group["k"] = 0
             group["k"] += 1
@@ -1548,6 +1557,8 @@ class SpectralSNRScheduleFreeMuon(Optimizer):
             grokfast_alpha = group.get("grokfast_alpha", 0.0)
             grokfast_lamb = group.get("grokfast_lamb", 0.0)
 
+            if not any(p.grad is not None for p in group["params"]):
+                continue
             if "k" not in group:
                 group["k"] = 0
             group["k"] += 1
