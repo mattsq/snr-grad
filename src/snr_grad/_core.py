@@ -938,7 +938,7 @@ class MARSSNRAdamW(Optimizer):
                     grad = -grad
 
                 state: MutableMapping[str, Any] = self.state[p]
-                if len(state) == 0:
+                if "step" not in state:
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
