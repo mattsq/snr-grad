@@ -79,6 +79,24 @@ optimizer = SNRAdamW(
 
 `alpha` also accepts `"online"` (equivalent to `1.0`, the default) or any numeric value.
 
+## Freezing low-SNR parameters to save backward compute
+
+The gate `q` already suppresses noise-dominated updates, but the backward pass still computes the gradients and stores the activations needed for them. When a parameter's gate sits near zero for many consecutive steps, those resources are wasted. Setting `freeze_low_snr=True` makes the optimizer track an EMA of each parameter's gate and call `p.requires_grad_(False)` once the EMA has been below `freeze_threshold` for `freeze_patience` steps. PyTorch's autograd then propagates `needs_input_grad=False` through the subgraph: when every leaf in a module is frozen, its activations are not retained and its backward kernels do not run. Frozen parameters are re-enabled every `freeze_recheck_interval` steps so they can recover if their signal returns.
+
+```python
+optimizer = SNRAdamW(
+    model.parameters(),
+    lr=3e-4,
+    freeze_low_snr=True,
+    freeze_threshold=0.05,
+    freeze_patience=200,
+    freeze_recheck_interval=1000,
+    freeze_beta=0.99,
+)
+```
+
+The same flag works on all four optimizers (`SNRAdamW`, `SNRMuon`, `RotatedSNRAdamW`, `SpectralSNRMuon`). Each exposes an `opt.count_frozen()` method returning `(parameters_frozen, elements_frozen)`; `SNRAdamW` additionally reports these in `opt.last_stats` when `track_stats=True`. Parameters the user has already set to `requires_grad=False` are not touched by the recheck. `benchmark_freeze.py` compares the freeze and baseline arms on an overparameterized MLP.
+
 ## Exact gradient variance
 
 If you have access to per-sample gradients (e.g. via `torch.func.vmap`), you can supply exact variance estimates instead of relying on the streaming EMA:
@@ -214,6 +232,50 @@ optimizer = MARSSNRAdamW(
 )
 ```
 
+### ScheduleFree integration -- Iterate averaging without LR schedules
+
+We provide ScheduleFree (Defazio et al., [arXiv:2405.15682](https://arxiv.org/abs/2405.15682)) variants of all four optimizer classes:
+
+- `SNRScheduleFreeAdamW`
+- `SNRScheduleFreeMuon`
+- `RotatedSNRScheduleFreeAdamW`
+- `SpectralSNRScheduleFreeMuon`
+
+ScheduleFree replaces the need for LR schedules (warmup/cosine/linear) with built-in Polyak-Ruppert iterate averaging. The model parameters hold the gradient-evaluation point `y = (1 - sf_beta) * z + sf_beta * x` during training; the averaged iterate `x` (used at inference) is reconstructed on demand. The SNR gate is computed exactly as before and filters the per-step Adam-normalized gradient that drives the base sequence `z`. Adam's first moment `m_hat` is used *only* to compute the gate -- it does not appear in the update direction, because ScheduleFree's `y`-interpolation already provides the momentum role.
+
+```python
+from snr_grad import SNRScheduleFreeAdamW
+
+optimizer = SNRScheduleFreeAdamW(
+    model.parameters(),
+    lr=3e-4,
+    sf_beta=0.9,             # y-interpolation factor (Polyak averaging strength)
+    sf_warmup_steps=500,     # optional linear warmup of effective lr (0 disables)
+    sf_lr_power=2.0,         # weight_t = lr_max ** sf_lr_power (Defazio default)
+    weight_decay=0.01,
+)
+
+# Training loop
+optimizer.train()
+for batch in train_loader:
+    loss = compute_loss(model, batch)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+# Switch parameters to the averaged iterate x for validation:
+optimizer.eval()
+model.eval()
+with torch.no_grad():
+    validate(model)
+# Restore y for resumed training:
+optimizer.train()
+model.train()
+```
+
+Calling `.step()` while in eval mode raises an explicit error. `optimizer.eval()` and `optimizer.train()` are idempotent and survive `state_dict()` / `load_state_dict()` roundtrips.
+
+Defaults follow the ScheduleFree paper: `sf_beta=0.9`, `sf_warmup_steps=0`, `sf_lr_power=2.0`, `sf_r=0.0`. Decoupled weight decay is applied through `y` (Defazio's choice). The Grokfast slow-gradient amplification described above composes with the ScheduleFree variants -- pass `grokfast_alpha` and `grokfast_lamb` as usual.
 ### When to use which optimizer
 
 Benchmarks on synthetic low-rank matrix recovery with anisotropic inputs reveal clear regimes where each method excels:

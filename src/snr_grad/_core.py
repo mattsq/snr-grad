@@ -147,6 +147,140 @@ class SNRAdamWStats:
     mean_s_hat: float
     mean_m2: float
     parameters_seen: int
+    parameters_frozen: int = 0
+    elements_frozen: int = 0
+
+
+def _validate_freeze_args(
+    freeze_low_snr: bool,
+    freeze_threshold: float,
+    freeze_patience: int,
+    freeze_recheck_interval: int,
+    freeze_beta: float,
+) -> None:
+    """Shared validation for the freeze-low-SNR hyperparameters."""
+    if not isinstance(freeze_low_snr, bool):
+        raise ValueError(f"freeze_low_snr must be bool, got {type(freeze_low_snr).__name__}.")
+    if not (0.0 <= freeze_threshold <= 1.0):
+        raise ValueError(f"freeze_threshold must be in [0, 1], got {freeze_threshold}.")
+    if not (isinstance(freeze_patience, int) and freeze_patience > 0):
+        raise ValueError(f"freeze_patience must be a positive int, got {freeze_patience!r}.")
+    if not (isinstance(freeze_recheck_interval, int) and freeze_recheck_interval > 0):
+        raise ValueError(
+            f"freeze_recheck_interval must be a positive int, got {freeze_recheck_interval!r}."
+        )
+    if not (0.0 <= freeze_beta < 1.0):
+        raise ValueError(f"freeze_beta must be in [0, 1), got {freeze_beta}.")
+
+
+def _update_freeze_state(
+    p: Tensor,
+    state: MutableMapping[str, Any],
+    q: Tensor,
+    group: Mapping[str, Any],
+) -> None:
+    """
+    Update the per-parameter gate EMA and freeze p if it stays below the threshold.
+
+    Called once per param, immediately after compute_gate. No-op when freeze_low_snr
+    is disabled for this group.
+    """
+    if not group.get("freeze_low_snr", False):
+        return
+
+    q_mean = float(q.detach().mean().item())
+    beta = group["freeze_beta"]
+    if "gate_ema" in state:
+        state["gate_ema"] = beta * state["gate_ema"] + (1.0 - beta) * q_mean
+    else:
+        state["gate_ema"] = q_mean
+
+    if state["gate_ema"] < group["freeze_threshold"]:
+        state["below_count"] = state.get("below_count", 0) + 1
+        if (
+            state["below_count"] >= group["freeze_patience"]
+            and not state.get("frozen", False)
+        ):
+            p.requires_grad_(False)
+            state["frozen"] = True
+    else:
+        state["below_count"] = 0
+
+
+def _maybe_recheck_freeze(optimizer: Optimizer) -> None:
+    """
+    Bump the optimizer global step and, on the recheck cadence, re-enable any
+    params the optimizer has frozen so their gate can be re-evaluated.
+
+    User-frozen params (state["frozen"] is False/missing) are never touched.
+    """
+    if not any(g.get("freeze_low_snr", False) for g in optimizer.param_groups):
+        return
+    optimizer._global_step = getattr(optimizer, "_global_step", 0) + 1
+    for group in optimizer.param_groups:
+        if not group.get("freeze_low_snr", False):
+            continue
+        if optimizer._global_step % group["freeze_recheck_interval"] != 0:
+            continue
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is None:
+                continue
+            if st.get("frozen", False):
+                p.requires_grad_(True)
+                st["frozen"] = False
+                st["below_count"] = 0
+
+
+def _count_frozen(optimizer: Optimizer) -> tuple[int, int]:
+    """Return (num_params_frozen_by_optimizer, total_elements_frozen)."""
+    n_params = 0
+    n_elems = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                n_params += 1
+                n_elems += p.numel()
+    return n_params, n_elems
+
+
+def _freeze_state_dict(optimizer: Optimizer) -> dict:
+    """
+    Augment Optimizer.state_dict with the freeze global step counter.
+
+    The recheck cadence depends on optimizer._global_step. Without this, a
+    checkpoint resumed mid-run would restart the cadence at 0.
+    """
+    sd = Optimizer.state_dict(optimizer)
+    sd["_global_step"] = int(getattr(optimizer, "_global_step", 0))
+    return sd
+
+
+def _freeze_load_state_dict(optimizer: Optimizer, state_dict: dict) -> None:
+    """
+    Load Optimizer state and reapply the freeze invariants.
+
+    Two things the base class does not handle for us:
+      1. Restore optimizer._global_step so recheck cadence continues correctly.
+      2. Reapply p.requires_grad_(False) for any param whose restored state
+         says state["frozen"] is True. Without this, fresh parameters arrive
+         with requires_grad=True so the optimizer would think they're frozen
+         while autograd still computes their gradients until the next recheck.
+    """
+    # _global_step is our extension; the base class only reads
+    # "state" and "param_groups", but be explicit and strip it anyway.
+    global_step = int(state_dict.get("_global_step", 0))
+    base_sd = {k: v for k, v in state_dict.items() if k != "_global_step"}
+
+    Optimizer.load_state_dict(optimizer, base_sd)
+    optimizer._global_step = global_step
+
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                p.requires_grad_(False)
 
 
 class SNRAdamW(Optimizer):
@@ -202,6 +336,11 @@ class SNRAdamW(Optimizer):
         track_stats: bool = False,
         grokfast_alpha: float = 0.0,
         grokfast_lamb: float = 0.0,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -225,6 +364,13 @@ class SNRAdamW(Optimizer):
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_freeze_args(
+            freeze_low_snr,
+            freeze_threshold,
+            freeze_patience,
+            freeze_recheck_interval,
+            freeze_beta,
+        )
 
         defaults = dict(
             lr=lr,
@@ -242,9 +388,24 @@ class SNRAdamW(Optimizer):
             track_stats=track_stats,
             grokfast_alpha=grokfast_alpha,
             grokfast_lamb=grokfast_lamb,
+            freeze_low_snr=freeze_low_snr,
+            freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience,
+            freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
         self.last_stats: Optional[SNRAdamWStats] = None
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(
@@ -370,6 +531,8 @@ class SNRAdamW(Optimizer):
                     gate_eps=gate_eps,
                 )
 
+                _update_freeze_state(p, state, q, group)
+
                 # Decoupled weight decay, matching AdamW and the paper's update.
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
@@ -390,6 +553,8 @@ class SNRAdamW(Optimizer):
                     elem_counts.append(q_detached.numel())
                     parameters_seen += 1
 
+        _maybe_recheck_freeze(self)
+
         if parameters_seen > 0:
             target_device = gate_sums[0].device
             gate_sums_t = torch.stack([x.to(target_device) for x in gate_sums])
@@ -408,6 +573,7 @@ class SNRAdamW(Optimizer):
             ])
             stats_cpu = stats_tensor.cpu().tolist()
 
+            n_frozen_params, n_frozen_elems = _count_frozen(self)
             self.last_stats = SNRAdamWStats(
                 mean_gate=stats_cpu[0] / elem_count,
                 min_gate=stats_cpu[1],
@@ -415,6 +581,8 @@ class SNRAdamW(Optimizer):
                 mean_s_hat=stats_cpu[3] / elem_count,
                 mean_m2=stats_cpu[4] / elem_count,
                 parameters_seen=parameters_seen,
+                parameters_frozen=n_frozen_params,
+                elements_frozen=n_frozen_elems,
             )
         else:
             self.last_stats = None
@@ -467,18 +635,39 @@ class SNRMuon(Optimizer):
         muon_mode: Literal["post", "pre"] = "post",
         grokfast_alpha: float = 0.0,
         grokfast_lamb: float = 0.0,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_freeze_args(
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+        )
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
             gate=gate, lambda_pop=lambda_pop, alpha=alpha, batch_size=batch_size,
             dataset_size=dataset_size, maximize=maximize, muon_ns_steps=muon_ns_steps,
             muon_mode=muon_mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+            freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -534,6 +723,8 @@ class SNRMuon(Optimizer):
                 s_hat = s / (1.0 - rho**t)
                 q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
 
+                _update_freeze_state(p, st, q, group)
+
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
 
@@ -546,6 +737,7 @@ class SNRMuon(Optimizer):
                 else:
                     update = q * base_update
                 p.add_(update, alpha=-lr)
+        _maybe_recheck_freeze(self)
         return loss
 
 
@@ -569,18 +761,39 @@ class RotatedSNRAdamW(Optimizer):
         maximize: bool = False,
         grokfast_alpha: float = 0.0,
         grokfast_lamb: float = 0.0,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_freeze_args(
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+        )
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
             gate=gate, lambda_pop=lambda_pop, alpha=alpha, basis_beta=basis_beta,
             basis_update_interval=basis_update_interval, maximize=maximize,
             grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+            freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -649,6 +862,7 @@ class RotatedSNRAdamW(Optimizer):
                     v_hat = v / (1 - beta2**t)
                     s_hat = s / (1 - rho**t)
                     q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     p.add_(q * m_hat / (v_hat.sqrt() + eps), alpha=-lr)
                     continue
 
@@ -680,22 +894,37 @@ class RotatedSNRAdamW(Optimizer):
                 V_hat = V / (1 - beta2**t)
                 S_hat = S / (1 - rho**t)
                 q = compute_gate(M_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                _update_freeze_state(p, st, q, group)
                 Uc = q * M_hat / (V_hat.sqrt() + eps)
                 update = QL @ Uc @ QR.t()
                 p.add_(update.to(dtype=p.dtype), alpha=-lr)
+        _maybe_recheck_freeze(self)
         return loss
 
 
 class SpectralSNRMuon(Optimizer):
     """SVD-basis SNR gating with diagonal or full spectral coefficients."""
 
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0):
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0, freeze_low_snr: bool = False, freeze_threshold: float = 0.05, freeze_patience: int = 200, freeze_recheck_interval: int = 1000, freeze_beta: float = 0.99):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
-        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb)
+        _validate_freeze_args(
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+        )
+        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb, freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold, freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval, freeze_beta=freeze_beta)
         super().__init__(params, defaults)
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -755,6 +984,7 @@ class SpectralSNRMuon(Optimizer):
                     v_hat = v / (1 - b2**t)
                     s_hat = s / (1 - rho**t)
                     q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     if group["weight_decay"] != 0:
                         p.add_(p, alpha=-group["lr"] * group["weight_decay"])
                     p.add_(q * m_hat / (v_hat.sqrt() + group["eps"]), alpha=-group["lr"])
@@ -777,6 +1007,7 @@ class SpectralSNRMuon(Optimizer):
                     s_hat = s / (1 - rho**t)
                     v_hat = v / (1 - b2**t)
                     q = compute_gate(a_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     if group["variant"] == "muon_spectral_gate":
                         d = q
                     else:
@@ -792,11 +1023,883 @@ class SpectralSNRMuon(Optimizer):
                     S_hat = S / (1 - rho**t)
                     V_hat = Vst / (1 - b2**t)
                     q = compute_gate(A_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     coeff = q if group["variant"] == "muon_spectral_gate" else q * A_hat / (V_hat.sqrt() + group["eps"])
                     D = U @ coeff @ V.t()
                 if group["weight_decay"] != 0:
                     p.add_(p, alpha=-group["lr"] * group["weight_decay"])
                 p.add_(D.to(dtype=p.dtype), alpha=-group["lr"])
+        _maybe_recheck_freeze(self)
+        return loss
+
+
+# ---------------------------------------------------------------------------
+# ScheduleFree variants
+#
+# These combine SNR gating with the iterate-averaging dynamic from
+# "The Road Less Scheduled" (Defazio et al., arXiv:2405.15682).
+#
+# Notation:
+#   z_t     : base iterate (in optimizer state)
+#   x_t     : Polyak-Ruppert running average of z (implicit; reconstructed when needed)
+#   y_t     : gradient evaluation point; y_t = (1-beta_sf) z_t + beta_sf x_t
+#
+# During training, p.data holds y_t. Calling optimizer.eval() swaps p.data to x_t;
+# optimizer.train() swaps it back to y_t. SNR moments (m, v, s) track gradients
+# computed at y_t, exactly like the existing SNR optimizers. The SNR gate q is
+# computed from bias-corrected (m_hat, s_hat) and applied to the Adam-normalized
+# per-step gradient g/(sqrt(v_hat)+eps) in the z-update. m_hat itself does NOT
+# enter the update direction -- ScheduleFree replaces Adam's first-moment momentum
+# with the y-interpolation, so adding m_hat back would double-count momentum.
+# ---------------------------------------------------------------------------
+
+
+def _validate_schedulefree_args(
+    sf_beta: float,
+    sf_warmup_steps: int,
+    sf_lr_power: float,
+    sf_r: float,
+) -> None:
+    if not 0.0 < sf_beta < 1.0:
+        raise ValueError(f"Invalid sf_beta: {sf_beta}. Must be in (0, 1).")
+    if sf_warmup_steps < 0:
+        raise ValueError(f"Invalid sf_warmup_steps: {sf_warmup_steps}.")
+    if sf_lr_power < 0:
+        raise ValueError(f"Invalid sf_lr_power: {sf_lr_power}.")
+    if sf_r < 0:
+        raise ValueError(f"Invalid sf_r: {sf_r}.")
+
+
+def _schedulefree_group_init(defaults: dict) -> dict:
+    """Add ScheduleFree per-group state placeholders to a defaults dict."""
+    defaults["weight_sum"] = 0.0
+    defaults["lr_max"] = 0.0
+    defaults["train_mode"] = True
+    return defaults
+
+
+def _schedulefree_lr_and_ckp1(group: dict, step_after_increment: int) -> tuple[float, float]:
+    """
+    Compute the warmup-scaled lr_t and the Polyak-Ruppert weight c_{t+1} for this step.
+
+    step_after_increment is the step counter AFTER increment for the current step (i.e. t).
+    Mirrors the reference schedule_free package's per-group bookkeeping.
+    """
+    warmup = group["sf_warmup_steps"]
+    if warmup > 0 and step_after_increment <= warmup:
+        sched = step_after_increment / warmup
+    else:
+        sched = 1.0
+    lr_t = float(group["lr"]) * sched
+
+    lr_max = max(group["lr_max"], lr_t)
+    group["lr_max"] = lr_max
+
+    weight = (step_after_increment ** group["sf_r"]) * (lr_max ** group["sf_lr_power"])
+    weight_sum = group["weight_sum"] + weight
+    group["weight_sum"] = weight_sum
+
+    if weight_sum > 0:
+        ckp1 = weight / weight_sum
+    else:
+        ckp1 = 0.0
+    return lr_t, ckp1
+
+
+def _schedulefree_swap_to_eval(group: dict, state: MutableMapping) -> None:
+    """Swap p.data from y -> x = (y - (1-beta)*z) / beta for every param with state."""
+    beta = group["sf_beta"]
+    for p in group["params"]:
+        if p not in state:
+            continue
+        z = state[p].get("z")
+        if z is None:
+            continue
+        # lerp(p, z, w) = (1-w)*p + w*z; choose w = 1 - 1/beta so result = (p - (1-beta)*z)/beta = x.
+        p.data.lerp_(z, 1.0 - 1.0 / beta)
+    group["train_mode"] = False
+
+
+def _schedulefree_swap_to_train(group: dict, state: MutableMapping) -> None:
+    """Swap p.data from x -> y = (1-beta)*z + beta*x for every param with state."""
+    beta = group["sf_beta"]
+    for p in group["params"]:
+        if p not in state:
+            continue
+        z = state[p].get("z")
+        if z is None:
+            continue
+        # lerp(p, z, w) = (1-w)*p + w*z; choose w = 1 - beta so result = beta*x + (1-beta)*z = y.
+        p.data.lerp_(z, 1.0 - beta)
+    group["train_mode"] = True
+
+
+def _apply_schedulefree_y_update(
+    p: Tensor,
+    z: Tensor,
+    z_old: Tensor,
+    ckp1: float,
+    sf_beta: float,
+) -> None:
+    """
+    In-place update of p.data from y_t to y_{t+1}, given new z, old z, and ckp1.
+
+    Derivation:
+        x_{t+1} = (1 - c) x_t + c z_{t+1}
+        y_{t+1} = (1 - beta) z_{t+1} + beta x_{t+1}
+        x_t     = (y_t - (1 - beta) z_t) / beta
+    Substituting:
+        y_{t+1} = ((1-beta) + beta*c) z_{t+1}
+                + (1 - c) y_t
+                - (1 - c)(1 - beta) z_t
+    """
+    coef_z_new = (1.0 - sf_beta) + sf_beta * ckp1
+    coef_y_old = 1.0 - ckp1
+    coef_z_old = -(1.0 - ckp1) * (1.0 - sf_beta)
+    # In place: p = coef_y_old * p + coef_z_new * z + coef_z_old * z_old
+    p.data.mul_(coef_y_old)
+    p.data.add_(z, alpha=coef_z_new)
+    p.data.add_(z_old, alpha=coef_z_old)
+
+
+class SNRScheduleFreeAdamW(Optimizer):
+    """
+    ScheduleFree (Defazio et al., 2024) variant of SNRAdamW.
+
+    Replaces explicit LR schedules with Polyak-Ruppert iterate averaging. The model
+    parameters hold y_t = (1 - sf_beta) z_t + sf_beta x_t during training; gradients
+    computed at y_t flow through the SNR gate into the base iterate z_t. The averaged
+    iterate x_t (used at evaluation) is reconstructed on demand from y and z.
+
+    Call `optimizer.eval()` before validation/inference to swap params to x_t; call
+    `optimizer.train()` before resuming training to swap back to y_t.
+
+    Notes:
+        - SNR moments (m, v, s) are accumulated from gradients evaluated at y_t.
+        - The Adam first moment m_hat is used ONLY to compute the gate q. It does
+          not appear in the update direction. ScheduleFree's y-interpolation
+          provides the momentum role that m_hat would otherwise play.
+        - Weight decay is decoupled and applied through y (Defazio's choice).
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "snr",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        batch_size: Optional[int] = None,
+        dataset_size: Optional[int] = None,
+        maximize: bool = False,
+        sf_beta: float = 0.9,
+        sf_warmup_steps: int = 0,
+        sf_lr_power: float = 2.0,
+        sf_r: float = 0.0,
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if eps <= 0:
+            raise ValueError(f"Invalid eps: {eps}")
+        if gate_eps <= 0:
+            raise ValueError(f"Invalid gate_eps: {gate_eps}")
+        if not 0 <= betas[0] < 1:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0 <= betas[1] < 1:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+        if not 0 <= rho < 1:
+            raise ValueError(f"Invalid rho: {rho}")
+        if weight_decay < 0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if lambda_pop < 0:
+            raise ValueError(f"Invalid lambda_pop: {lambda_pop}")
+        if gate not in {"soft", "snr", "hard"}:
+            raise ValueError(f"Invalid gate: {gate!r}")
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_schedulefree_args(sf_beta, sf_warmup_steps, sf_lr_power, sf_r)
+
+        defaults = dict(
+            lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps,
+            weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop,
+            alpha=alpha, batch_size=batch_size, dataset_size=dataset_size,
+            maximize=maximize,
+            sf_beta=sf_beta, sf_warmup_steps=sf_warmup_steps,
+            sf_lr_power=sf_lr_power, sf_r=sf_r,
+            grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+        )
+        _schedulefree_group_init(defaults)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def train(self) -> None:
+        """Switch back to training mode: p.data <- y_t."""
+        for group in self.param_groups:
+            if group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_train(group, self.state)
+
+    @torch.no_grad()
+    def eval(self) -> None:
+        """Switch to evaluation mode: p.data <- x_t (the averaged iterate)."""
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_eval(group, self.state)
+
+    @torch.no_grad()
+    def step(
+        self,
+        closure: Optional[Any] = None,
+        *,
+        batch_size: Optional[int] = None,
+        dataset_size: Optional[int] = None,
+        grad_variances: Optional[Mapping[Tensor, Tensor]] = None,
+    ) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                raise RuntimeError(
+                    "SNRScheduleFreeAdamW.step() called in eval mode. "
+                    "Call optimizer.train() before stepping."
+                )
+
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            gate_eps = group["gate_eps"]
+            wd = group["weight_decay"]
+            gate_type: GateType = group["gate"]
+            lambda_pop = group["lambda_pop"]
+            alpha_value = resolve_alpha(
+                group["alpha"],
+                batch_size=batch_size if batch_size is not None else group.get("batch_size"),
+                dataset_size=dataset_size if dataset_size is not None else group.get("dataset_size"),
+            )
+            maximize = group["maximize"]
+            sf_beta = group["sf_beta"]
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
+
+            # Advance ScheduleFree bookkeeping only when at least one param has a
+            # gradient -- otherwise no-op step() calls would shift the averaging
+            # trajectory for subsequent real updates.
+            if not any(p.grad is not None for p in group["params"]):
+                continue
+            if "k" not in group:
+                group["k"] = 0
+            group["k"] += 1
+            lr_t, ckp1 = _schedulefree_lr_and_ckp1(group, group["k"])
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("SNRScheduleFreeAdamW does not support sparse gradients.")
+                grad = grad.detach()
+                if maximize:
+                    grad = -grad
+
+                state: MutableMapping[str, Any] = self.state[p]
+                if "step" not in state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_grad_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    # z starts equal to the initial parameters (y_0 = x_0 = z_0).
+                    state["z"] = p.data.clone(memory_format=torch.preserve_format)
+
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in state:
+                        state["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = state["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(grad, alpha=1.0 - grokfast_alpha)
+                    grad = grad + grokfast_lamb * g_slow
+
+                exp_avg: Tensor = state["exp_avg"]
+                exp_avg_sq: Tensor = state["exp_avg_sq"]
+                exp_grad_var: Tensor = state["exp_grad_var"]
+                z: Tensor = state["z"]
+
+                state["step"] += 1
+                t = state["step"]
+
+                grad_minus_m_prev = grad - exp_avg
+                exp_grad_var.mul_(rho).addcmul_(grad_minus_m_prev, grad_minus_m_prev, value=1.0 - rho)
+                exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                m_hat = exp_avg / (1.0 - beta1 ** t)
+                v_hat = exp_avg_sq / (1.0 - beta2 ** t)
+                s_hat = exp_grad_var / (1.0 - rho ** t)
+
+                if grad_variances is not None and p in grad_variances:
+                    exact_s = grad_variances[p].to(device=p.device, dtype=p.dtype)
+                    if exact_s.shape != p.shape:
+                        raise ValueError(
+                            f"grad_variances entry for parameter has shape {tuple(exact_s.shape)}, "
+                            f"expected {tuple(p.shape)}."
+                        )
+                    s_for_gate = exact_s
+                else:
+                    s_for_gate = s_hat
+
+                q = compute_gate(
+                    m_hat, s_for_gate,
+                    gate=gate_type, alpha=alpha_value,
+                    lambda_pop=lambda_pop, gate_eps=gate_eps,
+                )
+
+                # Build the per-step Adam-normalized, gated descent direction (no m_hat).
+                g_adam = grad / (v_hat.sqrt() + eps)
+                update = q * g_adam
+                if wd != 0:
+                    update = update + wd * p.data
+
+                # Save old z, then update z in place.
+                z_old = z.clone()
+                z.add_(update, alpha=-lr_t)
+
+                # Update y = p.data in place using closed-form derivation.
+                _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
+
+        return loss
+
+
+class SNRScheduleFreeMuon(Optimizer):
+    """
+    ScheduleFree variant of SNRMuon: Newton-Schulz orthogonalization applied to the
+    gated, Adam-normalized direction before the z-update (Muon "pre" mode only).
+    Non-2D parameters fall back to the diagonal ScheduleFree step.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "snr",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        batch_size: Optional[int] = None,
+        dataset_size: Optional[int] = None,
+        maximize: bool = False,
+        muon_ns_steps: int = 5,
+        sf_beta: float = 0.9,
+        sf_warmup_steps: int = 0,
+        sf_lr_power: float = 2.0,
+        sf_r: float = 0.0,
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
+    ):
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_schedulefree_args(sf_beta, sf_warmup_steps, sf_lr_power, sf_r)
+        defaults = dict(
+            lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
+            gate=gate, lambda_pop=lambda_pop, alpha=alpha, batch_size=batch_size,
+            dataset_size=dataset_size, maximize=maximize, muon_ns_steps=muon_ns_steps,
+            sf_beta=sf_beta, sf_warmup_steps=sf_warmup_steps,
+            sf_lr_power=sf_lr_power, sf_r=sf_r,
+            grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+        )
+        _schedulefree_group_init(defaults)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def train(self) -> None:
+        for group in self.param_groups:
+            if group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_train(group, self.state)
+
+    @torch.no_grad()
+    def eval(self) -> None:
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_eval(group, self.state)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Any] = None) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                raise RuntimeError(
+                    "SNRScheduleFreeMuon.step() called in eval mode. "
+                    "Call optimizer.train() before stepping."
+                )
+
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            maximize = group["maximize"]
+            alpha_value = resolve_alpha(group["alpha"], batch_size=group.get("batch_size"), dataset_size=group.get("dataset_size"))
+            sf_beta = group["sf_beta"]
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
+
+            if not any(p.grad is not None for p in group["params"]):
+                continue
+            if "k" not in group:
+                group["k"] = 0
+            group["k"] += 1
+            lr_t, ckp1 = _schedulefree_lr_and_ckp1(group, group["k"])
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError("SNRScheduleFreeMuon does not support sparse gradients.")
+                g = p.grad.detach()
+                if maximize:
+                    g = -g
+                st = self.state[p]
+                if "step" not in st:
+                    st["step"] = 0
+                    st["exp_avg"] = torch.zeros_like(p)
+                    st["exp_avg_sq"] = torch.zeros_like(p)
+                    st["exp_grad_var"] = torch.zeros_like(p)
+                    st["z"] = p.data.clone(memory_format=torch.preserve_format)
+
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in st:
+                        st["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = st["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
+                    g = g + grokfast_lamb * g_slow
+
+                m = st["exp_avg"]
+                v = st["exp_avg_sq"]
+                s = st["exp_grad_var"]
+                z = st["z"]
+
+                st["step"] += 1
+                t = st["step"]
+
+                g_minus_m = g - m
+                s.mul_(rho).addcmul_(g_minus_m, g_minus_m, value=1.0 - rho)
+                m.mul_(beta1).add_(g, alpha=1.0 - beta1)
+                v.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
+
+                m_hat = m / (1.0 - beta1 ** t)
+                v_hat = v / (1.0 - beta2 ** t)
+                s_hat = s / (1.0 - rho ** t)
+                q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+
+                g_adam = g / (v_hat.sqrt() + eps)
+                gated = q * g_adam
+                if p.ndim == 2:
+                    direction = _newton_schulz_orthogonalize(gated, steps=group["muon_ns_steps"])
+                else:
+                    direction = gated
+                if wd != 0:
+                    direction = direction + wd * p.data
+
+                z_old = z.clone()
+                z.add_(direction, alpha=-lr_t)
+                _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
+
+        return loss
+
+
+class RotatedSNRScheduleFreeAdamW(Optimizer):
+    """
+    ScheduleFree variant of RotatedSNRAdamW. SOAP-style left/right covariance tracking
+    builds a rotated basis from gradients at y_t; SNR moments are tracked in that basis;
+    the gated rotated direction (no first-moment momentum) drives the z-update.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.95),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "soft",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        basis_beta: float = 0.95,
+        basis_update_interval: int = 50,
+        maximize: bool = False,
+        sf_beta: float = 0.9,
+        sf_warmup_steps: int = 0,
+        sf_lr_power: float = 2.0,
+        sf_r: float = 0.0,
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
+    ):
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_schedulefree_args(sf_beta, sf_warmup_steps, sf_lr_power, sf_r)
+        defaults = dict(
+            lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
+            gate=gate, lambda_pop=lambda_pop, alpha=alpha, basis_beta=basis_beta,
+            basis_update_interval=basis_update_interval, maximize=maximize,
+            sf_beta=sf_beta, sf_warmup_steps=sf_warmup_steps,
+            sf_lr_power=sf_lr_power, sf_r=sf_r,
+            grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+        )
+        _schedulefree_group_init(defaults)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def train(self) -> None:
+        for group in self.param_groups:
+            if group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_train(group, self.state)
+
+    @torch.no_grad()
+    def eval(self) -> None:
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_eval(group, self.state)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Any] = None) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                raise RuntimeError(
+                    "RotatedSNRScheduleFreeAdamW.step() called in eval mode. "
+                    "Call optimizer.train() before stepping."
+                )
+
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            maximize = group["maximize"]
+            alpha_value = resolve_alpha(group["alpha"])
+            sf_beta = group["sf_beta"]
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
+
+            if not any(p.grad is not None for p in group["params"]):
+                continue
+            if "k" not in group:
+                group["k"] = 0
+            group["k"] += 1
+            lr_t, ckp1 = _schedulefree_lr_and_ckp1(group, group["k"])
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if maximize:
+                    g = -g
+                if g.is_sparse:
+                    raise RuntimeError("RotatedSNRScheduleFreeAdamW does not support sparse gradients.")
+
+                st = self.state[p]
+                if "step" not in st:
+                    st["step"] = 0
+                    st["z"] = p.data.clone(memory_format=torch.preserve_format)
+                    if p.ndim == 2:
+                        o, i = p.shape
+                        st["L_cov"] = torch.eye(o, device=p.device, dtype=torch.float32)
+                        st["R_cov"] = torch.eye(i, device=p.device, dtype=torch.float32)
+                        st["QL"] = torch.eye(o, device=p.device, dtype=torch.float32)
+                        st["QR"] = torch.eye(i, device=p.device, dtype=torch.float32)
+                        st["M_c"] = torch.zeros_like(p, dtype=torch.float32)
+                        st["V_c"] = torch.zeros_like(p, dtype=torch.float32)
+                        st["S_c"] = torch.zeros_like(p, dtype=torch.float32)
+                    else:
+                        st["exp_avg"] = torch.zeros_like(p)
+                        st["exp_avg_sq"] = torch.zeros_like(p)
+                        st["exp_grad_var"] = torch.zeros_like(p)
+
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in st:
+                        st["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = st["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
+                    g = g + grokfast_lamb * g_slow
+
+                st["step"] += 1
+                t = st["step"]
+                z = st["z"]
+                z_old = z.clone()
+
+                if p.ndim != 2:
+                    m, v, s = st["exp_avg"], st["exp_avg_sq"], st["exp_grad_var"]
+                    g_minus_m = g - m
+                    s.mul_(rho).addcmul_(g_minus_m, g_minus_m, value=1 - rho)
+                    m.mul_(beta1).add_(g, alpha=1 - beta1)
+                    v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                    m_hat = m / (1 - beta1**t)
+                    v_hat = v / (1 - beta2**t)
+                    s_hat = s / (1 - rho**t)
+                    q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    direction = q * g / (v_hat.sqrt() + eps)
+                    if wd != 0:
+                        direction = direction + wd * p.data
+                    z.add_(direction, alpha=-lr_t)
+                    _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
+                    continue
+
+                G = g.float()
+                basis_beta = group["basis_beta"]
+                st["L_cov"].mul_(basis_beta).add_(G @ G.t(), alpha=1 - basis_beta)
+                st["R_cov"].mul_(basis_beta).add_(G.t() @ G, alpha=1 - basis_beta)
+
+                if t % group["basis_update_interval"] == 0:
+                    QL_old, QR_old = st["QL"], st["QR"]
+                    _, QL_new = torch.linalg.eigh(st["L_cov"])
+                    _, QR_new = torch.linalg.eigh(st["R_cov"])
+                    A = QL_new.t() @ QL_old
+                    B = QR_old.t() @ QR_new
+                    st["M_c"] = A @ st["M_c"] @ B
+                    st["S_c"] = A.square() @ st["S_c"] @ B.square()
+                    st["V_c"] = A.square() @ st["V_c"] @ B.square()
+                    st["QL"], st["QR"] = QL_new, QR_new
+
+                QL, QR = st["QL"], st["QR"]
+                Gc = QL.t() @ G @ QR
+                M, V, S = st["M_c"], st["V_c"], st["S_c"]
+                Gc_minus_M = Gc - M
+                S.mul_(rho).addcmul_(Gc_minus_M, Gc_minus_M, value=1 - rho)
+                M.mul_(beta1).add_(Gc, alpha=1 - beta1)
+                V.mul_(beta2).addcmul_(Gc, Gc, value=1 - beta2)
+
+                M_hat = M / (1 - beta1**t)
+                V_hat = V / (1 - beta2**t)
+                S_hat = S / (1 - rho**t)
+                q = compute_gate(M_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                Uc = q * Gc / (V_hat.sqrt() + eps)
+                direction = (QL @ Uc @ QR.t()).to(dtype=p.dtype)
+                if wd != 0:
+                    direction = direction + wd * p.data
+                z.add_(direction, alpha=-lr_t)
+                _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
+
+        return loss
+
+
+class SpectralSNRScheduleFreeMuon(Optimizer):
+    """
+    ScheduleFree variant of SpectralSNRMuon. Maintains the SVD-basis tracking on the
+    momentum EMA M (which sets a stable spectral basis), but the update direction
+    uses the per-step spectral coefficients c = U^T G V rather than the bias-corrected
+    first-moment a_hat. The gate q is still computed from (a_hat, s_hat).
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.9,
+        betas: tuple[float, float] = (0.9, 0.95),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "soft",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate",
+        mode: Literal["diag", "full"] = "diag",
+        sf_beta: float = 0.9,
+        sf_warmup_steps: int = 0,
+        sf_lr_power: float = 2.0,
+        sf_r: float = 0.0,
+        grokfast_alpha: float = 0.0,
+        grokfast_lamb: float = 0.0,
+    ):
+        if grokfast_alpha < 0:
+            raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
+        if grokfast_lamb < 0:
+            raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_schedulefree_args(sf_beta, sf_warmup_steps, sf_lr_power, sf_r)
+        defaults = dict(
+            lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps,
+            weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha,
+            variant=variant, mode=mode,
+            sf_beta=sf_beta, sf_warmup_steps=sf_warmup_steps,
+            sf_lr_power=sf_lr_power, sf_r=sf_r,
+            grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+        )
+        _schedulefree_group_init(defaults)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def train(self) -> None:
+        for group in self.param_groups:
+            if group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_train(group, self.state)
+
+    @torch.no_grad()
+    def eval(self) -> None:
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                continue
+            _schedulefree_swap_to_eval(group, self.state)
+
+    @torch.no_grad()
+    def step(self, closure: Optional[Any] = None) -> Optional[float]:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if not group.get("train_mode", True):
+                raise RuntimeError(
+                    "SpectralSNRScheduleFreeMuon.step() called in eval mode. "
+                    "Call optimizer.train() before stepping."
+                )
+
+            sf_beta = group["sf_beta"]
+            grokfast_alpha = group.get("grokfast_alpha", 0.0)
+            grokfast_lamb = group.get("grokfast_lamb", 0.0)
+
+            if not any(p.grad is not None for p in group["params"]):
+                continue
+            if "k" not in group:
+                group["k"] = 0
+            group["k"] += 1
+            lr_t, ckp1 = _schedulefree_lr_and_ckp1(group, group["k"])
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                if g.is_sparse:
+                    raise RuntimeError("SpectralSNRScheduleFreeMuon does not support sparse gradients.")
+                st = self.state[p]
+
+                if "step" not in st:
+                    st["step"] = 0
+                    st["z"] = p.data.clone(memory_format=torch.preserve_format)
+                    if p.ndim == 2:
+                        st["M"] = torch.zeros_like(p, dtype=torch.float32)
+                        if group["mode"] == "diag":
+                            r = min(p.shape)
+                            st["a"] = torch.zeros(r, device=p.device)
+                            st["s"] = torch.zeros(r, device=p.device)
+                            st["v"] = torch.zeros(r, device=p.device)
+                        else:
+                            r = min(p.shape)
+                            st["A"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                            st["S"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                            st["V"] = torch.zeros((r, r), device=p.device, dtype=torch.float32)
+                    else:
+                        st["exp_avg"] = torch.zeros_like(p)
+                        st["exp_avg_sq"] = torch.zeros_like(p)
+                        st["exp_grad_var"] = torch.zeros_like(p)
+
+                if grokfast_alpha > 0.0 and grokfast_lamb > 0.0:
+                    if "g_slow" not in st:
+                        st["g_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    g_slow = st["g_slow"]
+                    g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
+                    g = g + grokfast_lamb * g_slow
+
+                st["step"] += 1
+                t = st["step"]
+                b1, b2 = group["betas"]
+                rho = group["rho"]
+                eps = group["eps"]
+                wd = group["weight_decay"]
+                alpha_value = resolve_alpha(group["alpha"])
+                z = st["z"]
+                z_old = z.clone()
+
+                if p.ndim != 2:
+                    m, v, s = st["exp_avg"], st["exp_avg_sq"], st["exp_grad_var"]
+                    g_minus_m_prev = g - m
+                    s.mul_(rho).addcmul_(g_minus_m_prev, g_minus_m_prev, value=1 - rho)
+                    m.mul_(b1).add_(g, alpha=1 - b1)
+                    v.mul_(b2).addcmul_(g, g, value=1 - b2)
+                    m_hat = m / (1 - b1**t)
+                    v_hat = v / (1 - b2**t)
+                    s_hat = s / (1 - rho**t)
+                    q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    direction = q * g / (v_hat.sqrt() + eps)
+                    if wd != 0:
+                        direction = direction + wd * p.data
+                    z.add_(direction, alpha=-lr_t)
+                    _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
+                    continue
+
+                G = g.float()
+                M = st["M"]
+                M.mul_(group["momentum"]).add_(G, alpha=1 - group["momentum"])
+                U, _, Vh = torch.linalg.svd(M, full_matrices=False)
+                V = Vh.t()
+                C = U.t() @ G @ V
+                if group["mode"] == "diag":
+                    c = C.diag()
+                    a, s, v = st["a"], st["s"], st["v"]
+                    c_minus_a = c - a
+                    s.mul_(rho).addcmul_(c_minus_a, c_minus_a, value=1 - rho)
+                    a.mul_(b1).add_(c, alpha=1 - b1)
+                    v.mul_(b2).addcmul_(c, c, value=1 - b2)
+                    a_hat = a / (1 - b1**t)
+                    s_hat = s / (1 - rho**t)
+                    v_hat = v / (1 - b2**t)
+                    q = compute_gate(a_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    if group["variant"] == "muon_spectral_gate":
+                        d = q
+                    else:
+                        d = q * c / (v_hat.sqrt() + eps)
+                    D = U @ torch.diag(d) @ V.t()
+                else:
+                    A, S, Vst = st["A"], st["S"], st["V"]
+                    C_minus_A = C - A
+                    S.mul_(rho).addcmul_(C_minus_A, C_minus_A, value=1 - rho)
+                    A.mul_(b1).add_(C, alpha=1 - b1)
+                    Vst.mul_(b2).addcmul_(C, C, value=1 - b2)
+                    A_hat = A / (1 - b1**t)
+                    S_hat = S / (1 - rho**t)
+                    V_hat = Vst / (1 - b2**t)
+                    q = compute_gate(A_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    coeff = q if group["variant"] == "muon_spectral_gate" else q * C / (V_hat.sqrt() + eps)
+                    D = U @ coeff @ V.t()
+
+                direction = D.to(dtype=p.dtype)
+                if wd != 0:
+                    direction = direction + wd * p.data
+                z.add_(direction, alpha=-lr_t)
+                _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
+
         return loss
 
 

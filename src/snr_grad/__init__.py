@@ -11,6 +11,10 @@ from snr_grad._core import (
     RotatedSNRAdamW,
     SpectralSNRMuon,
     MARSSNRAdamW,
+    SNRScheduleFreeAdamW,
+    SNRScheduleFreeMuon,
+    RotatedSNRScheduleFreeAdamW,
+    SpectralSNRScheduleFreeMuon,
     compute_gate,
     per_sample_variance_term,
     resolve_alpha,
@@ -25,8 +29,11 @@ __all__ = [
     "RotatedSNRAdamW",
     "SpectralSNRMuon",
     "MARSSNRAdamW",
+    "SNRScheduleFreeAdamW",
+    "SNRScheduleFreeMuon",
+    "RotatedSNRScheduleFreeAdamW",
+    "SpectralSNRScheduleFreeMuon",
     "compute_gate",
     "per_sample_variance_term",
     "resolve_alpha",
 ]
-
