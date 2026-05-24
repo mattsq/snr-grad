@@ -147,6 +147,140 @@ class SNRAdamWStats:
     mean_s_hat: float
     mean_m2: float
     parameters_seen: int
+    parameters_frozen: int = 0
+    elements_frozen: int = 0
+
+
+def _validate_freeze_args(
+    freeze_low_snr: bool,
+    freeze_threshold: float,
+    freeze_patience: int,
+    freeze_recheck_interval: int,
+    freeze_beta: float,
+) -> None:
+    """Shared validation for the freeze-low-SNR hyperparameters."""
+    if not isinstance(freeze_low_snr, bool):
+        raise ValueError(f"freeze_low_snr must be bool, got {type(freeze_low_snr).__name__}.")
+    if not (0.0 <= freeze_threshold <= 1.0):
+        raise ValueError(f"freeze_threshold must be in [0, 1], got {freeze_threshold}.")
+    if not (isinstance(freeze_patience, int) and freeze_patience > 0):
+        raise ValueError(f"freeze_patience must be a positive int, got {freeze_patience!r}.")
+    if not (isinstance(freeze_recheck_interval, int) and freeze_recheck_interval > 0):
+        raise ValueError(
+            f"freeze_recheck_interval must be a positive int, got {freeze_recheck_interval!r}."
+        )
+    if not (0.0 <= freeze_beta < 1.0):
+        raise ValueError(f"freeze_beta must be in [0, 1), got {freeze_beta}.")
+
+
+def _update_freeze_state(
+    p: Tensor,
+    state: MutableMapping[str, Any],
+    q: Tensor,
+    group: Mapping[str, Any],
+) -> None:
+    """
+    Update the per-parameter gate EMA and freeze p if it stays below the threshold.
+
+    Called once per param, immediately after compute_gate. No-op when freeze_low_snr
+    is disabled for this group.
+    """
+    if not group.get("freeze_low_snr", False):
+        return
+
+    q_mean = float(q.detach().mean().item())
+    beta = group["freeze_beta"]
+    if "gate_ema" in state:
+        state["gate_ema"] = beta * state["gate_ema"] + (1.0 - beta) * q_mean
+    else:
+        state["gate_ema"] = q_mean
+
+    if state["gate_ema"] < group["freeze_threshold"]:
+        state["below_count"] = state.get("below_count", 0) + 1
+        if (
+            state["below_count"] >= group["freeze_patience"]
+            and not state.get("frozen", False)
+        ):
+            p.requires_grad_(False)
+            state["frozen"] = True
+    else:
+        state["below_count"] = 0
+
+
+def _maybe_recheck_freeze(optimizer: Optimizer) -> None:
+    """
+    Bump the optimizer global step and, on the recheck cadence, re-enable any
+    params the optimizer has frozen so their gate can be re-evaluated.
+
+    User-frozen params (state["frozen"] is False/missing) are never touched.
+    """
+    if not any(g.get("freeze_low_snr", False) for g in optimizer.param_groups):
+        return
+    optimizer._global_step = getattr(optimizer, "_global_step", 0) + 1
+    for group in optimizer.param_groups:
+        if not group.get("freeze_low_snr", False):
+            continue
+        if optimizer._global_step % group["freeze_recheck_interval"] != 0:
+            continue
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is None:
+                continue
+            if st.get("frozen", False):
+                p.requires_grad_(True)
+                st["frozen"] = False
+                st["below_count"] = 0
+
+
+def _count_frozen(optimizer: Optimizer) -> tuple[int, int]:
+    """Return (num_params_frozen_by_optimizer, total_elements_frozen)."""
+    n_params = 0
+    n_elems = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                n_params += 1
+                n_elems += p.numel()
+    return n_params, n_elems
+
+
+def _freeze_state_dict(optimizer: Optimizer) -> dict:
+    """
+    Augment Optimizer.state_dict with the freeze global step counter.
+
+    The recheck cadence depends on optimizer._global_step. Without this, a
+    checkpoint resumed mid-run would restart the cadence at 0.
+    """
+    sd = Optimizer.state_dict(optimizer)
+    sd["_global_step"] = int(getattr(optimizer, "_global_step", 0))
+    return sd
+
+
+def _freeze_load_state_dict(optimizer: Optimizer, state_dict: dict) -> None:
+    """
+    Load Optimizer state and reapply the freeze invariants.
+
+    Two things the base class does not handle for us:
+      1. Restore optimizer._global_step so recheck cadence continues correctly.
+      2. Reapply p.requires_grad_(False) for any param whose restored state
+         says state["frozen"] is True. Without this, fresh parameters arrive
+         with requires_grad=True so the optimizer would think they're frozen
+         while autograd still computes their gradients until the next recheck.
+    """
+    # _global_step is our extension; the base class only reads
+    # "state" and "param_groups", but be explicit and strip it anyway.
+    global_step = int(state_dict.get("_global_step", 0))
+    base_sd = {k: v for k, v in state_dict.items() if k != "_global_step"}
+
+    Optimizer.load_state_dict(optimizer, base_sd)
+    optimizer._global_step = global_step
+
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                p.requires_grad_(False)
 
 
 class SNRAdamW(Optimizer):
@@ -202,6 +336,11 @@ class SNRAdamW(Optimizer):
         track_stats: bool = False,
         grokfast_alpha: float = 0.0,
         grokfast_lamb: float = 0.0,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -225,6 +364,13 @@ class SNRAdamW(Optimizer):
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_freeze_args(
+            freeze_low_snr,
+            freeze_threshold,
+            freeze_patience,
+            freeze_recheck_interval,
+            freeze_beta,
+        )
 
         defaults = dict(
             lr=lr,
@@ -242,9 +388,24 @@ class SNRAdamW(Optimizer):
             track_stats=track_stats,
             grokfast_alpha=grokfast_alpha,
             grokfast_lamb=grokfast_lamb,
+            freeze_low_snr=freeze_low_snr,
+            freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience,
+            freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
         self.last_stats: Optional[SNRAdamWStats] = None
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(
@@ -370,6 +531,8 @@ class SNRAdamW(Optimizer):
                     gate_eps=gate_eps,
                 )
 
+                _update_freeze_state(p, state, q, group)
+
                 # Decoupled weight decay, matching AdamW and the paper's update.
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
@@ -390,6 +553,8 @@ class SNRAdamW(Optimizer):
                     elem_counts.append(q_detached.numel())
                     parameters_seen += 1
 
+        _maybe_recheck_freeze(self)
+
         if parameters_seen > 0:
             target_device = gate_sums[0].device
             gate_sums_t = torch.stack([x.to(target_device) for x in gate_sums])
@@ -408,6 +573,7 @@ class SNRAdamW(Optimizer):
             ])
             stats_cpu = stats_tensor.cpu().tolist()
 
+            n_frozen_params, n_frozen_elems = _count_frozen(self)
             self.last_stats = SNRAdamWStats(
                 mean_gate=stats_cpu[0] / elem_count,
                 min_gate=stats_cpu[1],
@@ -415,6 +581,8 @@ class SNRAdamW(Optimizer):
                 mean_s_hat=stats_cpu[3] / elem_count,
                 mean_m2=stats_cpu[4] / elem_count,
                 parameters_seen=parameters_seen,
+                parameters_frozen=n_frozen_params,
+                elements_frozen=n_frozen_elems,
             )
         else:
             self.last_stats = None
@@ -467,18 +635,39 @@ class SNRMuon(Optimizer):
         muon_mode: Literal["post", "pre"] = "post",
         grokfast_alpha: float = 0.0,
         grokfast_lamb: float = 0.0,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_freeze_args(
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+        )
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
             gate=gate, lambda_pop=lambda_pop, alpha=alpha, batch_size=batch_size,
             dataset_size=dataset_size, maximize=maximize, muon_ns_steps=muon_ns_steps,
             muon_mode=muon_mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+            freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -534,6 +723,8 @@ class SNRMuon(Optimizer):
                 s_hat = s / (1.0 - rho**t)
                 q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
 
+                _update_freeze_state(p, st, q, group)
+
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
 
@@ -546,6 +737,7 @@ class SNRMuon(Optimizer):
                 else:
                     update = q * base_update
                 p.add_(update, alpha=-lr)
+        _maybe_recheck_freeze(self)
         return loss
 
 
@@ -569,18 +761,39 @@ class RotatedSNRAdamW(Optimizer):
         maximize: bool = False,
         grokfast_alpha: float = 0.0,
         grokfast_lamb: float = 0.0,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
+        _validate_freeze_args(
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+        )
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
             gate=gate, lambda_pop=lambda_pop, alpha=alpha, basis_beta=basis_beta,
             basis_update_interval=basis_update_interval, maximize=maximize,
             grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
+            freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -649,6 +862,7 @@ class RotatedSNRAdamW(Optimizer):
                     v_hat = v / (1 - beta2**t)
                     s_hat = s / (1 - rho**t)
                     q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     p.add_(q * m_hat / (v_hat.sqrt() + eps), alpha=-lr)
                     continue
 
@@ -680,22 +894,37 @@ class RotatedSNRAdamW(Optimizer):
                 V_hat = V / (1 - beta2**t)
                 S_hat = S / (1 - rho**t)
                 q = compute_gate(M_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                _update_freeze_state(p, st, q, group)
                 Uc = q * M_hat / (V_hat.sqrt() + eps)
                 update = QL @ Uc @ QR.t()
                 p.add_(update.to(dtype=p.dtype), alpha=-lr)
+        _maybe_recheck_freeze(self)
         return loss
 
 
 class SpectralSNRMuon(Optimizer):
     """SVD-basis SNR gating with diagonal or full spectral coefficients."""
 
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0):
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0, freeze_low_snr: bool = False, freeze_threshold: float = 0.05, freeze_patience: int = 200, freeze_recheck_interval: int = 1000, freeze_beta: float = 0.99):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
-        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb)
+        _validate_freeze_args(
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+        )
+        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb, freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold, freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval, freeze_beta=freeze_beta)
         super().__init__(params, defaults)
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(self, closure: Optional[Any] = None) -> Optional[float]:
@@ -755,6 +984,7 @@ class SpectralSNRMuon(Optimizer):
                     v_hat = v / (1 - b2**t)
                     s_hat = s / (1 - rho**t)
                     q = compute_gate(m_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     if group["weight_decay"] != 0:
                         p.add_(p, alpha=-group["lr"] * group["weight_decay"])
                     p.add_(q * m_hat / (v_hat.sqrt() + group["eps"]), alpha=-group["lr"])
@@ -777,6 +1007,7 @@ class SpectralSNRMuon(Optimizer):
                     s_hat = s / (1 - rho**t)
                     v_hat = v / (1 - b2**t)
                     q = compute_gate(a_hat, s_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     if group["variant"] == "muon_spectral_gate":
                         d = q
                     else:
@@ -792,9 +1023,11 @@ class SpectralSNRMuon(Optimizer):
                     S_hat = S / (1 - rho**t)
                     V_hat = Vst / (1 - b2**t)
                     q = compute_gate(A_hat, S_hat, gate=group["gate"], alpha=alpha_value, lambda_pop=group["lambda_pop"], gate_eps=group["gate_eps"])
+                    _update_freeze_state(p, st, q, group)
                     coeff = q if group["variant"] == "muon_spectral_gate" else q * A_hat / (V_hat.sqrt() + group["eps"])
                     D = U @ coeff @ V.t()
                 if group["weight_decay"] != 0:
                     p.add_(p, alpha=-group["lr"] * group["weight_decay"])
                 p.add_(D.to(dtype=p.dtype), alpha=-group["lr"])
+        _maybe_recheck_freeze(self)
         return loss
