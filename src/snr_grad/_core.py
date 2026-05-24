@@ -315,7 +315,7 @@ class SNRAdamW(Optimizer):
                     grad = -grad
 
                 state: MutableMapping[str, Any] = self.state[p]
-                if len(state) == 0:
+                if "step" not in state:
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
@@ -512,7 +512,7 @@ class SNRMuon(Optimizer):
                     g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
                     g = g + grokfast_lamb * g_slow
 
-                if len(st) == 0:
+                if "step" not in st:
                     st["step"] = 0
                     st["exp_avg"] = torch.zeros_like(p)
                     st["exp_avg_sq"] = torch.zeros_like(p)
@@ -617,7 +617,7 @@ class RotatedSNRAdamW(Optimizer):
                     g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
                     g = g + grokfast_lamb * g_slow
 
-                if len(st) == 0:
+                if "step" not in st:
                     st["step"] = 0
                     if p.ndim == 2:
                         o, i = p.shape
@@ -720,7 +720,7 @@ class SpectralSNRMuon(Optimizer):
                     g_slow.mul_(grokfast_alpha).add_(g, alpha=1.0 - grokfast_alpha)
                     g = g + grokfast_lamb * g_slow
 
-                if len(st) == 0:
+                if "step" not in st:
                     st["step"] = 0
                     if p.ndim == 2:
                         st["M"] = torch.zeros_like(p, dtype=torch.float32)

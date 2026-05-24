@@ -40,3 +40,26 @@ def test_spectral_snr_muon_updates_non_2d_params_via_fallback():
     opt = SpectralSNRMuon(model.parameters(), lr=1e-3, mode="diag", variant="adam_spectral_gate")
     _run_steps(model, opt)
     assert not torch.equal(before_bias, model[0].bias.detach())
+
+
+def test_rotated_snr_adamw_runs_with_grokfast_enabled():
+    # Regression: Grokfast initialized state['g_slow'] before the native
+    # state-init guard, causing KeyError: 'step' on the first step.
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.ReLU(), nn.Linear(8, 1))
+    opt = RotatedSNRAdamW(
+        model.parameters(), lr=1e-3, basis_update_interval=1,
+        grokfast_alpha=0.9, grokfast_lamb=2.0,
+    )
+    _run_steps(model, opt)
+
+
+def test_spectral_snr_muon_runs_with_grokfast_enabled():
+    torch.manual_seed(0)
+    for mode in ("diag", "full"):
+        model = nn.Sequential(nn.Linear(8, 8, bias=False), nn.ReLU(), nn.Linear(8, 1))
+        opt = SpectralSNRMuon(
+            model.parameters(), lr=1e-3, mode=mode, variant="adam_spectral_gate",
+            grokfast_alpha=0.9, grokfast_lamb=2.0,
+        )
+        _run_steps(model, opt)
