@@ -1929,6 +1929,11 @@ class MARSSNRAdamW(Optimizer):
         caution: bool = False,
         maximize: bool = False,
         track_stats: bool = False,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -1952,6 +1957,13 @@ class MARSSNRAdamW(Optimizer):
             raise ValueError(f"Invalid gamma: {gamma}")
         if mars_clip is not None and mars_clip < 0:
             raise ValueError(f"Invalid mars_clip: {mars_clip}")
+        _validate_freeze_args(
+            freeze_low_snr,
+            freeze_threshold,
+            freeze_patience,
+            freeze_recheck_interval,
+            freeze_beta,
+        )
 
         defaults = dict(
             lr=lr,
@@ -1971,9 +1983,24 @@ class MARSSNRAdamW(Optimizer):
             caution=caution,
             maximize=maximize,
             track_stats=track_stats,
+            freeze_low_snr=freeze_low_snr,
+            freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience,
+            freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
         )
         super().__init__(params, defaults)
         self.last_stats: Optional[SNRAdamWStats] = None
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
 
     @torch.no_grad()
     def step(
@@ -2040,13 +2067,17 @@ class MARSSNRAdamW(Optimizer):
                 if maximize:
                     grad = -grad
 
+                is_grad_2d = p.ndim == 2
+                mars_active = optimize_1d or is_grad_2d
+
                 state: MutableMapping[str, Any] = self.state[p]
                 if "step" not in state:
                     state["step"] = 0
                     state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_grad_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["last_grad"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    if mars_active:
+                        state["last_grad"] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
                 state["step"] += 1
                 step_num: int = state["step"]
@@ -2054,12 +2085,9 @@ class MARSSNRAdamW(Optimizer):
                 exp_avg: Tensor = state["exp_avg"]
                 exp_avg_sq: Tensor = state["exp_avg_sq"]
                 exp_grad_var: Tensor = state["exp_grad_var"]
-                last_grad: Tensor = state["last_grad"]
-
-                is_grad_2d = p.ndim == 2
 
                 # 1D Fallback strategy
-                if not optimize_1d and not is_grad_2d:
+                if not mars_active:
                     # Run standard SNRAdamW update using raw `grad`
                     grad_minus_m_prev = grad - exp_avg
                     exp_grad_var.mul_(rho).addcmul_(grad_minus_m_prev, grad_minus_m_prev, value=1.0 - rho)
@@ -2073,10 +2101,9 @@ class MARSSNRAdamW(Optimizer):
                     m_hat = exp_avg / bias_correction1
                     v_hat = exp_avg_sq / bias_correction2
                     s_hat = exp_grad_var / bias_correction_s
-
-                    c_t_for_stats = grad
                 else:
                     # Run MARS update
+                    last_grad = state["last_grad"]
                     if step_num == 1:
                         c_t = grad.clone()
                     else:
@@ -2115,7 +2142,6 @@ class MARSSNRAdamW(Optimizer):
 
                     # Save current raw gradient for next step
                     last_grad.copy_(grad)
-                    c_t_for_stats = c_t
 
                 # Exact variance override
                 if grad_variances is not None and p in grad_variances:
@@ -2138,6 +2164,8 @@ class MARSSNRAdamW(Optimizer):
                     gate_eps=gate_eps,
                 )
 
+                _update_freeze_state(p, state, q, group)
+
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
 
@@ -2157,6 +2185,8 @@ class MARSSNRAdamW(Optimizer):
                     elem_counts.append(q_detached.numel())
                     parameters_seen += 1
 
+        _maybe_recheck_freeze(self)
+
         if parameters_seen > 0:
             target_device = gate_sums[0].device
             gate_sums_t = torch.stack([x.to(target_device) for x in gate_sums])
@@ -2175,6 +2205,7 @@ class MARSSNRAdamW(Optimizer):
             ])
             stats_cpu = stats_tensor.cpu().tolist()
 
+            n_frozen_params, n_frozen_elems = _count_frozen(self)
             self.last_stats = SNRAdamWStats(
                 mean_gate=stats_cpu[0] / elem_count,
                 min_gate=stats_cpu[1],
@@ -2182,6 +2213,8 @@ class MARSSNRAdamW(Optimizer):
                 mean_s_hat=stats_cpu[3] / elem_count,
                 mean_m2=stats_cpu[4] / elem_count,
                 parameters_seen=parameters_seen,
+                parameters_frozen=n_frozen_params,
+                elements_frozen=n_frozen_elems,
             )
         else:
             self.last_stats = None

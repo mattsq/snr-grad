@@ -17,6 +17,7 @@ from snr_grad import (
     SNRAdamW,
     SNRMuon,
     SpectralSNRMuon,
+    MARSSNRAdamW,
 )
 
 
@@ -86,7 +87,7 @@ class TestFreezeConstruction:
         with pytest.raises(ValueError, match="freeze_beta"):
             SNRAdamW(model.parameters(), freeze_low_snr=True, freeze_beta=beta)
 
-    @pytest.mark.parametrize("opt_cls", [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon])
+    @pytest.mark.parametrize("opt_cls", [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW])
     def test_count_frozen_method_available(self, opt_cls):
         """All four optimizers expose count_frozen() returning (params, elems)."""
         model = nn.Linear(5, 3)
@@ -145,8 +146,8 @@ class TestFreezeTriggerSNRAdamW:
 
 @pytest.mark.parametrize(
     "opt_cls",
-    [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon],
-    ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon"],
+    [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW],
+    ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon", "MARSSNRAdamW"],
 )
 class TestFreezeAcrossOptimizers:
 
@@ -300,8 +301,8 @@ class TestFreezeStateDictRoundtrip:
 
     @pytest.mark.parametrize(
         "opt_cls",
-        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon],
-        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon"],
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon", "MARSSNRAdamW"],
     )
     def test_load_restores_requires_grad_false(self, opt_cls):
         """
@@ -348,8 +349,8 @@ class TestFreezeStateDictRoundtrip:
 
     @pytest.mark.parametrize(
         "opt_cls",
-        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon],
-        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon"],
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon", "MARSSNRAdamW"],
     )
     def test_global_step_persists_for_recheck_cadence(self, opt_cls):
         """
