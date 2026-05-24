@@ -209,6 +209,51 @@ Based on rigorous regime sweeps on high-dimensional sparse regression, Grokfast 
 2. **Overdetermined Regime ($n > d$, e.g., large clean datasets):**
    - **Highly Recommended.** When training data is abundant, the true signals have consistent, slow-moving gradients while noise cancels out. Grokfast excels in this well-determined regime, dramatically accelerating signal learning and slashing test MSE.
 
+### ScheduleFree integration -- Iterate averaging without LR schedules
+
+We provide ScheduleFree (Defazio et al., [arXiv:2405.15682](https://arxiv.org/abs/2405.15682)) variants of all four optimizer classes:
+
+- `SNRScheduleFreeAdamW`
+- `SNRScheduleFreeMuon`
+- `RotatedSNRScheduleFreeAdamW`
+- `SpectralSNRScheduleFreeMuon`
+
+ScheduleFree replaces the need for LR schedules (warmup/cosine/linear) with built-in Polyak-Ruppert iterate averaging. The model parameters hold the gradient-evaluation point `y = (1 - sf_beta) * z + sf_beta * x` during training; the averaged iterate `x` (used at inference) is reconstructed on demand. The SNR gate is computed exactly as before and filters the per-step Adam-normalized gradient that drives the base sequence `z`. Adam's first moment `m_hat` is used *only* to compute the gate -- it does not appear in the update direction, because ScheduleFree's `y`-interpolation already provides the momentum role.
+
+```python
+from snr_grad import SNRScheduleFreeAdamW
+
+optimizer = SNRScheduleFreeAdamW(
+    model.parameters(),
+    lr=3e-4,
+    sf_beta=0.9,             # y-interpolation factor (Polyak averaging strength)
+    sf_warmup_steps=500,     # optional linear warmup of effective lr (0 disables)
+    sf_lr_power=2.0,         # weight_t = lr_max ** sf_lr_power (Defazio default)
+    weight_decay=0.01,
+)
+
+# Training loop
+optimizer.train()
+for batch in train_loader:
+    loss = compute_loss(model, batch)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+# Switch parameters to the averaged iterate x for validation:
+optimizer.eval()
+model.eval()
+with torch.no_grad():
+    validate(model)
+# Restore y for resumed training:
+optimizer.train()
+model.train()
+```
+
+Calling `.step()` while in eval mode raises an explicit error. `optimizer.eval()` and `optimizer.train()` are idempotent and survive `state_dict()` / `load_state_dict()` roundtrips.
+
+Defaults follow the ScheduleFree paper: `sf_beta=0.9`, `sf_warmup_steps=0`, `sf_lr_power=2.0`, `sf_r=0.0`. Decoupled weight decay is applied through `y` (Defazio's choice). The Grokfast slow-gradient amplification described above composes with the ScheduleFree variants -- pass `grokfast_alpha` and `grokfast_lamb` as usual.
+
 ### When to use which optimizer
 
 Benchmarks on synthetic low-rank matrix recovery with anisotropic inputs reveal clear regimes where each method excels:
