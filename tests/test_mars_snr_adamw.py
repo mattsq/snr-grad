@@ -140,3 +140,19 @@ class TestMARSSNRAdamWStats:
         opt = MARSSNRAdamW(model.parameters(), lr=1e-3, track_stats=False)
         _do_step(model, target, opt)
         assert opt.last_stats is None
+
+    def test_multidimensional_tensors_mars_active(self):
+        # Create a 3D parameter (e.g. simulating a 1D conv or general 3D weight tensor)
+        p3d = nn.Parameter(torch.randn(2, 3, 4))
+        opt = MARSSNRAdamW([p3d], lr=1e-3, optimize_1d=False)
+        
+        # Take a step
+        loss = p3d.sum()
+        loss.backward()
+        opt.step()
+        
+        # Verify that last_grad is initialized in the optimizer state, which proves mars_active is True!
+        state = opt.state[p3d]
+        assert "last_grad" in state
+        assert torch.equal(state["last_grad"], torch.ones_like(p3d))
+

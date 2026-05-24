@@ -2067,8 +2067,8 @@ class MARSSNRAdamW(Optimizer):
                 if maximize:
                     grad = -grad
 
-                is_grad_2d = p.ndim == 2
-                mars_active = optimize_1d or is_grad_2d
+                is_multidim = p.ndim > 1
+                mars_active = optimize_1d or is_multidim
 
                 state: MutableMapping[str, Any] = self.state[p]
                 if "step" not in state:
@@ -2110,11 +2110,10 @@ class MARSSNRAdamW(Optimizer):
                         one_minus_beta1 = 1.0 - beta1
                         c_t = torch.add(grad, grad - last_grad, alpha=gamma * (beta1 / one_minus_beta1))
                         
-                        # Clip c_t by L2 norm if mars_clip is set
+                        # Clip c_t by L2 norm if mars_clip is set (fully asynchronous on GPU)
                         if mars_clip is not None:
                             c_t_norm = torch.norm(c_t)
-                            if c_t_norm > mars_clip:
-                                c_t.mul_(mars_clip / c_t_norm)
+                            c_t.mul_(torch.clamp(mars_clip / (c_t_norm + 1e-12), max=1.0))
 
                     # Update exp_grad_var using corrected gradient c_t
                     c_t_minus_m_prev = c_t - exp_avg
