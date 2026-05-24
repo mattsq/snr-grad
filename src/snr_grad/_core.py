@@ -1901,3 +1901,322 @@ class SpectralSNRScheduleFreeMuon(Optimizer):
                 _apply_schedulefree_y_update(p, z, z_old, ckp1, sf_beta)
 
         return loss
+
+
+class MARSSNRAdamW(Optimizer):
+    """
+    MARS (Make Variance Reduction Shine) combined with SNR / population-risk gating.
+    Includes optional Cautious updates and configurable 1D fallback.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        rho: float = 0.99,
+        eps: float = 1e-8,
+        gate_eps: float = 1e-12,
+        weight_decay: float = 0.0,
+        gate: GateType = "snr",
+        lambda_pop: float = 1.0,
+        alpha: AlphaSpec = "online",
+        batch_size: Optional[int] = None,
+        dataset_size: Optional[int] = None,
+        gamma: float = 0.025,
+        mars_clip: Optional[float] = 1.0,
+        optimize_1d: bool = False,
+        caution: bool = False,
+        maximize: bool = False,
+        track_stats: bool = False,
+        freeze_low_snr: bool = False,
+        freeze_threshold: float = 0.05,
+        freeze_patience: int = 200,
+        freeze_recheck_interval: int = 1000,
+        freeze_beta: float = 0.99,
+    ):
+        if lr < 0:
+            raise ValueError(f"Invalid lr: {lr}")
+        if eps <= 0:
+            raise ValueError(f"Invalid eps: {eps}")
+        if gate_eps <= 0:
+            raise ValueError(f"Invalid gate_eps: {gate_eps}")
+        if not 0 <= betas[0] < 1:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0 <= betas[1] < 1:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+        if not 0 <= rho < 1:
+            raise ValueError(f"Invalid rho: {rho}")
+        if weight_decay < 0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        if lambda_pop < 0:
+            raise ValueError(f"Invalid lambda_pop: {lambda_pop}")
+        if gate not in {"soft", "snr", "hard"}:
+            raise ValueError(f"Invalid gate: {gate!r}")
+        if gamma < 0:
+            raise ValueError(f"Invalid gamma: {gamma}")
+        if mars_clip is not None and mars_clip < 0:
+            raise ValueError(f"Invalid mars_clip: {mars_clip}")
+        _validate_freeze_args(
+            freeze_low_snr,
+            freeze_threshold,
+            freeze_patience,
+            freeze_recheck_interval,
+            freeze_beta,
+        )
+
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            rho=rho,
+            eps=eps,
+            gate_eps=gate_eps,
+            weight_decay=weight_decay,
+            gate=gate,
+            lambda_pop=lambda_pop,
+            alpha=alpha,
+            batch_size=batch_size,
+            dataset_size=dataset_size,
+            gamma=gamma,
+            mars_clip=mars_clip,
+            optimize_1d=optimize_1d,
+            caution=caution,
+            maximize=maximize,
+            track_stats=track_stats,
+            freeze_low_snr=freeze_low_snr,
+            freeze_threshold=freeze_threshold,
+            freeze_patience=freeze_patience,
+            freeze_recheck_interval=freeze_recheck_interval,
+            freeze_beta=freeze_beta,
+        )
+        super().__init__(params, defaults)
+        self.last_stats: Optional[SNRAdamWStats] = None
+
+    def count_frozen(self) -> tuple[int, int]:
+        """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
+        return _count_frozen(self)
+
+    def state_dict(self) -> dict:
+        return _freeze_state_dict(self)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        _freeze_load_state_dict(self, state_dict)
+
+    @torch.no_grad()
+    def step(
+        self,
+        closure: Optional[Any] = None,
+        *,
+        batch_size: Optional[int] = None,
+        dataset_size: Optional[int] = None,
+        grad_variances: Optional[Mapping[Tensor, Tensor]] = None,
+    ) -> Optional[float]:
+        """
+        Perform one optimizer step.
+
+        Args:
+            closure:
+                Optional closure, as in standard PyTorch optimizers.
+            batch_size, dataset_size:
+                Optional per-step values used only when alpha='finite'.
+            grad_variances:
+                Optional mapping param -> exact variance term on the same scale as s_hat.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        gate_sums = []
+        gate_mins = []
+        gate_maxs = []
+        s_sums = []
+        m2_sums = []
+        elem_counts = []
+        parameters_seen = 0
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            rho = group["rho"]
+            eps = group["eps"]
+            gate_eps = group["gate_eps"]
+            wd = group["weight_decay"]
+            gate_type: GateType = group["gate"]
+            lambda_pop = group["lambda_pop"]
+            alpha_value = resolve_alpha(
+                group["alpha"],
+                batch_size=batch_size if batch_size is not None else group.get("batch_size"),
+                dataset_size=dataset_size if dataset_size is not None else group.get("dataset_size"),
+            )
+            gamma = group["gamma"]
+            mars_clip = group["mars_clip"]
+            optimize_1d = group["optimize_1d"]
+            caution = group["caution"]
+            maximize = group["maximize"]
+            track_stats = group["track_stats"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("MARSSNRAdamW does not support sparse gradients.")
+
+                grad = grad.detach()
+                if maximize:
+                    grad = -grad
+
+                is_multidim = p.ndim > 1
+                mars_active = optimize_1d or is_multidim
+
+                state: MutableMapping[str, Any] = self.state[p]
+                if "step" not in state:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_grad_var"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    if mars_active:
+                        state["last_grad"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                state["step"] += 1
+                step_num: int = state["step"]
+
+                exp_avg: Tensor = state["exp_avg"]
+                exp_avg_sq: Tensor = state["exp_avg_sq"]
+                exp_grad_var: Tensor = state["exp_grad_var"]
+
+                # 1D Fallback strategy
+                if not mars_active:
+                    # Run standard SNRAdamW update using raw `grad`
+                    grad_minus_m_prev = grad - exp_avg
+                    exp_grad_var.mul_(rho).addcmul_(grad_minus_m_prev, grad_minus_m_prev, value=1.0 - rho)
+                    exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                    bias_correction1 = 1.0 - beta1 ** step_num
+                    bias_correction2 = 1.0 - beta2 ** step_num
+                    bias_correction_s = 1.0 - rho ** step_num
+
+                    m_hat = exp_avg / bias_correction1
+                    v_hat = exp_avg_sq / bias_correction2
+                    s_hat = exp_grad_var / bias_correction_s
+                else:
+                    # Run MARS update
+                    last_grad = state["last_grad"]
+                    if step_num == 1:
+                        c_t = grad.clone()
+                    else:
+                        one_minus_beta1 = 1.0 - beta1
+                        c_t = torch.add(grad, grad - last_grad, alpha=gamma * (beta1 / one_minus_beta1))
+                        
+                        # Clip c_t by L2 norm if mars_clip is set (fully asynchronous on GPU)
+                        if mars_clip is not None:
+                            c_t_norm = torch.norm(c_t)
+                            c_t.mul_(torch.clamp(mars_clip / (c_t_norm + 1e-12), max=1.0))
+
+                    # Update exp_grad_var using corrected gradient c_t
+                    c_t_minus_m_prev = c_t - exp_avg
+                    exp_grad_var.mul_(rho).addcmul_(c_t_minus_m_prev, c_t_minus_m_prev, value=1.0 - rho)
+
+                    # Update first moment using c_t
+                    exp_avg.mul_(beta1).add_(c_t, alpha=1.0 - beta1)
+
+                    # Cautious optimization mask
+                    if caution:
+                        mask = (exp_avg * grad > 0).to(grad.dtype)
+                        mask.div_(mask.mean().clamp_(min=1e-3))
+                        exp_avg.mul_(mask)
+
+                    # Update second moment using c_t
+                    exp_avg_sq.mul_(beta2).addcmul_(c_t, c_t, value=1.0 - beta2)
+
+                    bias_correction1 = 1.0 - beta1 ** step_num
+                    bias_correction2 = 1.0 - beta2 ** step_num
+                    bias_correction_s = 1.0 - rho ** step_num
+
+                    m_hat = exp_avg / bias_correction1
+                    v_hat = exp_avg_sq / bias_correction2
+                    s_hat = exp_grad_var / bias_correction_s
+
+                    # Save current raw gradient for next step
+                    last_grad.copy_(grad)
+
+                # Exact variance override
+                if grad_variances is not None and p in grad_variances:
+                    exact_s = grad_variances[p].to(device=p.device, dtype=p.dtype)
+                    if exact_s.shape != p.shape:
+                        raise ValueError(
+                            f"grad_variances entry for parameter has shape {tuple(exact_s.shape)}, "
+                            f"expected {tuple(p.shape)}."
+                        )
+                    s_for_gate = exact_s
+                else:
+                    s_for_gate = s_hat
+
+                q = compute_gate(
+                    m_hat,
+                    s_for_gate,
+                    gate=gate_type,
+                    alpha=alpha_value,
+                    lambda_pop=lambda_pop,
+                    gate_eps=gate_eps,
+                )
+
+                _update_freeze_state(p, state, q, group)
+
+                if wd != 0:
+                    p.add_(p, alpha=-lr * wd)
+
+                update = q * m_hat / (v_hat.sqrt() + eps)
+                p.add_(update, alpha=-lr)
+
+                if track_stats:
+                    q_detached = q.detach()
+                    s_detached = s_for_gate.detach()
+                    m2_detached = m_hat.detach().square()
+
+                    gate_sums.append(q_detached.sum())
+                    gate_mins.append(q_detached.min())
+                    gate_maxs.append(q_detached.max())
+                    s_sums.append(s_detached.sum())
+                    m2_sums.append(m2_detached.sum())
+                    elem_counts.append(q_detached.numel())
+                    parameters_seen += 1
+
+        _maybe_recheck_freeze(self)
+
+        if parameters_seen > 0:
+            target_device = gate_sums[0].device
+            gate_sums_t = torch.stack([x.to(target_device) for x in gate_sums])
+            gate_mins_t = torch.stack([x.to(target_device) for x in gate_mins])
+            gate_maxs_t = torch.stack([x.to(target_device) for x in gate_maxs])
+            s_sums_t = torch.stack([x.to(target_device) for x in s_sums])
+            m2_sums_t = torch.stack([x.to(target_device) for x in m2_sums])
+            elem_count = sum(elem_counts)
+
+            stats_tensor = torch.stack([
+                gate_sums_t.sum(),
+                gate_mins_t.min(),
+                gate_maxs_t.max(),
+                s_sums_t.sum(),
+                m2_sums_t.sum()
+            ])
+            stats_cpu = stats_tensor.cpu().tolist()
+
+            n_frozen_params, n_frozen_elems = _count_frozen(self)
+            self.last_stats = SNRAdamWStats(
+                mean_gate=stats_cpu[0] / elem_count,
+                min_gate=stats_cpu[1],
+                max_gate=stats_cpu[2],
+                mean_s_hat=stats_cpu[3] / elem_count,
+                mean_m2=stats_cpu[4] / elem_count,
+                parameters_seen=parameters_seen,
+                parameters_frozen=n_frozen_params,
+                elements_frozen=n_frozen_elems,
+            )
+        else:
+            self.last_stats = None
+
+        return loss
+
