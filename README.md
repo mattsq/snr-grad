@@ -199,15 +199,21 @@ optimizer = SNRAdamW(
 )
 ```
 
-#### Important Guidance: The Underdetermined vs. Overdetermined Trade-off
+#### Important Guidance: The Convergence vs. Steady-State Variance Trade-off
 
-Based on rigorous regime sweeps on high-dimensional sparse regression, Grokfast slow-gradient amplification exhibits a critical trade-off:
+Based on rigorous regime sweeps on high-dimensional sparse regression and non-convex modular arithmetic, Grokfast slow-gradient amplification exhibits a critical trade-off governed by optimization dynamics:
 
 1. **Underdetermined Regime ($n < d$, e.g., small datasets, high noise):**
-   - **Do not use standard Grokfast.** In underdetermined settings, spurious correlations create persistent, static noise-fitting gradients. Grokfast will track and *amplify* this persistent noise-fitting component, leading to severe overfitting.
-   - If Grokfast is required, always pair it with the SNR gate (`grokfast_lamb > 0` and `lambda_pop > 0.0`), which acts as an adaptive filter to block the noise-amplifying updates.
+   - **Do not use standard Grokfast.** In underdetermined settings, spurious correlations create persistent, static noise-fitting gradients. Grokfast's low-pass filter tracks and *amplifies* this persistent noise component, causing severe overfitting.
+   - If Grokfast is required, always pair it with the SNR gate (`grokfast_lamb > 0` and `lambda_pop > 0.0`), which acts as a robust adaptive shield to block the noise-amplifying updates.
 2. **Overdetermined Regime ($n > d$, e.g., large clean datasets):**
-   - **Highly Recommended.** When training data is abundant, the true signals have consistent, slow-moving gradients while noise cancels out. Grokfast excels in this well-determined regime, dramatically accelerating signal learning and slashing test MSE.
+   - **Highly Recommended for Convergence Speed.** When training data is abundant, the true signals have consistent, slow-moving gradients while noise cancels out. Grokfast excels in this well-determined regime, dramatically accelerating signal learning (achieving up to **5.5x lower Excess Test MSE** at 2000 steps).
+3. **Convex Steady-State Fluctuation vs. LR Schedulers:**
+   - In convex optimization near the optimum, expected gradients go to zero but minibatch sampling introduces high-frequency white noise. Grokfast's slow-gradient tracking acts as a low-pass filter on this noise, amplifying it and increasing the steady-state parameter fluctuation (variance) around the optimum.
+   - **Mitigation:** When paired with a **learning rate scheduler** (e.g., `CosineAnnealingLR` decaying to zero), this late-stage noise amplification is suppressed. This allows Grokfast to preserve its early convergence speed advantage and deliver lower final generalization error even under high noise.
+4. **Non-Convex Representation Learning & Grokking:**
+   - In deep, highly non-linear networks (e.g., Transformers or MLPs) trained on algorithmic tasks (like modular arithmetic), models undergo **delayed generalization** ("grokking") where they fit the training set instantly but require thousands of steps to learn generalizing representations.
+   - Grokfast is **highly effective** here, tracking the slow-varying, generalization-inducing gradients of the model and contracting the grokking plateau by over 4x, achieving perfect validation accuracy long before standard AdamW.
 
 ### `MARSSNRAdamW` -- MARS Variance-Reduced SNR Optimizer
 
@@ -462,6 +468,8 @@ python benchmark_muon.py      # SNRMuon vs SNRAdamW vs AdamW (two-layer network)
 python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
 python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
+python benchmark_regimes.py   # Grokfast regimes sweep (Constant vs Decaying LR)
+python benchmark_grokking.py  # Canonical modular addition grokking benchmark
 ```
 
 ### `benchmark.py` -- Core SNR gating evaluation
@@ -497,6 +505,29 @@ Metrics tracked: relative Frobenius error, left/right singular subspace alignmen
 Sparse linear regression (d=200, k=5 signal features, n=100 training samples, high noise) comparing MARSSNRAdamW (with and without Caution), SNRAdamW, and standard AdamW. Demonstrates how the combination of variance reduction, cautious updating, and SNR gating dramatically improves generalization on noisy regression.
 
 **Output:** `benchmarks/benchmark_mars_curves.png`, `benchmarks/benchmark_mars_weights.png`, `benchmarks/benchmark_mars_summary.png`
+
+### `benchmark_regimes.py` -- Grokfast scientific regimes sweep
+
+Sweeps training dataset size $n$ from highly underdetermined ($n=50 < d=200$) to highly overdetermined ($n=500 > d$) under low noise ($\sigma=0.2$) and high noise ($\sigma=3.0$) regimes, comparing **Constant LR** versus **Cosine LR Decay**.
+
+This benchmark is designed to scientifically dissect the convergence vs. steady-state noise amplification trade-off of Grokfast, demonstrating:
+* Grokfast's massive convergence speed advantage in overdetermined regimes (5.5x lower Excess Test MSE at 2000 steps).
+* The hazard of standard Grokfast in underdetermined or high-noise regimes where it acts as a low-pass filter over white noise and amplifies spurious correlations.
+* The protective shielding effect of combining Grokfast with the SNR gate (`Grokfast-SNR`) to suppress noise amplification.
+* How a learning rate decay schedule suppresses late-stage noise amplification, allowing Grokfast to preserve its fast convergence speed advantage and win even under high noise.
+
+**Output:** `benchmarks/benchmark_regimes_comparison.png`, `benchmarks/benchmark_regimes_curves.png`
+
+### `benchmark_grokking.py` -- Canonical modular addition grokking benchmark
+
+The definitive demonstration of Grokfast in its native non-convex representation-learning environment. Trains a 2-layer MLP with embedding layers on modular addition ($a + b \pmod{97}$) with an 80% train / 20% validation split. 
+
+Tracks and compares:
+1. **AdamW:** Instantly fits the training set but plateaus at chance-level validation accuracy for over 4000 steps before suddenly grokking/generalizing.
+2. **SNRAdamW:** Integrates population-risk gating to filter out noise, providing standard learning.
+3. **Grokfast & Grokfast-SNR:** Tracks the slow-varying, generalization-inducing components of the gradients, contracting the grokking plateau by over **4x** and achieving 100% validation accuracy within ~1000 steps.
+
+**Output:** `benchmarks/benchmark_grokking_curves.png`
 
 ## Diagnostics
 

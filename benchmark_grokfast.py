@@ -84,7 +84,7 @@ class RunResult:
     final_weights: torch.Tensor = None
 
 
-def run_one_seed(optimizer_cls, opt_kwargs, cfg, seed):
+def run_one_seed(optimizer_cls, opt_kwargs, cfg, seed, use_scheduler=False):
     w_true, signal_idx = make_true_weights(cfg.d, cfg.k, cfg.signal_magnitude)
 
     train_gen = torch.Generator().manual_seed(seed)
@@ -97,6 +97,10 @@ def run_one_seed(optimizer_cls, opt_kwargs, cfg, seed):
     nn.init.zeros_(model.weight)
     optimizer = optimizer_cls(model.parameters(), **opt_kwargs)
 
+    scheduler = None
+    if use_scheduler:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.n_steps, eta_min=0.0)
+
     result = RunResult()
     eval_every = 10
 
@@ -108,6 +112,9 @@ def run_one_seed(optimizer_cls, opt_kwargs, cfg, seed):
         loss = ((model(X_b) - y_b) ** 2).mean()
         loss.backward()
         optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
 
         if step % eval_every == 0:
             result.train_losses.append(loss.item())
