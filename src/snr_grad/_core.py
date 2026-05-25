@@ -231,6 +231,51 @@ def _maybe_recheck_freeze(optimizer: Optimizer) -> None:
                 st["frozen"] = False
                 st["below_count"] = 0
 
+    _guard_all_frozen(optimizer)
+
+
+def _guard_all_frozen(optimizer: Optimizer) -> None:
+    """
+    Safety guard to prevent PyTorch autograd from crashing when all parameters are frozen.
+    If all parameters in the optimizer currently have requires_grad=False, and at least one
+    was frozen by the optimizer, we unfreeze the parameter with the highest gate_ema to
+    guarantee that the computation graph can be built and loss.requires_grad remains True.
+    """
+    total_params = 0
+    currently_no_grad = 0
+    optimizer_frozen_params = []
+
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            total_params += 1
+            if not p.requires_grad:
+                currently_no_grad += 1
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                optimizer_frozen_params.append(p)
+
+    if total_params > 1 and currently_no_grad == total_params and len(optimizer_frozen_params) > 0:
+        # All parameters have requires_grad=False and at least one was frozen by us.
+        # Find the one with the highest gate_ema.
+        best_p = None
+        best_ema = -1.0
+        for p in optimizer_frozen_params:
+            st = optimizer.state.get(p)
+            if st is not None and "gate_ema" in st:
+                if st["gate_ema"] > best_ema:
+                    best_ema = st["gate_ema"]
+                    best_p = p
+        
+        # Fallback in case no gate_ema was found
+        if best_p is None:
+            best_p = optimizer_frozen_params[0]
+            
+        st = optimizer.state[best_p]
+        best_p.requires_grad_(True)
+        st["frozen"] = False
+        st["below_count"] = 0
+
+
 
 def _count_frozen(optimizer: Optimizer) -> tuple[int, int]:
     """Return (num_params_frozen_by_optimizer, total_elements_frozen)."""

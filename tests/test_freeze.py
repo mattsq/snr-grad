@@ -493,3 +493,65 @@ class TestFreezePerGroup:
 
         assert p_a.requires_grad is False
         assert p_b.requires_grad is True
+
+
+# ---------------------------------------------------------------------------
+# Autograd total freeze prevention guard
+# ---------------------------------------------------------------------------
+
+class TestTotalFreezePreventionGuard:
+
+    @pytest.mark.parametrize(
+        "opt_cls",
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon", "MARSSNRAdamW"],
+    )
+    def test_prevents_total_freeze(self, opt_cls):
+        """When all parameters are about to freeze, the guard keeps the one with the highest gate_ema active."""
+        p_a = _make_2d_param(shape=(4, 4), seed=42)
+        p_b = _make_2d_param(shape=(4, 4), seed=43)
+
+        opt = opt_cls(
+            [p_a, p_b],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=10,
+            freeze_recheck_interval=10_000,
+            freeze_beta=0.5,
+        )
+
+        # Run one step to initialize state
+        p_a.grad = torch.randn(4, 4)
+        p_b.grad = torch.randn(4, 4)
+        opt.step()
+        p_a.grad = None
+        p_b.grad = None
+
+        # Manually set their gate_ema in state so they are both below freeze_threshold
+        # but p_a has a higher EMA than p_b
+        opt.state[p_a]["gate_ema"] = 0.3
+        opt.state[p_b]["gate_ema"] = 0.1
+
+        # Set below_count to patience - 1 so the next step will trigger freeze on both
+        opt.state[p_a]["below_count"] = 9
+        opt.state[p_b]["below_count"] = 9
+
+        # Trigger optimizer step by giving them noise grads.
+        # During the step, both would be frozen (requires_grad=False).
+        # But our guard should unfreeze p_a because it has the higher gate_ema!
+        p_a.grad = torch.randn(4, 4)
+        p_b.grad = torch.randn(4, 4)
+        opt.step()
+        p_a.grad = None
+        p_b.grad = None
+
+        # Check that p_a was kept active (requires_grad is True, frozen is False)
+        # while p_b was frozen (requires_grad is False, frozen is True)
+        assert p_a.requires_grad is True
+        assert opt.state[p_a]["frozen"] is False
+        assert opt.state[p_a]["below_count"] == 0
+
+        assert p_b.requires_grad is False
+        assert opt.state[p_b]["frozen"] is True
+
