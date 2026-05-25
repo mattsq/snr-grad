@@ -157,10 +157,13 @@ def _validate_freeze_args(
     freeze_patience: int,
     freeze_recheck_interval: int,
     freeze_beta: float,
+    freeze_guard: bool,
 ) -> None:
     """Shared validation for the freeze-low-SNR hyperparameters."""
     if not isinstance(freeze_low_snr, bool):
         raise ValueError(f"freeze_low_snr must be bool, got {type(freeze_low_snr).__name__}.")
+    if not isinstance(freeze_guard, bool):
+        raise ValueError(f"freeze_guard must be bool, got {type(freeze_guard).__name__}.")
     if not (0.0 <= freeze_threshold <= 1.0):
         raise ValueError(f"freeze_threshold must be in [0, 1], got {freeze_threshold}.")
     if not (isinstance(freeze_patience, int) and freeze_patience > 0):
@@ -230,6 +233,60 @@ def _maybe_recheck_freeze(optimizer: Optimizer) -> None:
                 p.requires_grad_(True)
                 st["frozen"] = False
                 st["below_count"] = 0
+
+    _guard_all_frozen(optimizer)
+
+
+def _guard_all_frozen(optimizer: Optimizer) -> None:
+    """
+    Safety guard to prevent PyTorch autograd from crashing when all parameters are frozen.
+    If all parameters in the optimizer currently have requires_grad=False, and at least one
+    was frozen by the optimizer, we unfreeze the parameter with the highest gate_ema to
+    guarantee that the computation graph can be built and loss.requires_grad remains True.
+    """
+    # Only run the guard if freeze_low_snr is enabled for at least one group
+    if not any(g.get("freeze_low_snr", False) for g in optimizer.param_groups):
+        return
+
+    # Check if freeze_guard is enabled on all groups that have freeze_low_snr
+    # If any group has freeze_guard=False, we bypass the guard to let it freeze completely as requested.
+    if any(not g.get("freeze_guard", True) for g in optimizer.param_groups if g.get("freeze_low_snr", False)):
+        return
+
+    total_params = 0
+    currently_no_grad = 0
+    optimizer_frozen_params = []
+
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            total_params += 1
+            if not p.requires_grad:
+                currently_no_grad += 1
+            st = optimizer.state.get(p)
+            if st is not None and st.get("frozen", False):
+                optimizer_frozen_params.append(p)
+
+    if total_params > 0 and currently_no_grad == total_params and len(optimizer_frozen_params) > 0:
+        # All parameters have requires_grad=False and at least one was frozen by us.
+        # Find the one with the highest gate_ema.
+        best_p = None
+        best_ema = -1.0
+        for p in optimizer_frozen_params:
+            st = optimizer.state.get(p)
+            if st is not None and "gate_ema" in st:
+                if st["gate_ema"] > best_ema:
+                    best_ema = st["gate_ema"]
+                    best_p = p
+        
+        # Fallback in case no gate_ema was found
+        if best_p is None:
+            best_p = optimizer_frozen_params[0]
+            
+        st = optimizer.state[best_p]
+        best_p.requires_grad_(True)
+        st["frozen"] = False
+        st["below_count"] = 0
+
 
 
 def _count_frozen(optimizer: Optimizer) -> tuple[int, int]:
@@ -341,6 +398,7 @@ class SNRAdamW(Optimizer):
         freeze_patience: int = 200,
         freeze_recheck_interval: int = 1000,
         freeze_beta: float = 0.99,
+        freeze_guard: bool = True,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -370,6 +428,7 @@ class SNRAdamW(Optimizer):
             freeze_patience,
             freeze_recheck_interval,
             freeze_beta,
+            freeze_guard,
         )
 
         defaults = dict(
@@ -393,6 +452,7 @@ class SNRAdamW(Optimizer):
             freeze_patience=freeze_patience,
             freeze_recheck_interval=freeze_recheck_interval,
             freeze_beta=freeze_beta,
+            freeze_guard=freeze_guard,
         )
         super().__init__(params, defaults)
         self.last_stats: Optional[SNRAdamWStats] = None
@@ -640,13 +700,14 @@ class SNRMuon(Optimizer):
         freeze_patience: int = 200,
         freeze_recheck_interval: int = 1000,
         freeze_beta: float = 0.99,
+        freeze_guard: bool = True,
     ):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
         _validate_freeze_args(
-            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta, freeze_guard,
         )
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
@@ -655,7 +716,7 @@ class SNRMuon(Optimizer):
             muon_mode=muon_mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
             freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold,
             freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval,
-            freeze_beta=freeze_beta,
+            freeze_beta=freeze_beta, freeze_guard=freeze_guard,
         )
         super().__init__(params, defaults)
 
@@ -766,13 +827,14 @@ class RotatedSNRAdamW(Optimizer):
         freeze_patience: int = 200,
         freeze_recheck_interval: int = 1000,
         freeze_beta: float = 0.99,
+        freeze_guard: bool = True,
     ):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
         _validate_freeze_args(
-            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta, freeze_guard,
         )
         defaults = dict(
             lr=lr, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay,
@@ -781,7 +843,7 @@ class RotatedSNRAdamW(Optimizer):
             grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb,
             freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold,
             freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval,
-            freeze_beta=freeze_beta,
+            freeze_beta=freeze_beta, freeze_guard=freeze_guard,
         )
         super().__init__(params, defaults)
 
@@ -905,15 +967,15 @@ class RotatedSNRAdamW(Optimizer):
 class SpectralSNRMuon(Optimizer):
     """SVD-basis SNR gating with diagonal or full spectral coefficients."""
 
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0, freeze_low_snr: bool = False, freeze_threshold: float = 0.05, freeze_patience: int = 200, freeze_recheck_interval: int = 1000, freeze_beta: float = 0.99):
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, momentum: float = 0.9, betas: tuple[float, float] = (0.9, 0.95), rho: float = 0.99, eps: float = 1e-8, gate_eps: float = 1e-12, weight_decay: float = 0.0, gate: GateType = "soft", lambda_pop: float = 1.0, alpha: AlphaSpec = "online", variant: Literal["muon_spectral_gate", "adam_spectral_gate"] = "adam_spectral_gate", mode: Literal["diag", "full"] = "diag", grokfast_alpha: float = 0.0, grokfast_lamb: float = 0.0, freeze_low_snr: bool = False, freeze_threshold: float = 0.05, freeze_patience: int = 200, freeze_recheck_interval: int = 1000, freeze_beta: float = 0.99, freeze_guard: bool = True):
         if grokfast_alpha < 0:
             raise ValueError(f"Invalid grokfast_alpha: {grokfast_alpha}")
         if grokfast_lamb < 0:
             raise ValueError(f"Invalid grokfast_lamb: {grokfast_lamb}")
         _validate_freeze_args(
-            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta,
+            freeze_low_snr, freeze_threshold, freeze_patience, freeze_recheck_interval, freeze_beta, freeze_guard,
         )
-        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb, freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold, freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval, freeze_beta=freeze_beta)
+        defaults = dict(lr=lr, momentum=momentum, betas=betas, rho=rho, eps=eps, gate_eps=gate_eps, weight_decay=weight_decay, gate=gate, lambda_pop=lambda_pop, alpha=alpha, variant=variant, mode=mode, grokfast_alpha=grokfast_alpha, grokfast_lamb=grokfast_lamb, freeze_low_snr=freeze_low_snr, freeze_threshold=freeze_threshold, freeze_patience=freeze_patience, freeze_recheck_interval=freeze_recheck_interval, freeze_beta=freeze_beta, freeze_guard=freeze_guard)
         super().__init__(params, defaults)
 
     def count_frozen(self) -> tuple[int, int]:
@@ -1934,6 +1996,7 @@ class MARSSNRAdamW(Optimizer):
         freeze_patience: int = 200,
         freeze_recheck_interval: int = 1000,
         freeze_beta: float = 0.99,
+        freeze_guard: bool = True,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -1963,6 +2026,7 @@ class MARSSNRAdamW(Optimizer):
             freeze_patience,
             freeze_recheck_interval,
             freeze_beta,
+            freeze_guard,
         )
 
         defaults = dict(
@@ -1988,6 +2052,7 @@ class MARSSNRAdamW(Optimizer):
             freeze_patience=freeze_patience,
             freeze_recheck_interval=freeze_recheck_interval,
             freeze_beta=freeze_beta,
+            freeze_guard=freeze_guard,
         )
         super().__init__(params, defaults)
         self.last_stats: Optional[SNRAdamWStats] = None

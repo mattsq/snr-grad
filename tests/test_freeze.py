@@ -87,6 +87,12 @@ class TestFreezeConstruction:
         with pytest.raises(ValueError, match="freeze_beta"):
             SNRAdamW(model.parameters(), freeze_low_snr=True, freeze_beta=beta)
 
+    @pytest.mark.parametrize("guard", ["invalid", 123, None])
+    def test_invalid_guard_raises(self, guard):
+        model = nn.Linear(5, 1)
+        with pytest.raises(ValueError, match="freeze_guard"):
+            SNRAdamW(model.parameters(), freeze_low_snr=True, freeze_guard=guard)
+
     @pytest.mark.parametrize("opt_cls", [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW])
     def test_count_frozen_method_available(self, opt_cls):
         """All four optimizers expose count_frozen() returning (params, elems)."""
@@ -114,6 +120,7 @@ class TestFreezeTriggerSNRAdamW:
             freeze_patience=30,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,  # fast EMA so the test runs short
+            freeze_guard=False,
         )
         # 60 noise steps is well past patience=30
         _drive_noise_grads(p, opt, n_steps=60)
@@ -134,6 +141,7 @@ class TestFreezeTriggerSNRAdamW:
             freeze_patience=20,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         _drive_signal_grads(p, opt, n_steps=100)
         assert p.requires_grad is True
@@ -163,6 +171,7 @@ class TestFreezeAcrossOptimizers:
             freeze_patience=30,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         _drive_noise_grads(p, opt, n_steps=120)
         assert p.requires_grad is False, (
@@ -198,6 +207,7 @@ class TestFreezeRecheck:
             freeze_patience=10,
             freeze_recheck_interval=25,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         # 20 steps: gate collapses, param freezes (patience=10)
         _drive_noise_grads(p, opt, n_steps=20)
@@ -272,6 +282,7 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=10,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         _drive_noise_grads(p, opt, n_steps=30)
         assert opt.state[p]["frozen"] is True
@@ -291,6 +302,7 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=10,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         opt2.load_state_dict(sd)
 
@@ -319,6 +331,7 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=10,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         _drive_noise_grads(p, opt, n_steps=40)
         assert opt.state[p]["frozen"] is True
@@ -337,6 +350,7 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=10,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         opt2.load_state_dict(sd)
 
@@ -368,6 +382,7 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=5,
             freeze_recheck_interval=recheck,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         # Drive to freeze well before the first recheck (step 25).
         _drive_noise_grads(p, opt, n_steps=15)
@@ -388,6 +403,7 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=5,
             freeze_recheck_interval=recheck,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         opt2.load_state_dict(sd)
         assert opt2._global_step == 15
@@ -415,12 +431,13 @@ class TestFreezeStateDictRoundtrip:
             freeze_patience=5,
             freeze_recheck_interval=10,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         opt._global_step = 7  # pretend a prior run
         sd = opt.state_dict()
         sd.pop("_global_step")  # simulate an older checkpoint
 
-        opt2 = SNRAdamW([torch.zeros((4,), requires_grad=True)], lr=1e-3)
+        opt2 = SNRAdamW([torch.zeros((4,), requires_grad=True)], lr=1e-3, freeze_guard=False)
         opt2.load_state_dict(sd)
         assert opt2._global_step == 0
 
@@ -443,6 +460,7 @@ class TestFreezeStats:
             freeze_patience=10,
             freeze_recheck_interval=10_000,
             freeze_beta=0.5,
+            freeze_guard=False,
         )
         # Initially no freeze
         p.grad = torch.randn(7)
@@ -493,3 +511,99 @@ class TestFreezePerGroup:
 
         assert p_a.requires_grad is False
         assert p_b.requires_grad is True
+
+
+# ---------------------------------------------------------------------------
+# Autograd total freeze prevention guard
+# ---------------------------------------------------------------------------
+
+class TestTotalFreezePreventionGuard:
+
+    @pytest.mark.parametrize(
+        "opt_cls",
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon", "MARSSNRAdamW"],
+    )
+    def test_prevents_total_freeze(self, opt_cls):
+        """When all parameters are about to freeze, the guard keeps the one with the highest gate_ema active."""
+        p_a = _make_2d_param(shape=(4, 4), seed=42)
+        p_b = _make_2d_param(shape=(4, 4), seed=43)
+
+        opt = opt_cls(
+            [p_a, p_b],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=10,
+            freeze_recheck_interval=10_000,
+            freeze_beta=0.5,
+        )
+
+        # Run one step to initialize state
+        p_a.grad = torch.randn(4, 4)
+        p_b.grad = torch.randn(4, 4)
+        opt.step()
+        p_a.grad = None
+        p_b.grad = None
+
+        # Manually set their gate_ema in state so they are both below freeze_threshold
+        # but p_a has a higher EMA than p_b
+        opt.state[p_a]["gate_ema"] = 0.3
+        opt.state[p_b]["gate_ema"] = 0.1
+
+        # Set below_count to patience - 1 so the next step will trigger freeze on both
+        opt.state[p_a]["below_count"] = 9
+        opt.state[p_b]["below_count"] = 9
+
+        # Trigger optimizer step by giving them noise grads.
+        # During the step, both would be frozen (requires_grad=False).
+        # But our guard should unfreeze p_a because it has the higher gate_ema!
+        p_a.grad = torch.randn(4, 4)
+        p_b.grad = torch.randn(4, 4)
+        opt.step()
+        p_a.grad = None
+        p_b.grad = None
+
+        # Check that p_a was kept active (requires_grad is True, frozen is False)
+        # while p_b was frozen (requires_grad is False, frozen is True)
+        assert p_a.requires_grad is True
+        assert opt.state[p_a]["frozen"] is False
+        assert opt.state[p_a]["below_count"] == 0
+
+        assert p_b.requires_grad is False
+        assert opt.state[p_b]["frozen"] is True
+
+    @pytest.mark.parametrize(
+        "opt_cls",
+        [SNRAdamW, SNRMuon, RotatedSNRAdamW, SpectralSNRMuon, MARSSNRAdamW],
+        ids=["SNRAdamW", "SNRMuon", "RotatedSNRAdamW", "SpectralSNRMuon", "MARSSNRAdamW"],
+    )
+    def test_single_parameter_guard_by_default(self, opt_cls):
+        """Single-parameter optimizers are guarded by default and kept active unless freeze_guard=False."""
+        p = _make_2d_param(shape=(4, 4), seed=42)
+        opt = opt_cls(
+            [p],
+            lr=1e-3,
+            freeze_low_snr=True,
+            freeze_threshold=0.5,
+            freeze_patience=10,
+            freeze_recheck_interval=10_000,
+            freeze_beta=0.5,
+        )
+
+        p.grad = torch.randn(4, 4)
+        opt.step()
+        p.grad = None
+
+        opt.state[p]["gate_ema"] = 0.3
+        opt.state[p]["below_count"] = 9
+
+        p.grad = torch.randn(4, 4)
+        opt.step()
+        p.grad = None
+
+        # Kept active by the guard!
+        assert p.requires_grad is True
+        assert opt.state[p]["frozen"] is False
+
+
