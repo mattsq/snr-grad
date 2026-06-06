@@ -24,6 +24,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ from torch.func import functional_call
 
 @dataclass
 class Config:
+    task: str = "stationary"          # "stationary" or "drift"
     d: int = 200
     k: int = 5
     n_train: int = 100
@@ -62,8 +64,21 @@ class Config:
     weight_decay: float = 0.0
     signal_magnitude: float = 3.0
     rho: float = 0.99
+    beta1: float = 0.9
     lambda_pop: float = 1.0
     gate: str = "snr"
+    # Non-stationary ("drift") regime: signal coordinates oscillate so their true
+    # gradient is large and time-varying. The temporal EMA conflates this drift with
+    # noise and over-estimates variance on signal coords; within-batch estimators do not.
+    drift_period: int = 40
+    drift_strength: float = 0.9
+
+
+# Tuned preset that surfaces the EMA's miscalibration under non-stationarity.
+DRIFT_PRESET = dict(
+    sigma_noise=0.5, n_train=200, n_steps=600, lr=1e-2, beta1=0.95,
+    lambda_pop=2.0, drift_period=40, drift_strength=0.9,
+)
 
 
 def make_true_weights(d, k, magnitude, seed=0):
@@ -82,6 +97,23 @@ def make_dataset(w_true, n, sigma_noise, gen):
     return X, y.unsqueeze(1)
 
 
+def make_signal_spec(cfg: Config, seed=0):
+    """Fixed support + base magnitudes + phases for the drifting target."""
+    gen = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(cfg.d, generator=gen)[: cfg.k]
+    base = torch.randn(cfg.k, generator=gen) * cfg.signal_magnitude
+    phase = torch.rand(cfg.k, generator=gen) * 2 * math.pi
+    return idx, base, phase
+
+
+def drifting_weights(step, cfg: Config, idx, base, phase):
+    """Instantaneous target weights at a given step (signal magnitudes oscillate)."""
+    w = torch.zeros(cfg.d)
+    mod = 1.0 + cfg.drift_strength * torch.sin(2 * math.pi * step / cfg.drift_period + phase)
+    w[idx] = base * mod
+    return w
+
+
 # ---------------------------------------------------------------------------
 # Per-sample / microbatch loss closures for a linear regression head
 # ---------------------------------------------------------------------------
@@ -96,8 +128,8 @@ def loss_one_sample(model):
 
 
 def microbatch_loss(model, sub_batch):
-    x, y = sub_batch
-    return ((model(x) - y) ** 2).mean()
+    x, y = sub_batch  # y has shape [chunk]; squeeze the model's trailing dim to match.
+    return ((model(x).squeeze(1) - y) ** 2).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +161,7 @@ class RunResult:
     false_suppress_signal: float = 0.0  # fraction of signal coords with gate < 0.5
     false_pass_noise: float = 0.0       # fraction of noise coords with gate > 0.5
     ema_exact_corr: float = float("nan")
+    signal_var_ratio: float = float("nan")  # median s_ema / s_exact on signal coords
     history_test: list = field(default_factory=list)
 
 
@@ -136,24 +169,72 @@ class RunResult:
 # Single run for a given variance "mode"
 # ---------------------------------------------------------------------------
 
+def _final_s_for_mode(mode, model, opt, rep_batch, exact_est, cfg, probe_interval):
+    """Variance estimate the mode actually applies to the gate, for a fresh batch.
+
+    This makes the gate-quality panel reflect each method's own estimator rather than
+    always reading the internal EMA.
+    """
+    state = opt.state[model.weight]
+    if mode == "ema":
+        return state["exp_grad_var"].squeeze() / (1 - cfg.rho ** state["step"])
+    if mode in ("exact", "exact_k"):
+        return exact_est.estimate(model, loss_one_sample(model), rep_batch)[model.weight].squeeze()
+    if mode.startswith("micro"):
+        k = int(mode.split("_")[1])
+        _, gv = backward_with_microbatch_variance(model, microbatch_loss, rep_batch, num_splits=k)
+        opt.zero_grad(set_to_none=True)
+        return gv[model.weight].squeeze()
+    raise ValueError(mode)
+
+
 def run_one(mode: str, cfg: Config, seed: int, probe_interval: int = 10) -> RunResult:
-    w_true, signal_idx = make_true_weights(cfg.d, cfg.k, cfg.signal_magnitude)
+    drift = cfg.task == "drift"
+
+    if drift:
+        signal_idx, base, phase = make_signal_spec(cfg, seed)
+    else:
+        w_true, signal_idx = make_true_weights(cfg.d, cfg.k, cfg.signal_magnitude)
     signal_mask = torch.zeros(cfg.d, dtype=torch.bool)
     signal_mask[signal_idx] = True
 
     train_gen = torch.Generator().manual_seed(seed)
-    X_train, y_train = make_dataset(w_true, cfg.n_train, cfg.sigma_noise, train_gen)
-    test_gen = torch.Generator().manual_seed(9999)
-    X_test, y_test = make_dataset(w_true, cfg.test_size, cfg.sigma_noise, test_gen)
+    X_train = torch.randn(cfg.n_train, cfg.d, generator=train_gen)
+    X_test = torch.randn(cfg.test_size, cfg.d, generator=torch.Generator().manual_seed(9999))
+    label_gen = torch.Generator().manual_seed(seed + 5)
+    if not drift:
+        y_train = (X_train @ w_true).unsqueeze(1) + torch.randn(cfg.n_train, 1, generator=train_gen) * cfg.sigma_noise
+        y_test = (X_test @ w_true).unsqueeze(1) + torch.randn(cfg.test_size, 1, generator=torch.Generator().manual_seed(8888)) * cfg.sigma_noise
+
+    def current_target(step):
+        return drifting_weights(step, cfg, signal_idx, base, phase) if drift else w_true
+
+    def test_loss(step):
+        with torch.no_grad():
+            if drift:  # noiseless instantaneous target -> measures tracking error
+                yt = (X_test @ current_target(step)).unsqueeze(1)
+            else:
+                yt = y_test
+            return ((model(X_test) - yt) ** 2).mean().item()
 
     torch.manual_seed(seed + 1000)
     model = nn.Linear(cfg.d, 1, bias=False)
     nn.init.zeros_(model.weight)
-    opt = SNRAdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, gate=cfg.gate,
-        rho=cfg.rho, alpha="finite", batch_size=cfg.batch_size, dataset_size=cfg.n_train,
-        lambda_pop=cfg.lambda_pop, track_stats=True,
-    )
+    if drift:
+        opt = SNRAdamW(
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, gate=cfg.gate,
+            rho=cfg.rho, betas=(cfg.beta1, 0.999), alpha="online",
+            lambda_pop=cfg.lambda_pop, track_stats=True,
+        )
+        alpha_val = resolve_alpha("online")
+    else:
+        opt = SNRAdamW(
+            model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, gate=cfg.gate,
+            rho=cfg.rho, betas=(cfg.beta1, 0.999), alpha="finite",
+            batch_size=cfg.batch_size, dataset_size=cfg.n_train, lambda_pop=cfg.lambda_pop,
+            track_stats=True,
+        )
+        alpha_val = resolve_alpha("finite", batch_size=cfg.batch_size, dataset_size=cfg.n_train)
     exact_est = ExactVarianceEstimator(exclude_norm=False)
 
     result = RunResult()
@@ -161,54 +242,60 @@ def run_one(mode: str, cfg: Config, seed: int, probe_interval: int = 10) -> RunR
     last_loss = 0.0
     for step in range(cfg.n_steps):
         idx = torch.randint(cfg.n_train, (cfg.batch_size,))
-        X_b, y_b = X_train[idx], y_train[idx]
-        batch = (X_b, y_b.squeeze(1))
+        X_b = X_train[idx]
+        if drift:
+            y_b = X_b @ current_target(step) + torch.randn(cfg.batch_size, generator=label_gen) * cfg.sigma_noise
+        else:
+            y_b = y_train[idx].squeeze(1)
+        batch = (X_b, y_b)
 
         opt.zero_grad(set_to_none=True)
         grad_variances = None
 
-        if mode == "ema":
-            loss = ((model(X_b) - y_b) ** 2).mean()
-            loss.backward()
-            last_loss = loss.item()
-        elif mode == "exact":
-            loss = ((model(X_b) - y_b) ** 2).mean()
-            loss.backward()
-            last_loss = loss.item()
-            grad_variances = exact_est.estimate(model, loss_one_sample(model), batch)
-        elif mode == "exact_k":
-            loss = ((model(X_b) - y_b) ** 2).mean()
-            loss.backward()
-            last_loss = loss.item()
-            if step % probe_interval == 0:
-                grad_variances = exact_est.estimate(model, loss_one_sample(model), batch)
-        elif mode.startswith("micro"):
+        if mode.startswith("micro"):
             k = int(mode.split("_")[1])
-            loss_val, grad_variances = backward_with_microbatch_variance(
+            last_loss, grad_variances = backward_with_microbatch_variance(
                 model, microbatch_loss, batch, num_splits=k
             )
-            last_loss = loss_val
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            loss = ((model(X_b).squeeze(1) - y_b) ** 2).mean()
+            loss.backward()
+            last_loss = loss.item()
+            if mode == "exact":
+                grad_variances = exact_est.estimate(model, loss_one_sample(model), batch)
+            elif mode == "exact_k" and step % probe_interval == 0:
+                grad_variances = exact_est.estimate(model, loss_one_sample(model), batch)
+            elif mode not in ("ema", "exact", "exact_k"):
+                raise ValueError(f"Unknown mode: {mode}")
 
         opt.step(grad_variances=grad_variances)
 
-        if step % 50 == 0:
-            with torch.no_grad():
-                result.history_test.append(((model(X_test) - y_test) ** 2).mean().item())
+        if step % EVAL_EVERY == 0:
+            result.history_test.append(test_loss(step))
 
     result.wall_clock = time.perf_counter() - t0
     result.final_train = last_loss
-    with torch.no_grad():
-        result.final_test = ((model(X_test) - y_test) ** 2).mean().item()
+    if drift:
+        # Average tracking error over the last ~2 drift periods (more stable than one phase).
+        w = max(1, (2 * cfg.drift_period) // EVAL_EVERY)
+        tail = result.history_test[-w:]
+        result.final_test = sum(tail) / len(tail)
+    else:
+        result.final_test = test_loss(cfg.n_steps - 1)
 
-    # Final gate quality, computed from the EMA-corrected s_hat actually used.
+    # Representative fresh batch for the final-gate diagnostics.
+    ridx = torch.randint(cfg.n_train, (cfg.batch_size,))
+    Xr = X_train[ridx]
+    yr = (Xr @ current_target(cfg.n_steps - 1)
+          + torch.randn(cfg.batch_size, generator=label_gen) * cfg.sigma_noise)
+    rep_batch = (Xr, yr)
+
     state = opt.state[model.weight]
     step_num = state["step"]
-    m_hat = (state["exp_avg"].squeeze() / (1 - 0.9 ** step_num))
-    s_hat = state["exp_grad_var"].squeeze() / (1 - cfg.rho ** step_num)
-    alpha_val = resolve_alpha("finite", batch_size=cfg.batch_size, dataset_size=cfg.n_train)
-    gate_vals = compute_gate(m_hat, s_hat, gate=cfg.gate, alpha=alpha_val, lambda_pop=cfg.lambda_pop)
+    m_hat = state["exp_avg"].squeeze() / (1 - cfg.beta1 ** step_num)
+    # Gate quality from the s this mode actually applies.
+    s_used = _final_s_for_mode(mode, model, opt, rep_batch, exact_est, cfg, probe_interval).detach()
+    gate_vals = compute_gate(m_hat, s_used, gate=cfg.gate, alpha=alpha_val, lambda_pop=cfg.lambda_pop)
 
     result.mean_signal_gate = float(gate_vals[signal_mask].mean())
     result.mean_noise_gate = float(gate_vals[~signal_mask].mean())
@@ -216,14 +303,16 @@ def run_one(mode: str, cfg: Config, seed: int, probe_interval: int = 10) -> RunR
     result.false_suppress_signal = float((gate_vals[signal_mask] < 0.5).float().mean())
     result.false_pass_noise = float((gate_vals[~signal_mask] > 0.5).float().mean())
 
-    # Correlation between the internal EMA variance and a fresh exact variance.
-    full_batch = (X_train, y_train.squeeze(1))
-    exact_full = exact_est.estimate(model, loss_one_sample(model), full_batch)
-    s_exact = exact_full[model.weight].squeeze().detach()
-    log_ema = torch.log(s_hat.detach().clamp_min(1e-12))
+    # Mechanism metrics: how the internal EMA compares to a fresh exact estimate.
+    s_ema = (state["exp_grad_var"].squeeze() / (1 - cfg.rho ** step_num)).detach()
+    s_exact = exact_est.estimate(model, loss_one_sample(model), rep_batch)[model.weight].squeeze().detach()
+    log_ema = torch.log(s_ema.clamp_min(1e-12))
     log_exact = torch.log(s_exact.clamp_min(1e-12))
     if torch.std(log_ema) > 0 and torch.std(log_exact) > 0:
         result.ema_exact_corr = float(torch.corrcoef(torch.stack([log_ema, log_exact]))[0, 1])
+    result.signal_var_ratio = float(
+        (s_ema[signal_mask] / s_exact[signal_mask].clamp_min(1e-12)).median()
+    )
 
     return result
 
@@ -239,6 +328,8 @@ MODES = [
     ("micro_2", "microbatch K=2"),
     ("micro_4", "microbatch K=4"),
 ]
+
+EVAL_EVERY = 10
 
 
 def aggregate(results: list[RunResult]) -> dict:
@@ -256,6 +347,7 @@ def aggregate(results: list[RunResult]) -> dict:
         "false_suppress": mean("false_suppress_signal"),
         "false_pass": mean("false_pass_noise"),
         "corr": mean("ema_exact_corr"),
+        "var_ratio": mean("signal_var_ratio"),
     }
 
 
@@ -268,43 +360,77 @@ COLORS = {
 }
 
 
-def make_figures(all_runs: dict, summary: dict, cfg: Config, out_dir: str):
+def make_figures(all_runs: dict, summary: dict, cfg: Config, out_dir: str, tag: str):
     os.makedirs(out_dir, exist_ok=True)
     labels = [label for _, label in MODES]
-    eval_every = 50
-    steps = list(range(0, cfg.n_steps, eval_every))
-    irreducible = cfg.sigma_noise ** 2
+    steps = list(range(0, cfg.n_steps, EVAL_EVERY))
+    irreducible = 0.0 if cfg.task == "drift" else cfg.sigma_noise ** 2
+    drift = cfg.task == "drift"
+    regime = (
+        f"non-stationary drifting target (period={cfg.drift_period})"
+        if drift else "stationary target"
+    )
+    n_eval = min(len(steps), min(len(all_runs[l][0].history_test) for l in labels))
+    steps = steps[:n_eval]
 
     # ---- Figure 1: test-loss curves ----
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+    fig, ax = plt.subplots(figsize=(9.5, 5.5))
     fig.suptitle(
         f"Variance backends for the SNRAdamW gate: test loss\n"
-        f"sparse regression (d={cfg.d}, k={cfg.k}, n={cfg.n_train}, "
-        f"noise={cfg.sigma_noise}, {cfg.n_seeds} seeds)",
+        f"{regime}",
         fontsize=12, fontweight="bold",
     )
+    ax.set_title(
+        f"d={cfg.d}, k={cfg.k}, n={cfg.n_train}, noise={cfg.sigma_noise}, "
+        f"lambda_pop={cfg.lambda_pop}, {cfg.n_seeds} seeds",
+        fontsize=9,
+    )
+    # Under drift the instantaneous tracking error oscillates with the target; all variants
+    # share that phase, so plotting each variant relative to EMA-only (per seed, per step)
+    # cancels the oscillation and isolates the gate's effect.
+    def smooth(t, w):
+        if w <= 1 or t.shape[-1] < w:
+            return t
+        kernel = torch.ones(1, 1, w) / w
+        pad = w // 2
+        x = t.unsqueeze(1)
+        x = torch.nn.functional.pad(x, (pad, pad), mode="replicate")
+        return torch.nn.functional.conv1d(x, kernel).squeeze(1)[:, : t.shape[-1]]
+
+    # Smooth the absolute error over one full drift period FIRST (a boxcar of one period
+    # nulls the oscillation); only then form the ratio to EMA, so the comparison reflects
+    # period-averaged tracking quality rather than phase misalignment between methods.
+    win = max(1, cfg.drift_period // EVAL_EVERY) if drift else 1
+    ema_smooth = smooth(torch.tensor([r.history_test for r in all_runs["EMA-only"]])[:, :n_eval], win)
     for label in labels:
-        hist = torch.tensor([r.history_test for r in all_runs[label]])  # [seeds, T]
-        n = min(len(steps), hist.shape[1])
-        mean = hist[:, :n].mean(dim=0)
-        std = hist[:, :n].std(dim=0)
-        ax.plot(steps[:n], mean, label=label, color=COLORS[label], linewidth=1.6)
-        ax.fill_between(steps[:n], (mean - std).numpy(), (mean + std).numpy(),
-                        color=COLORS[label], alpha=0.15)
-    ax.axhline(irreducible, ls="--", color="black", alpha=0.5,
-               label=f"irreducible ({irreducible:.0f})")
+        hist = smooth(torch.tensor([r.history_test for r in all_runs[label]])[:, :n_eval], win)
+        series = (hist / ema_smooth.clamp_min(1e-9)) if drift else hist
+        mean = series.mean(dim=0)
+        std = series.std(dim=0)
+        ax.plot(steps, mean, label=label, color=COLORS[label], linewidth=1.6)
+        ax.fill_between(steps, (mean - std).numpy(), (mean + std).numpy(),
+                        color=COLORS[label], alpha=0.12)
+    if drift:
+        ax.axhline(1.0, ls="--", color="black", alpha=0.5, label="EMA-only baseline")
+        ax.set_ylabel("Test MSE relative to EMA-only (<1 is better)")
+        ax.set_ylim(0.5, 1.25)
+    else:
+        if irreducible > 0:
+            ax.axhline(irreducible, ls="--", color="black", alpha=0.5,
+                       label=f"irreducible ({irreducible:.0f})")
+        ax.set_ylabel("Test MSE")
     ax.set_xlabel("Step")
-    ax.set_ylabel("Test MSE")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    path1 = os.path.join(out_dir, "benchmark_variance_curves.png")
+    path1 = os.path.join(out_dir, f"benchmark_variance_{tag}_curves.png")
     fig.savefig(path1, dpi=150)
     plt.close(fig)
 
     # ---- Figure 2: gate-quality + cost summary ----
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
-    fig.suptitle("Variance backends: gate quality and cost", fontsize=12, fontweight="bold")
+    fig.suptitle(f"Variance backends: gate quality and cost  --  {regime}",
+                 fontsize=12, fontweight="bold")
     x = range(len(labels))
     colors = [COLORS[l] for l in labels]
 
@@ -346,7 +472,7 @@ def make_figures(all_runs: dict, summary: dict, cfg: Config, out_dir: str):
     ax.grid(axis="y", alpha=0.3)
 
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    path2 = os.path.join(out_dir, "benchmark_variance_summary.png")
+    path2 = os.path.join(out_dir, f"benchmark_variance_{tag}_summary.png")
     fig.savefig(path2, dpi=150)
     plt.close(fig)
 
@@ -355,6 +481,8 @@ def make_figures(all_runs: dict, summary: dict, cfg: Config, out_dir: str):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task", choices=["stationary", "drift", "both"], default="both",
+                        help="Which regime(s) to run.")
     parser.add_argument("--quick", action="store_true", help="Fewer steps/seeds for a smoke run.")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--seeds", type=int, default=None)
@@ -362,63 +490,67 @@ def main():
     parser.add_argument("--no-figures", action="store_true", help="Skip figure generation.")
     args = parser.parse_args()
 
-    cfg = Config()
+    tasks = ["stationary", "drift"] if args.task == "both" else [args.task]
+    for task in tasks:
+        run_task(task, args)
+
+
+def run_task(task: str, args):
+    cfg = Config(task=task)
+    if task == "drift":
+        for k, v in DRIFT_PRESET.items():
+            setattr(cfg, k, v)
     if args.quick:
-        cfg.n_steps, cfg.n_seeds = 300, 2
+        cfg.n_steps = min(cfg.n_steps, 300)
+        cfg.n_seeds = 2
     if args.steps is not None:
         cfg.n_steps = args.steps
     if args.seeds is not None:
         cfg.n_seeds = args.seeds
 
+    regime = ("non-stationary drifting target" if task == "drift" else "stationary target")
     print(
-        f"Sparse regression: d={cfg.d}, k={cfg.k}, n_train={cfg.n_train}, "
-        f"batch={cfg.batch_size}, sigma={cfg.sigma_noise}, steps={cfg.n_steps}, "
-        f"seeds={cfg.n_seeds}\n"
+        f"\n=== {regime} ===\n"
+        f"d={cfg.d}, k={cfg.k}, n_train={cfg.n_train}, batch={cfg.batch_size}, "
+        f"sigma={cfg.sigma_noise}, lr={cfg.lr}, beta1={cfg.beta1}, lambda_pop={cfg.lambda_pop}, "
+        f"steps={cfg.n_steps}, seeds={cfg.n_seeds}\n"
     )
 
-    summary = {}
-    all_runs = {}
+    summary, all_runs = {}, {}
     for mode, label in MODES:
-        runs = []
-        for seed in range(cfg.n_seeds):
-            runs.append(run_one(mode, cfg, seed))
+        runs = [run_one(mode, cfg, seed) for seed in range(cfg.n_seeds)]
         all_runs[label] = runs
         summary[label] = aggregate(runs)
-        agg = summary[label]
-        print(
-            f"  {label:<16} test={agg['test']:.3f}  wall={agg['wall']:.1f}s  "
-            f"sig_gate={agg['sig_gate']:.3f}  noise_gate={agg['noise_gate']:.3f}  "
-            f"AUC={agg['auc']:.3f}"
-        )
 
-    # Table.
+    ema_test = summary["EMA-only"]["test"]
     header = (
-        f"\n{'variant':<16} {'test':>8} {'train':>8} {'wall(s)':>8} "
-        f"{'sig_gate':>9} {'noise_gt':>9} {'auc':>6} {'f_supp':>7} {'f_pass':>7} {'corr':>6}"
+        f"{'variant':<16} {'test':>8} {'vs EMA':>8} {'wall(s)':>8} "
+        f"{'sig_gate':>9} {'noise_gt':>9} {'auc':>6} {'s_ema/s_ex':>11}"
     )
     print(header)
     print("-" * len(header))
     for _, label in MODES:
         a = summary[label]
+        gain = 100.0 * (ema_test - a["test"]) / ema_test if ema_test else float("nan")
         print(
-            f"{label:<16} {a['test']:>8.3f} {a['train']:>8.3f} {a['wall']:>8.1f} "
+            f"{label:<16} {a['test']:>8.3f} {gain:>7.1f}% {a['wall']:>8.1f} "
             f"{a['sig_gate']:>9.3f} {a['noise_gate']:>9.3f} {a['auc']:>6.3f} "
-            f"{a['false_suppress']:>7.3f} {a['false_pass']:>7.3f} {a['corr']:>6.3f}"
+            f"{a['var_ratio']:>11.2f}"
         )
 
     print(
         "\nNotes:"
-        "\n  - sig_gate/noise_gate: mean gate on true signal vs noise coordinates"
-        "\n    (higher signal, lower noise is better)."
+        "\n  - vs EMA: test-loss improvement over the EMA-only baseline (higher is better)."
+        "\n  - sig_gate/noise_gate: mean gate this method applies to signal vs noise coords."
         "\n  - auc: ranking of signal vs noise coords by gate value (1.0 = perfect)."
-        "\n  - f_supp: fraction of signal coords wrongly suppressed (gate < 0.5)."
-        "\n  - f_pass: fraction of noise coords wrongly passed (gate > 0.5)."
-        "\n  - corr: correlation of log EMA-variance vs log exact-variance (full batch)."
+        "\n  - s_ema/s_ex: median ratio of the internal EMA variance to a fresh exact"
+        "\n    estimate on signal coords (>1 means the EMA over-estimates signal variance,"
+        "\n    e.g. because it conflates a drifting target's gradient with noise)."
     )
 
     if not args.no_figures:
-        paths = make_figures(all_runs, summary, cfg, args.out_dir)
-        print("\nSaved figures:")
+        paths = make_figures(all_runs, summary, cfg, args.out_dir, tag=task)
+        print("Saved figures:")
         for p in paths:
             print(f"  {p}")
 

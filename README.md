@@ -180,9 +180,19 @@ variance estimate actually change the gate?" without mutating optimizer state. I
 the mean internal/external `s`, their ratio, the EMA-vs-external gate means, the fraction
 of elements whose gate changes by more than 0.25, and the log-variance correlation.
 
-`benchmark_variance_estimators.py` compares all backends on synthetic sparse regression,
-reporting loss, wall-clock, and ground-truth gate quality (signal-vs-noise separation and
-AUC).
+### When is a better estimate than the EMA worth it?
+
+The internal EMA estimates variance *over time*, which matches the within-batch sampling
+variance only when the gradient distribution is stationary. Its blind spot is
+**non-stationarity**: on a coordinate whose true gradient is large and changing,
+`(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance and the
+gate suppresses signal it should pass. Exact and microbatch estimators measure variance
+within the current batch and are immune to this. On a synthetic drifting-target task the
+EMA over-estimates signal-coordinate variance by ~10x, and switching to an exact or
+microbatch estimate cuts tracking error by ~14-17%; on a stationary task the EMA is already
+well-calibrated and the cheap estimators add no value (or slightly hurt). See the
+`benchmark_variance_estimators.py` entry under [Benchmarks](#benchmarks) for the full
+results and figures.
 
 ### Limitations
 
@@ -575,14 +585,22 @@ Sparse linear regression (d=200, k=5 signal features, n=100 training samples, hi
 
 ### `benchmark_variance_estimators.py` -- Variance-backend comparison
 
-Sparse linear regression comparing how `grad_variances` is supplied to the SNRAdamW gate: EMA-only (baseline), exact per-sample variance every step, exact every 10 steps, and the cheap microbatch (split-batch) estimator at K=2 and K=4. Reports test/train loss, wall-clock, and ground-truth gate quality (signal-vs-noise gate separation and AUC, since the true signal coordinates are known).
+Compares how `grad_variances` is supplied to the SNRAdamW gate -- EMA-only (baseline), exact per-sample variance every step, exact every 10 steps, and the cheap microbatch (split-batch) estimator at K=2 and K=4 -- across **two regimes**, reporting test loss, wall-clock, and ground-truth gate quality (signal-vs-noise separation and AUC, since the true signal coordinates are known). Run `python benchmark_variance_estimators.py` for both, or `--task {stationary,drift}`.
 
-**Key finding:** on this task exact-every-step tracks EMA-only closely in gate quality (the EMA is already well-calibrated here), while the cheap K=2/K=4 microbatch estimator is high-variance and over-suppresses, illustrating the cost/quality tradeoff rather than a universal win.
+The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)*(g_t - m_{t-1})^2`. This equals the within-batch sampling variance only when the gradient distribution is **stationary**. Its blind spot is non-stationarity: on a coordinate whose true gradient is large and *changing*, `(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance there and the gate wrongly suppresses it. Exact and microbatch estimators measure variance *within the current batch* and are immune to this.
 
-**Output:** `benchmarks/benchmark_variance_curves.png`, `benchmarks/benchmark_variance_summary.png`
+**Stationary target (control):** the EMA is already well-calibrated, so exact-every-step tracks it closely and the high-variance microbatch estimators slightly *hurt* (they add noise where none is needed). EMA-only is the right default here.
 
-![Variance backend test-loss curves](benchmarks/benchmark_variance_curves.png)
-![Variance backend gate quality and cost](benchmarks/benchmark_variance_summary.png)
+![Variance backends, stationary regime: test loss](benchmarks/benchmark_variance_stationary_curves.png)
+
+**Non-stationary (drifting) target:** the signal coordinates oscillate, so their gradient is persistently large and time-varying. Here the EMA over-estimates signal-coordinate variance by roughly **10x** (`s_ema/s_exact` median ≈ 10) and throttles the signal (it applies a mean gate of ~0.14 to signal coords, vs ~0.28-0.50 for the within-batch estimators). The within-batch estimators recover a large chunk of that: **exact/step ≈ 17% lower tracking error than EMA-only, microbatch K=4 ≈ 14%, and even the cheap K=2 ≈ 5%**, with higher signal-vs-noise AUC. Note that exact-every-10 barely helps under *fast* drift -- a hybrid cadence must be tightened when the target moves quickly.
+
+![Variance backends, drift regime: test loss relative to EMA](benchmarks/benchmark_variance_drift_curves.png)
+![Variance backends, drift regime: gate quality and cost](benchmarks/benchmark_variance_drift_summary.png)
+
+**Takeaway:** the EMA is a good, cheap default on stationary problems; an exact or microbatch within-batch estimate is worth its cost precisely when the gradient distribution is non-stationary (drifting targets, fast curriculum/schedule changes, strong transients).
+
+**Output:** `benchmarks/benchmark_variance_{stationary,drift}_{curves,summary}.png`
 
 ## Diagnostics
 
