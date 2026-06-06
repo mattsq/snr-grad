@@ -97,6 +97,59 @@ optimizer = SNRAdamW(
 
 The same flag works on all four optimizers (`SNRAdamW`, `SNRMuon`, `RotatedSNRAdamW`, `SpectralSNRMuon`). Each exposes an `opt.count_frozen()` method returning `(parameters_frozen, elements_frozen)`; `SNRAdamW` additionally reports these in `opt.last_stats` when `track_stats=True`. Parameters the user has already set to `requires_grad=False` are not touched by the recheck. `benchmark_freeze.py` compares the freeze and baseline arms on an overparameterized MLP.
 
+## Adaptive thresholding (self-tuning the gate)
+
+A fixed threshold says "suppress gradients when `m^2/s` is below a manually chosen boundary". As gradient statistics drift during training — noise level changes, the signal support moves — that fixed boundary stops meaning the same thing, so the gate quietly becomes too permissive or too suppressive. Adaptive thresholding instead *chooses* the boundary so the gate maintains a target behaviour.
+
+Pass an `adaptive_threshold` config (a dataclass or a plain dict) to `SNRAdamW` or `MARSSNRAdamW`. The controller adapts `lambda_pop` (by default) per parameter group, leaving your original setting recorded as `base_lambda_pop`. Two modes are implemented:
+
+- **`target_mean_gate`** — keep the average gate value near a target. Robust and general.
+- **`target_active_fraction`** — keep a target fraction of coordinates "active" (`q >= active_gate_threshold`), via a closed-form quantile solve. More interpretable: "let roughly 20% of coordinates through strongly".
+
+```python
+from snr_grad import SNRAdamW, AdaptiveThresholdConfig
+
+# Hold the average gate near 0.25, adapting lambda_pop.
+optimizer = SNRAdamW(
+    model.parameters(),
+    lr=3e-4,
+    gate="snr",
+    adaptive_threshold=AdaptiveThresholdConfig(
+        mode="target_mean_gate",
+        target_mean_gate=0.25,
+        update_interval=50,
+        warmup_steps=100,
+    ),
+)
+
+# Or keep the top ~20% of coordinates strongly active (dict form also works).
+optimizer = SNRAdamW(
+    model.parameters(),
+    lr=3e-4,
+    gate="snr",
+    adaptive_threshold={
+        "mode": "target_active_fraction",
+        "target_active_fraction": 0.2,
+        "active_gate_threshold": 0.5,
+    },
+)
+```
+
+Thresholds update only every `update_interval` steps and only after `warmup_steps`; small deviations inside `tolerance` are ignored and each update's log-space move is capped by `max_log_change`, so the threshold tracks sustained shifts without chattering. Adaptation is per parameter group, so you can mix policies:
+
+```python
+optimizer = SNRAdamW(
+    [
+        {"params": model.embedding.parameters(), "adaptive_threshold": {"mode": "off"}},
+        {"params": model.blocks.parameters(),    "adaptive_threshold": {"mode": "target_active_fraction"}},
+        {"params": model.head.parameters(),      "adaptive_threshold": {"mode": "target_mean_gate"}},
+    ],
+    lr=3e-4,
+)
+```
+
+Inspect or reset the live state with `optimizer.get_threshold_state()` and `optimizer.reset_threshold_state()`. The adaptive state is saved and restored through `state_dict()` / `load_state_dict()`. `benchmark_adaptive_threshold.py` runs a nonstationary sparse-regression schedule (noise jump, then a shift in the signal support) and shows the static gate drifting away from its operating point while the adaptive gates recalibrate to hold their target.
+
 ## Exact and cheap variance estimation
 
 The SNR gate compares `m_hat**2` against an estimate of the variance of the **minibatch
@@ -550,6 +603,7 @@ python benchmark_muon.py      # SNRMuon vs SNRAdamW vs AdamW (two-layer network)
 python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
 python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
+python benchmark_adaptive_threshold.py  # Adaptive vs static gate under regime shifts
 ```
 
 ### `benchmark.py` -- Core SNR gating evaluation
@@ -616,6 +670,16 @@ The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)
 
 **Output:** `benchmarks/benchmark_variance_{stationary,drift,switch}_{curves,summary}.png`, `benchmark_variance_staleness.png`
 
+### `benchmark_adaptive_threshold.py` -- Adaptive vs static gate under regime shifts
+
+A sparse linear regression on a deliberately **nonstationary** schedule: the noise level jumps at step 1000 and the signal support moves at step 2000. A static `lambda_pop` is tuned for the first regime; once the statistics shift, the static gate's mean gate drifts (collapsing toward zero in the high-noise regime), while the `target_mean_gate` and `target_active_fraction` controllers re-tune `lambda_pop` on the fly to hold their operating point. The script prints a summary (final test loss, mean gate, `lambda_pop`, and steps-to-recover after the signal shift) and plots `lambda_pop`, mean gate, and test loss over training.
+
+This answers the design question the feature exists for -- *does adaptive thresholding track regime changes better than a static threshold?* -- rather than merely winning a single final test loss.
+
+![Adaptive vs static gate under regime shifts](benchmarks/benchmark_adaptive_threshold.png)
+
+**Output:** `benchmarks/benchmark_adaptive_threshold.png`
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):
@@ -648,6 +712,29 @@ if stats:
 | `dataset_size` | `int \| None` | `None` | Required when `alpha="finite"` |
 | `maximize` | `bool` | `False` | Maximize the objective instead of minimizing |
 | `track_stats` | `bool` | `False` | Collect per-step gate diagnostics |
+| `adaptive_threshold` | `AdaptiveThresholdConfig \| dict \| None` | `None` | Self-tune `lambda_pop`/`alpha` to hold a target gate behaviour (see Adaptive thresholding) |
+
+### `AdaptiveThresholdConfig(**kwargs)`
+
+Controls adaptive thresholding for `SNRAdamW` and `MARSSNRAdamW`. Key fields:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `mode` | `"off" \| "target_mean_gate" \| "target_active_fraction" \| "quantile_threshold"` | `"off"` | Control target |
+| `adapt` | `"lambda_pop" \| "alpha" \| "both"` | `"lambda_pop"` | Which threshold to move |
+| `target_mean_gate` | `float` | `0.2` | Target average gate value |
+| `target_active_fraction` | `float` | `0.2` | Target fraction with `q >= active_gate_threshold` |
+| `active_gate_threshold` | `float` | `0.5` | "Active" gate cutoff `q0` |
+| `update_interval` | `int` | `50` | Steps between updates |
+| `warmup_steps` | `int` | `100` | Steps before any update |
+| `beta` | `float` | `0.9` | EMA smoothing for observations / proposals |
+| `adaptation_lr` | `float` | `0.05` | Mean-gate controller gain |
+| `tolerance` | `float` | `0.02` | Deadband; deviations smaller than this are ignored |
+| `max_log_change` | `float` | `0.25` | Cap on per-update log-space movement |
+| `min_lambda_pop` / `max_lambda_pop` | `float` | `1e-4` / `1e3` | Clamps on `lambda_pop` |
+| `min_alpha` / `max_alpha` | `float` | `1e-4` / `1e3` | Clamps on `alpha` |
+
+Use `opt.get_threshold_state()` to read the live thresholds and EMAs and `opt.reset_threshold_state()` to restore the base thresholds.
 
 ### `MARSSNRAdamW(params, **kwargs)`
 
