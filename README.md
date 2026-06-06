@@ -187,12 +187,15 @@ variance only when the gradient distribution is stationary. Its blind spot is
 **non-stationarity**: on a coordinate whose true gradient is large and changing,
 `(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance and the
 gate suppresses signal it should pass. Exact and microbatch estimators measure variance
-within the current batch and are immune to this. On a synthetic drifting-target task the
-EMA over-estimates signal-coordinate variance by ~10x, and switching to an exact or
-microbatch estimate cuts tracking error by ~14-17%; on a stationary task the EMA is already
-well-calibrated and the cheap estimators add no value (or slightly hurt). See the
-`benchmark_variance_estimators.py` entry under [Benchmarks](#benchmarks) for the full
-results and figures.
+within the current batch and are immune to this. On synthetic non-stationary tasks (a
+drifting target, or an abrupt task switch) the EMA over-estimates signal-coordinate variance
+by ~10x, and switching to an exact or microbatch estimate cuts tracking error by ~14-24%; on
+a stationary task the EMA is already well-calibrated and the cheap estimators add no value
+(or slightly hurt). This reframes the goal from "better variance estimation" to **adaptive
+variance freshness**: detect when the EMA is stale (the exact and EMA gates diverge) and
+spend exact probes only then. See the `benchmark_variance_estimators.py` entry under
+[Benchmarks](#benchmarks) for the staleness detector, the three regimes, and an adaptive
+`triggered` controller.
 
 ### Limitations
 
@@ -585,9 +588,13 @@ Sparse linear regression (d=200, k=5 signal features, n=100 training samples, hi
 
 ### `benchmark_variance_estimators.py` -- Variance-backend comparison
 
-Compares how `grad_variances` is supplied to the SNRAdamW gate -- EMA-only (baseline), exact per-sample variance every step, exact every 10 steps, and the cheap microbatch (split-batch) estimator at K=2 and K=4 -- across **two regimes**, reporting test loss, wall-clock, and ground-truth gate quality (signal-vs-noise separation and AUC, since the true signal coordinates are known). Run `python benchmark_variance_estimators.py` for both, or `--task {stationary,drift}`.
+Compares how `grad_variances` is supplied to the SNRAdamW gate -- EMA-only (baseline), exact per-sample variance every step, exact every 10 steps, the cheap microbatch (split-batch) estimator at K=2/K=4, and an adaptive `triggered` controller -- across **three regimes**, reporting test loss, probe budget, and ground-truth gate quality (signal-vs-noise separation and AUC, since the true signal coordinates are known). Run `python benchmark_variance_estimators.py` for all three, or `--task {stationary,drift,switch,all}`.
 
-The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)*(g_t - m_{t-1})^2`. This equals the within-batch sampling variance only when the gradient distribution is **stationary**. Its blind spot is non-stationarity: on a coordinate whose true gradient is large and *changing*, `(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance there and the gate wrongly suppresses it. Exact and microbatch estimators measure variance *within the current batch* and are immune to this.
+The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)*(g_t - m_{t-1})^2`. This equals the within-batch sampling variance only when the gradient distribution is **stationary**. Its blind spot is non-stationarity: on a coordinate whose true gradient is large and *changing*, `(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance there and the gate wrongly suppresses it. Exact and microbatch estimators measure variance *within the current batch* and are immune to this. So the real question is not "is exact better than the EMA?" but **"when is the EMA stale?"** -- exact/microbatch variance acts as a regime-change detector and short-horizon correction.
+
+**When is the EMA stale? A staleness detector.** Probing exact variance periodically and comparing it to the internal EMA gives two cheap signals: the log-variance gap `|log s_exact - log s_ema|` and the gate impact `|q_exact - q_ema|`. They stay low when the EMA is well-calibrated and spike when it goes stale. Across regimes: the signal is highest under continuous **drift** (the EMA is perpetually behind), spikes at an abrupt **task switch**, and -- tellingly -- is also elevated during *early* "stationary" training, when feature learning makes gradients genuinely non-stationary, before settling.
+
+![Staleness detector across regimes](benchmarks/benchmark_variance_staleness.png)
 
 **Stationary target (control):** the EMA is already well-calibrated, so exact-every-step tracks it closely and the high-variance microbatch estimators slightly *hurt* (they add noise where none is needed). EMA-only is the right default here.
 
@@ -596,11 +603,18 @@ The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)
 **Non-stationary (drifting) target:** the signal coordinates oscillate, so their gradient is persistently large and time-varying. Here the EMA over-estimates signal-coordinate variance by roughly **10x** (`s_ema/s_exact` median ≈ 10) and throttles the signal (it applies a mean gate of ~0.14 to signal coords, vs ~0.28-0.50 for the within-batch estimators). The within-batch estimators recover a large chunk of that: **exact/step ≈ 17% lower tracking error than EMA-only, microbatch K=4 ≈ 14%, and even the cheap K=2 ≈ 5%**, with higher signal-vs-noise AUC. Note that exact-every-10 barely helps under *fast* drift -- a hybrid cadence must be tightened when the target moves quickly.
 
 ![Variance backends, drift regime: test loss relative to EMA](benchmarks/benchmark_variance_drift_curves.png)
-![Variance backends, drift regime: gate quality and cost](benchmarks/benchmark_variance_drift_summary.png)
 
-**Takeaway:** the EMA is a good, cheap default on stationary problems; an exact or microbatch within-batch estimate is worth its cost precisely when the gradient distribution is non-stationary (drifting targets, fast curriculum/schedule changes, strong transients).
+**Abrupt task switch:** the target's signal support is swapped at step 300 (a clean single regime-change event, standing in for curriculum boundaries, schedule changes, RL target syncs, or unfreezing). The EMA's variance state is calibrated to the old task and lags through the transition; the within-batch estimators recover faster (exact/step ≈ 24% lower tracking error, microbatch K=4 ≈ 16%).
 
-**Output:** `benchmarks/benchmark_variance_{stationary,drift}_{curves,summary}.png`
+![Variance backends, switch regime: test loss relative to EMA](benchmarks/benchmark_variance_switch_curves.png)
+
+**Adaptive `triggered` controller.** Rather than always probing, run EMA by default, probe exact every 20 steps, and -- when the gate divergence `|q_exact - q_ema|` *spikes* above its running baseline -- switch to exact variance for a short correction window. This recovers most of exact's regime-change benefit at a fraction of the probe budget: on the switch it gets **≈ 13% (vs exact's 24%) using ~390 probes instead of 600**, and on stationary it defers to the EMA and probes little (so it stays much closer to EMA than always-on exact does). The summary's third panel reports probes-per-run as the cost axis.
+
+![Variance backends, switch regime: gate quality and cost](benchmarks/benchmark_variance_switch_summary.png)
+
+**Takeaway:** the EMA is a good, cheap default on stationary problems; an exact or microbatch within-batch estimate earns its cost precisely when the gradient distribution is non-stationary (drifting targets, abrupt switches, fast curriculum/schedule changes, strong transients) -- and a staleness-triggered controller can spend that cost only when it pays off. The cleaner research framing is **adaptive variance freshness**, not "better variance estimation."
+
+**Output:** `benchmarks/benchmark_variance_{stationary,drift,switch}_{curves,summary}.png`, `benchmark_variance_staleness.png`
 
 ## Diagnostics
 
