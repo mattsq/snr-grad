@@ -573,6 +573,17 @@ Sparse linear regression (d=200, k=5 signal features, n=100 training samples, hi
 
 **Output:** `benchmarks/benchmark_mars_curves.png`, `benchmarks/benchmark_mars_weights.png`, `benchmarks/benchmark_mars_summary.png`
 
+### `benchmark_variance_estimators.py` -- Variance-backend comparison
+
+Sparse linear regression comparing how `grad_variances` is supplied to the SNRAdamW gate: EMA-only (baseline), exact per-sample variance every step, exact every 10 steps, and the cheap microbatch (split-batch) estimator at K=2 and K=4. Reports test/train loss, wall-clock, and ground-truth gate quality (signal-vs-noise gate separation and AUC, since the true signal coordinates are known).
+
+**Key finding:** on this task exact-every-step tracks EMA-only closely in gate quality (the EMA is already well-calibrated here), while the cheap K=2/K=4 microbatch estimator is high-variance and over-suppresses, illustrating the cost/quality tradeoff rather than a universal win.
+
+**Output:** `benchmarks/benchmark_variance_curves.png`, `benchmarks/benchmark_variance_summary.png`
+
+![Variance backend test-loss curves](benchmarks/benchmark_variance_curves.png)
+![Variance backend gate quality and cost](benchmarks/benchmark_variance_summary.png)
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):

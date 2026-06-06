@@ -24,11 +24,15 @@ Run:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from snr_grad import (
     SNRAdamW,
@@ -255,11 +259,107 @@ def aggregate(results: list[RunResult]) -> dict:
     }
 
 
+COLORS = {
+    "EMA-only": "tab:gray",
+    "exact/step": "tab:blue",
+    "exact/10": "tab:cyan",
+    "microbatch K=2": "tab:orange",
+    "microbatch K=4": "tab:red",
+}
+
+
+def make_figures(all_runs: dict, summary: dict, cfg: Config, out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
+    labels = [label for _, label in MODES]
+    eval_every = 50
+    steps = list(range(0, cfg.n_steps, eval_every))
+    irreducible = cfg.sigma_noise ** 2
+
+    # ---- Figure 1: test-loss curves ----
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    fig.suptitle(
+        f"Variance backends for the SNRAdamW gate: test loss\n"
+        f"sparse regression (d={cfg.d}, k={cfg.k}, n={cfg.n_train}, "
+        f"noise={cfg.sigma_noise}, {cfg.n_seeds} seeds)",
+        fontsize=12, fontweight="bold",
+    )
+    for label in labels:
+        hist = torch.tensor([r.history_test for r in all_runs[label]])  # [seeds, T]
+        n = min(len(steps), hist.shape[1])
+        mean = hist[:, :n].mean(dim=0)
+        std = hist[:, :n].std(dim=0)
+        ax.plot(steps[:n], mean, label=label, color=COLORS[label], linewidth=1.6)
+        ax.fill_between(steps[:n], (mean - std).numpy(), (mean + std).numpy(),
+                        color=COLORS[label], alpha=0.15)
+    ax.axhline(irreducible, ls="--", color="black", alpha=0.5,
+               label=f"irreducible ({irreducible:.0f})")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Test MSE")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    path1 = os.path.join(out_dir, "benchmark_variance_curves.png")
+    fig.savefig(path1, dpi=150)
+    plt.close(fig)
+
+    # ---- Figure 2: gate-quality + cost summary ----
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    fig.suptitle("Variance backends: gate quality and cost", fontsize=12, fontweight="bold")
+    x = range(len(labels))
+    colors = [COLORS[l] for l in labels]
+
+    # (a) signal vs noise gate.
+    ax = axes[0]
+    width = 0.38
+    sig = [summary[l]["sig_gate"] for l in labels]
+    noise = [summary[l]["noise_gate"] for l in labels]
+    ax.bar([i - width / 2 for i in x], sig, width, label="signal coords", color="tab:green")
+    ax.bar([i + width / 2 for i in x], noise, width, label="noise coords", color="tab:red")
+    ax.set_ylabel("Mean gate")
+    ax.set_title("(a) Gate on signal vs noise")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+
+    # (b) AUC (signal-vs-noise ranking).
+    ax = axes[1]
+    auc = [summary[l]["auc"] for l in labels]
+    ax.bar(list(x), auc, color=colors)
+    ax.axhline(0.5, ls="--", color="gray", alpha=0.6, label="chance (0.5)")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("Signal-vs-noise AUC")
+    ax.set_title("(b) Gate ranking quality")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+
+    # (c) wall-clock cost.
+    ax = axes[2]
+    wall = [summary[l]["wall"] for l in labels]
+    ax.bar(list(x), wall, color=colors)
+    ax.set_ylabel("Wall-clock (s)")
+    ax.set_title(f"(c) Cost ({cfg.n_steps} steps x {cfg.n_seeds} seeds)")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    path2 = os.path.join(out_dir, "benchmark_variance_summary.png")
+    fig.savefig(path2, dpi=150)
+    plt.close(fig)
+
+    return [path1, path2]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="Fewer steps/seeds for a smoke run.")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--seeds", type=int, default=None)
+    parser.add_argument("--out-dir", default="benchmarks", help="Directory for output PNGs.")
+    parser.add_argument("--no-figures", action="store_true", help="Skip figure generation.")
     args = parser.parse_args()
 
     cfg = Config()
@@ -277,10 +377,12 @@ def main():
     )
 
     summary = {}
+    all_runs = {}
     for mode, label in MODES:
         runs = []
         for seed in range(cfg.n_seeds):
             runs.append(run_one(mode, cfg, seed))
+        all_runs[label] = runs
         summary[label] = aggregate(runs)
         agg = summary[label]
         print(
@@ -313,6 +415,12 @@ def main():
         "\n  - f_pass: fraction of noise coords wrongly passed (gate > 0.5)."
         "\n  - corr: correlation of log EMA-variance vs log exact-variance (full batch)."
     )
+
+    if not args.no_figures:
+        paths = make_figures(all_runs, summary, cfg, args.out_dir)
+        print("\nSaved figures:")
+        for p in paths:
+            print(f"  {p}")
 
 
 if __name__ == "__main__":
