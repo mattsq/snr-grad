@@ -97,27 +97,115 @@ optimizer = SNRAdamW(
 
 The same flag works on all four optimizers (`SNRAdamW`, `SNRMuon`, `RotatedSNRAdamW`, `SpectralSNRMuon`). Each exposes an `opt.count_frozen()` method returning `(parameters_frozen, elements_frozen)`; `SNRAdamW` additionally reports these in `opt.last_stats` when `track_stats=True`. Parameters the user has already set to `requires_grad=False` are not touched by the recheck. `benchmark_freeze.py` compares the freeze and baseline arms on an overparameterized MLP.
 
-## Exact gradient variance
+## Exact and cheap variance estimation
 
-If you have access to per-sample gradients (e.g. via `torch.func.vmap`), you can supply exact variance estimates instead of relying on the streaming EMA:
+The SNR gate compares `m_hat**2` against an estimate of the variance of the **minibatch
+mean gradient**, `s`. `SNRAdamW` maintains a cheap streaming EMA of `s` internally, but
+you can supply a better per-step estimate through the `grad_variances` hook:
 
 ```python
-from snr_grad import per_sample_variance_term
-import torch.func as F
+optimizer.step(grad_variances={param: s_tensor})
+```
 
-# Compute per-example gradients with vmap
-def compute_loss(params, buffers, sample, target):
-    prediction = torch.func.functional_call(model, (params, buffers), (sample.unsqueeze(0),))
-    return loss_fn(prediction, target.unsqueeze(0))
+When supplied for a parameter, `s_tensor` replaces the EMA in the gate for that step
+(the internal EMA is still updated for continuity). The `snr_grad.variance` module
+provides interchangeable backends that produce these dictionaries, all on the same scale
+as the internal `s_hat` (unbiased per-example gradient variance divided by batch size,
+matching `per_sample_variance_term`).
 
-ft_compute = F.grad(compute_loss)
-ft_compute_vmap = F.vmap(ft_compute, in_dims=(None, None, 0, 0))
-per_sample_grads = ft_compute_vmap(params, buffers, batch_inputs, batch_targets)
+### Exact probe (per-sample gradients)
 
-# Build grad_variances dict for each parameter
-grad_variances = {p: per_sample_variance_term(g) for p, g in zip(model.parameters(), per_sample_grads.values())}
+`ExactVarianceEstimator` computes the exact diagonal variance using `torch.func`
+per-sample gradients (`grad` + `vmap`). You provide a per-example loss
+`loss_one_sample(params, buffers, sample)` that returns one example's scalar loss; the
+estimator handles `vmap`-ing it over the batch:
+
+```python
+from snr_grad import SNRAdamW, ExactVarianceEstimator
+from torch.func import functional_call
+
+def loss_one_sample(params, buffers, sample):
+    x, y = sample
+    pred = functional_call(model, (params, buffers), (x.unsqueeze(0),))
+    return ((pred.squeeze(0) - y) ** 2).sum()   # per-example loss
+
+estimator = ExactVarianceEstimator(chunk_size=16)   # chunk_size trades memory for speed
+
+optimizer.zero_grad(set_to_none=True)
+loss = ((model(x) - y) ** 2).mean()
+loss.backward()
+grad_variances = estimator.estimate(model, loss_one_sample, (x, y))
 optimizer.step(grad_variances=grad_variances)
 ```
+
+`ExactVarianceEstimator` computes in fp32 by default (robust under mixed precision) and
+casts the result back to each parameter's dtype. Use `include_params` / `exclude_params`
+(name substrings) to restrict which parameters are differentiated — exact per-sample
+gradients for large embeddings or output heads can dominate memory. Normalization-layer
+parameters are excluded by default (`exclude_norm=True`).
+
+For an exact-every-K-steps cadence, just call `estimate` only when `step % K == 0` and
+pass `grad_variances=None` (or omit it) on the other steps, so the EMA is used in between.
+
+### Cheap microbatch estimate (split-batch)
+
+`backward_with_microbatch_variance` splits the minibatch into `K` chunks, runs one
+ordinary backward per chunk, and estimates `s = Var_unbiased(chunk_means) / K` (for
+`K=2` this is `(h_1 - h_2)**2 / 4`). It **owns the backward pass** and leaves the
+full-batch mean gradient in each `param.grad`, so no separate `loss.backward()` is needed:
+
+```python
+from snr_grad import backward_with_microbatch_variance
+
+def loss_fn(model, sub_batch):
+    x, y = sub_batch
+    return ((model(x) - y) ** 2).mean()
+
+optimizer.zero_grad(set_to_none=True)
+loss, grad_variances = backward_with_microbatch_variance(
+    model, loss_fn, (x, y), num_splits=4,
+)
+optimizer.step(grad_variances=grad_variances)
+```
+
+This needs only `K` backward passes instead of per-example gradients, so it scales to
+larger models, but the estimate is noisier (especially at `K=2`). The thin wrapper
+`MicrobatchVarianceEstimator(num_splits=...)` exposes the same `.estimate(model, loss_fn,
+batch)` interface and stores the loss on `.last_loss`.
+
+### Diagnostics
+
+`compare_gate_with_external_variance(optimizer, grad_variances)` answers "would this
+variance estimate actually change the gate?" without mutating optimizer state. It returns
+the mean internal/external `s`, their ratio, the EMA-vs-external gate means, the fraction
+of elements whose gate changes by more than 0.25, and the log-variance correlation.
+
+### When is a better estimate than the EMA worth it?
+
+The internal EMA estimates variance *over time*, which matches the within-batch sampling
+variance only when the gradient distribution is stationary. Its blind spot is
+**non-stationarity**: on a coordinate whose true gradient is large and changing,
+`(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance and the
+gate suppresses signal it should pass. Exact and microbatch estimators measure variance
+within the current batch and are immune to this. On synthetic non-stationary tasks (a
+drifting target, or an abrupt task switch) the EMA over-estimates signal-coordinate variance
+by ~10x, and switching to an exact or microbatch estimate cuts tracking error by ~14-24%; on
+a stationary task the EMA is already well-calibrated and the cheap estimators add no value
+(or slightly hurt). This reframes the goal from "better variance estimation" to **adaptive
+variance freshness**: detect when the EMA is stale (the exact and EMA gates diverge) and
+spend exact probes only then. See the `benchmark_variance_estimators.py` entry under
+[Benchmarks](#benchmarks) for the staleness detector, the three regimes, and an adaptive
+`triggered` controller.
+
+### Limitations
+
+- Exact per-sample gradients require a deterministic model: control dropout / RNG, or the
+  estimate includes model stochasticity.
+- BatchNorm in train mode couples examples through batch statistics; its parameters are
+  excluded from exact probes by default and a warning is emitted.
+- Microbatch variance is biased if the chunks are not comparable (e.g. strong augmentation
+  differences or stateful layers), and is high-variance at small `K`.
+- Estimates are local to the current process; distributed aggregation is out of scope.
 
 
 ## Experimental extensions
@@ -498,6 +586,36 @@ Sparse linear regression (d=200, k=5 signal features, n=100 training samples, hi
 
 **Output:** `benchmarks/benchmark_mars_curves.png`, `benchmarks/benchmark_mars_weights.png`, `benchmarks/benchmark_mars_summary.png`
 
+### `benchmark_variance_estimators.py` -- Variance-backend comparison
+
+Compares how `grad_variances` is supplied to the SNRAdamW gate -- EMA-only (baseline), exact per-sample variance every step, exact every 10 steps, the cheap microbatch (split-batch) estimator at K=2/K=4, and an adaptive `triggered` controller -- across **three regimes**, reporting test loss, probe budget, and ground-truth gate quality (signal-vs-noise separation and AUC, since the true signal coordinates are known). Run `python benchmark_variance_estimators.py` for all three, or `--task {stationary,drift,switch,all}`.
+
+The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)*(g_t - m_{t-1})^2`. This equals the within-batch sampling variance only when the gradient distribution is **stationary**. Its blind spot is non-stationarity: on a coordinate whose true gradient is large and *changing*, `(g_t - m_{t-1})^2` is inflated by the drift, so the EMA over-estimates variance there and the gate wrongly suppresses it. Exact and microbatch estimators measure variance *within the current batch* and are immune to this. So the real question is not "is exact better than the EMA?" but **"when is the EMA stale?"** -- exact/microbatch variance acts as a regime-change detector and short-horizon correction.
+
+**When is the EMA stale? A staleness detector.** Probing exact variance periodically and comparing it to the internal EMA gives two cheap signals: the log-variance gap `|log s_exact - log s_ema|` and the gate impact `|q_exact - q_ema|`. They stay low when the EMA is well-calibrated and spike when it goes stale. Across regimes: the signal is highest under continuous **drift** (the EMA is perpetually behind), spikes at an abrupt **task switch**, and -- tellingly -- is also elevated during *early* "stationary" training, when feature learning makes gradients genuinely non-stationary, before settling.
+
+![Staleness detector across regimes](benchmarks/benchmark_variance_staleness.png)
+
+**Stationary target (control):** the EMA is already well-calibrated, so exact-every-step tracks it closely and the high-variance microbatch estimators slightly *hurt* (they add noise where none is needed). EMA-only is the right default here.
+
+![Variance backends, stationary regime: test loss](benchmarks/benchmark_variance_stationary_curves.png)
+
+**Non-stationary (drifting) target:** the signal coordinates oscillate, so their gradient is persistently large and time-varying. Here the EMA over-estimates signal-coordinate variance by roughly **10x** (`s_ema/s_exact` median ≈ 10) and throttles the signal (it applies a mean gate of ~0.14 to signal coords, vs ~0.28-0.50 for the within-batch estimators). The within-batch estimators recover a large chunk of that: **exact/step ≈ 17% lower tracking error than EMA-only, microbatch K=4 ≈ 14%, and even the cheap K=2 ≈ 5%**, with higher signal-vs-noise AUC. Note that exact-every-10 barely helps under *fast* drift -- a hybrid cadence must be tightened when the target moves quickly.
+
+![Variance backends, drift regime: test loss relative to EMA](benchmarks/benchmark_variance_drift_curves.png)
+
+**Abrupt task switch:** the target's signal support is swapped at step 300 (a clean single regime-change event, standing in for curriculum boundaries, schedule changes, RL target syncs, or unfreezing). The EMA's variance state is calibrated to the old task and lags through the transition; the within-batch estimators recover faster (exact/step ≈ 24% lower tracking error, microbatch K=4 ≈ 16%).
+
+![Variance backends, switch regime: test loss relative to EMA](benchmarks/benchmark_variance_switch_curves.png)
+
+**Adaptive `triggered` controller.** Rather than always probing, run EMA by default, probe exact every 20 steps, and -- when the gate divergence `|q_exact - q_ema|` *spikes* above its running baseline -- switch to exact variance for a short correction window. This recovers most of exact's regime-change benefit at a fraction of the probe budget: on the switch it gets **≈ 13% (vs exact's 24%) using ~390 probes instead of 600**, and on stationary it defers to the EMA and probes little (so it stays much closer to EMA than always-on exact does). The summary's third panel reports probes-per-run as the cost axis.
+
+![Variance backends, switch regime: gate quality and cost](benchmarks/benchmark_variance_switch_summary.png)
+
+**Takeaway:** the EMA is a good, cheap default on stationary problems; an exact or microbatch within-batch estimate earns its cost precisely when the gradient distribution is non-stationary (drifting targets, abrupt switches, fast curriculum/schedule changes, strong transients) -- and a staleness-triggered controller can spend that cost only when it pays off. The cleaner research framing is **adaptive variance freshness**, not "better variance estimation."
+
+**Output:** `benchmarks/benchmark_variance_{stationary,drift,switch}_{curves,summary}.png`, `benchmark_variance_staleness.png`
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):
@@ -550,11 +668,21 @@ Inherits all other parameters from `SNRAdamW`.
 - **`compute_gate(m_hat, s_hat, *, gate, alpha, lambda_pop, gate_eps)`** -- Compute the gate tensor from bias-corrected moments.
 - **`per_sample_variance_term(per_sample_grads)`** -- Compute exact diagonal variance from per-example gradients.
 
+### Variance estimation (`snr_grad.variance`)
+
+See [Exact and cheap variance estimation](#exact-and-cheap-variance-estimation) for usage.
+
+- **`ExactVarianceEstimator(*, chunk_size, include_params, exclude_params, exclude_norm, dtype)`** -- Exact per-sample-gradient variance backend; `.estimate(model, loss_one_sample, batch)`.
+- **`MicrobatchVarianceEstimator(num_splits, *, accumulate_full_grad, loss_reduction)`** -- Cheap split-batch backend; owns the backward pass.
+- **`backward_with_microbatch_variance(model, loss_fn, batch, *, num_splits, ...)`** -- Functional split-batch estimator returning `(loss, grad_variances)`.
+- **`per_sample_grad_variances(model, loss_one_sample_fn, batch, *, params, buffers, chunk_size)`** -- Low-level exact per-sample variance via `torch.func`.
+- **`compare_gate_with_external_variance(optimizer, grad_variances)`** -- Diagnostic: how an external variance estimate would change the gate.
+
 ## Scope
 
 This package implements the **diagonal SNR / population-risk gated AdamW update** (Algorithm 1 from the paper) along with experimental extensions to matrix-aware gating strategies (rotated eigenbasis, SVD-basis, and Muon-style orthogonalization). It does not implement:
 
-- Automatic per-example gradient computation (use `torch.func.vmap` and pass results via `grad_variances`)
+- Distributed aggregation of variance across ranks (estimates are process-local)
 - Multi-epoch total-variation corrections for replayed batches
 - The full leave-one-out estimator pipeline (only the derived diagonal gate is implemented)
 
