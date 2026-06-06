@@ -97,27 +97,102 @@ optimizer = SNRAdamW(
 
 The same flag works on all four optimizers (`SNRAdamW`, `SNRMuon`, `RotatedSNRAdamW`, `SpectralSNRMuon`). Each exposes an `opt.count_frozen()` method returning `(parameters_frozen, elements_frozen)`; `SNRAdamW` additionally reports these in `opt.last_stats` when `track_stats=True`. Parameters the user has already set to `requires_grad=False` are not touched by the recheck. `benchmark_freeze.py` compares the freeze and baseline arms on an overparameterized MLP.
 
-## Exact gradient variance
+## Exact and cheap variance estimation
 
-If you have access to per-sample gradients (e.g. via `torch.func.vmap`), you can supply exact variance estimates instead of relying on the streaming EMA:
+The SNR gate compares `m_hat**2` against an estimate of the variance of the **minibatch
+mean gradient**, `s`. `SNRAdamW` maintains a cheap streaming EMA of `s` internally, but
+you can supply a better per-step estimate through the `grad_variances` hook:
 
 ```python
-from snr_grad import per_sample_variance_term
-import torch.func as F
+optimizer.step(grad_variances={param: s_tensor})
+```
 
-# Compute per-example gradients with vmap
-def compute_loss(params, buffers, sample, target):
-    prediction = torch.func.functional_call(model, (params, buffers), (sample.unsqueeze(0),))
-    return loss_fn(prediction, target.unsqueeze(0))
+When supplied for a parameter, `s_tensor` replaces the EMA in the gate for that step
+(the internal EMA is still updated for continuity). The `snr_grad.variance` module
+provides interchangeable backends that produce these dictionaries, all on the same scale
+as the internal `s_hat` (unbiased per-example gradient variance divided by batch size,
+matching `per_sample_variance_term`).
 
-ft_compute = F.grad(compute_loss)
-ft_compute_vmap = F.vmap(ft_compute, in_dims=(None, None, 0, 0))
-per_sample_grads = ft_compute_vmap(params, buffers, batch_inputs, batch_targets)
+### Exact probe (per-sample gradients)
 
-# Build grad_variances dict for each parameter
-grad_variances = {p: per_sample_variance_term(g) for p, g in zip(model.parameters(), per_sample_grads.values())}
+`ExactVarianceEstimator` computes the exact diagonal variance using `torch.func`
+per-sample gradients (`grad` + `vmap`). You provide a per-example loss
+`loss_one_sample(params, buffers, sample)` that returns one example's scalar loss; the
+estimator handles `vmap`-ing it over the batch:
+
+```python
+from snr_grad import SNRAdamW, ExactVarianceEstimator
+from torch.func import functional_call
+
+def loss_one_sample(params, buffers, sample):
+    x, y = sample
+    pred = functional_call(model, (params, buffers), (x.unsqueeze(0),))
+    return ((pred.squeeze(0) - y) ** 2).sum()   # per-example loss
+
+estimator = ExactVarianceEstimator(chunk_size=16)   # chunk_size trades memory for speed
+
+optimizer.zero_grad(set_to_none=True)
+loss = ((model(x) - y) ** 2).mean()
+loss.backward()
+grad_variances = estimator.estimate(model, loss_one_sample, (x, y))
 optimizer.step(grad_variances=grad_variances)
 ```
+
+`ExactVarianceEstimator` computes in fp32 by default (robust under mixed precision) and
+casts the result back to each parameter's dtype. Use `include_params` / `exclude_params`
+(name substrings) to restrict which parameters are differentiated — exact per-sample
+gradients for large embeddings or output heads can dominate memory. Normalization-layer
+parameters are excluded by default (`exclude_norm=True`).
+
+For an exact-every-K-steps cadence, just call `estimate` only when `step % K == 0` and
+pass `grad_variances=None` (or omit it) on the other steps, so the EMA is used in between.
+
+### Cheap microbatch estimate (split-batch)
+
+`backward_with_microbatch_variance` splits the minibatch into `K` chunks, runs one
+ordinary backward per chunk, and estimates `s = Var_unbiased(chunk_means) / K` (for
+`K=2` this is `(h_1 - h_2)**2 / 4`). It **owns the backward pass** and leaves the
+full-batch mean gradient in each `param.grad`, so no separate `loss.backward()` is needed:
+
+```python
+from snr_grad import backward_with_microbatch_variance
+
+def loss_fn(model, sub_batch):
+    x, y = sub_batch
+    return ((model(x) - y) ** 2).mean()
+
+optimizer.zero_grad(set_to_none=True)
+loss, grad_variances = backward_with_microbatch_variance(
+    model, loss_fn, (x, y), num_splits=4,
+)
+optimizer.step(grad_variances=grad_variances)
+```
+
+This needs only `K` backward passes instead of per-example gradients, so it scales to
+larger models, but the estimate is noisier (especially at `K=2`). The thin wrapper
+`MicrobatchVarianceEstimator(num_splits=...)` exposes the same `.estimate(model, loss_fn,
+batch)` interface and stores the loss on `.last_loss`.
+
+### Diagnostics
+
+`compare_gate_with_external_variance(optimizer, grad_variances)` answers "would this
+variance estimate actually change the gate?" without mutating optimizer state. It returns
+the mean internal/external `s`, their ratio, the EMA-vs-external gate means, the fraction
+of elements whose gate changes by more than 0.25, and the log-variance correlation.
+
+`benchmark_variance_estimators.py` compares all backends on synthetic sparse regression,
+reporting loss, wall-clock, and ground-truth gate quality (signal-vs-noise separation and
+AUC).
+
+### Limitations
+
+- Exact per-sample gradients require a deterministic model: control dropout / RNG, or the
+  estimate includes model stochasticity.
+- BatchNorm in train mode couples examples through batch statistics; its parameters are
+  excluded from exact probes by default and a warning is emitted.
+- Microbatch variance is biased if the chunks are not comparable (e.g. strong augmentation
+  differences or stateful layers), and is high-variance at small `K`.
+- Estimates are local to the current process; distributed aggregation is out of scope.
 
 
 ## Experimental extensions
@@ -550,11 +625,21 @@ Inherits all other parameters from `SNRAdamW`.
 - **`compute_gate(m_hat, s_hat, *, gate, alpha, lambda_pop, gate_eps)`** -- Compute the gate tensor from bias-corrected moments.
 - **`per_sample_variance_term(per_sample_grads)`** -- Compute exact diagonal variance from per-example gradients.
 
+### Variance estimation (`snr_grad.variance`)
+
+See [Exact and cheap variance estimation](#exact-and-cheap-variance-estimation) for usage.
+
+- **`ExactVarianceEstimator(*, chunk_size, include_params, exclude_params, exclude_norm, dtype)`** -- Exact per-sample-gradient variance backend; `.estimate(model, loss_one_sample, batch)`.
+- **`MicrobatchVarianceEstimator(num_splits, *, accumulate_full_grad, loss_reduction)`** -- Cheap split-batch backend; owns the backward pass.
+- **`backward_with_microbatch_variance(model, loss_fn, batch, *, num_splits, ...)`** -- Functional split-batch estimator returning `(loss, grad_variances)`.
+- **`per_sample_grad_variances(model, loss_one_sample_fn, batch, *, params, buffers, chunk_size)`** -- Low-level exact per-sample variance via `torch.func`.
+- **`compare_gate_with_external_variance(optimizer, grad_variances)`** -- Diagnostic: how an external variance estimate would change the gate.
+
 ## Scope
 
 This package implements the **diagonal SNR / population-risk gated AdamW update** (Algorithm 1 from the paper) along with experimental extensions to matrix-aware gating strategies (rotated eigenbasis, SVD-basis, and Muon-style orthogonalization). It does not implement:
 
-- Automatic per-example gradient computation (use `torch.func.vmap` and pass results via `grad_variances`)
+- Distributed aggregation of variance across ranks (estimates are process-local)
 - Multi-epoch total-variation corrections for replayed batches
 - The full leave-one-out estimator pipeline (only the derived diagonal gate is implemented)
 

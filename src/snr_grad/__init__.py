@@ -19,6 +19,16 @@ from snr_grad._core import (
     per_sample_variance_term,
     resolve_alpha,
 )
+from snr_grad.variance import (
+    VarianceEstimator,
+    ExactVarianceEstimator,
+    MicrobatchVarianceEstimator,
+    per_sample_grad_variances,
+    backward_with_microbatch_variance,
+    compare_gate_with_external_variance,
+    tree_batch_size,
+    tree_split,
+)
 
 __all__ = [
     "AlphaSpec",
@@ -36,4 +46,12 @@ __all__ = [
     "compute_gate",
     "per_sample_variance_term",
     "resolve_alpha",
+    "VarianceEstimator",
+    "ExactVarianceEstimator",
+    "MicrobatchVarianceEstimator",
+    "per_sample_grad_variances",
+    "backward_with_microbatch_variance",
+    "compare_gate_with_external_variance",
+    "tree_batch_size",
+    "tree_split",
 ]
