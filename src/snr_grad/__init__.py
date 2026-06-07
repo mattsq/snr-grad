@@ -19,6 +19,9 @@ from snr_grad._core import (
     per_sample_variance_term,
     resolve_alpha,
 )
+from snr_grad.adaptive import (
+    AdaptiveThresholdConfig,
+)
 from snr_grad.variance import (
     VarianceEstimator,
     ExactVarianceEstimator,
@@ -46,6 +49,7 @@ __all__ = [
     "compute_gate",
     "per_sample_variance_term",
     "resolve_alpha",
+    "AdaptiveThresholdConfig",
     "VarianceEstimator",
     "ExactVarianceEstimator",
     "MicrobatchVarianceEstimator",

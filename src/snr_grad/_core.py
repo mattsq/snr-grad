@@ -33,6 +33,16 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
+from snr_grad.adaptive import (
+    AdaptiveThresholdSpec,
+    adaptive_pre_step,
+    coerce_adaptive_config,
+    finalize_adaptive_group,
+    get_threshold_state,
+    reset_threshold_state,
+    sample_flat,
+)
+
 
 GateType = Literal["soft", "snr", "hard"]
 AlphaSpec = Union[float, int, Literal["online", "fresh", "fresh_batch", "finite", "finite_dataset"]]
@@ -341,6 +351,7 @@ class SNRAdamW(Optimizer):
         freeze_patience: int = 200,
         freeze_recheck_interval: int = 1000,
         freeze_beta: float = 0.99,
+        adaptive_threshold: AdaptiveThresholdSpec = None,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -393,13 +404,25 @@ class SNRAdamW(Optimizer):
             freeze_patience=freeze_patience,
             freeze_recheck_interval=freeze_recheck_interval,
             freeze_beta=freeze_beta,
+            adaptive_threshold=coerce_adaptive_config(adaptive_threshold),
         )
         super().__init__(params, defaults)
+        # Per-group overrides arrive as raw dicts; normalise them to configs.
+        for group in self.param_groups:
+            group["adaptive_threshold"] = coerce_adaptive_config(group["adaptive_threshold"])
         self.last_stats: Optional[SNRAdamWStats] = None
 
     def count_frozen(self) -> tuple[int, int]:
         """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
         return _count_frozen(self)
+
+    def get_threshold_state(self) -> dict:
+        """Return the live adaptive threshold state per group (see snr_grad.adaptive)."""
+        return get_threshold_state(self)
+
+    def reset_threshold_state(self) -> None:
+        """Restore base thresholds and clear adaptive controller state."""
+        reset_threshold_state(self)
 
     def state_dict(self) -> dict:
         return _freeze_state_dict(self)
@@ -463,6 +486,16 @@ class SNRAdamW(Optimizer):
             track_stats = group["track_stats"]
             grokfast_alpha = group.get("grokfast_alpha", 0.0)
             grokfast_lamb = group.get("grokfast_lamb", 0.0)
+
+            # Live thresholds (lambda_pop, alpha) above may have been adapted on a
+            # previous step; adaptive_pre_step only bumps the controller's counter.
+            adaptive_cfg, adaptive_collect = adaptive_pre_step(group)
+            ad_gate_sums: list[Tensor] = []
+            ad_active_sums: list[Tensor] = []
+            ad_r_samples: list[Tensor] = []
+            ad_elem_count = 0
+            ad_delta_sums: list[Tensor] = []
+            ad_delta_count = 0
 
             for p in group["params"]:
                 if p.grad is None:
@@ -533,6 +566,31 @@ class SNRAdamW(Optimizer):
 
                 _update_freeze_state(p, state, q, group)
 
+                if adaptive_collect:
+                    q_ad = q.detach()
+                    ad_gate_sums.append(q_ad.sum())
+                    ad_active_sums.append(
+                        (q_ad >= adaptive_cfg.active_gate_threshold).sum()
+                    )
+                    r = m_hat.detach().square() / (s_for_gate.detach() + gate_eps)
+                    ad_r_samples.append(sample_flat(r, adaptive_cfg.max_sampled_elements))
+                    ad_elem_count += q_ad.numel()
+                    if (
+                        adaptive_cfg.staleness_detection
+                        and grad_variances is not None
+                        and p in grad_variances
+                    ):
+                        q_internal = compute_gate(
+                            m_hat,
+                            s_hat,
+                            gate=gate_type,
+                            alpha=alpha_value,
+                            lambda_pop=lambda_pop,
+                            gate_eps=gate_eps,
+                        )
+                        ad_delta_sums.append((q_ad - q_internal.detach()).abs().sum())
+                        ad_delta_count += q_ad.numel()
+
                 # Decoupled weight decay, matching AdamW and the paper's update.
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
@@ -552,6 +610,19 @@ class SNRAdamW(Optimizer):
                     m2_sums.append(m2_detached.sum())
                     elem_counts.append(q_detached.numel())
                     parameters_seen += 1
+
+            finalize_adaptive_group(
+                group,
+                adaptive_cfg,
+                adaptive_collect,
+                gate_sums=ad_gate_sums,
+                active_sums=ad_active_sums,
+                r_samples=ad_r_samples,
+                elem_count=ad_elem_count,
+                delta_sums=ad_delta_sums,
+                delta_count=ad_delta_count,
+                alpha_value=alpha_value,
+            )
 
         _maybe_recheck_freeze(self)
 
@@ -1934,6 +2005,7 @@ class MARSSNRAdamW(Optimizer):
         freeze_patience: int = 200,
         freeze_recheck_interval: int = 1000,
         freeze_beta: float = 0.99,
+        adaptive_threshold: AdaptiveThresholdSpec = None,
     ):
         if lr < 0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -1988,13 +2060,25 @@ class MARSSNRAdamW(Optimizer):
             freeze_patience=freeze_patience,
             freeze_recheck_interval=freeze_recheck_interval,
             freeze_beta=freeze_beta,
+            adaptive_threshold=coerce_adaptive_config(adaptive_threshold),
         )
         super().__init__(params, defaults)
+        # Per-group overrides arrive as raw dicts; normalise them to configs.
+        for group in self.param_groups:
+            group["adaptive_threshold"] = coerce_adaptive_config(group["adaptive_threshold"])
         self.last_stats: Optional[SNRAdamWStats] = None
 
     def count_frozen(self) -> tuple[int, int]:
         """Return (parameters_frozen_by_optimizer, total_elements_frozen)."""
         return _count_frozen(self)
+
+    def get_threshold_state(self) -> dict:
+        """Return the live adaptive threshold state per group (see snr_grad.adaptive)."""
+        return get_threshold_state(self)
+
+    def reset_threshold_state(self) -> None:
+        """Restore base thresholds and clear adaptive controller state."""
+        reset_threshold_state(self)
 
     def state_dict(self) -> dict:
         return _freeze_state_dict(self)
@@ -2055,6 +2139,16 @@ class MARSSNRAdamW(Optimizer):
             caution = group["caution"]
             maximize = group["maximize"]
             track_stats = group["track_stats"]
+
+            # Live thresholds (lambda_pop, alpha) above may have been adapted on a
+            # previous step; adaptive_pre_step only bumps the controller's counter.
+            adaptive_cfg, adaptive_collect = adaptive_pre_step(group)
+            ad_gate_sums: list[Tensor] = []
+            ad_active_sums: list[Tensor] = []
+            ad_r_samples: list[Tensor] = []
+            ad_elem_count = 0
+            ad_delta_sums: list[Tensor] = []
+            ad_delta_count = 0
 
             for p in group["params"]:
                 if p.grad is None:
@@ -2165,6 +2259,31 @@ class MARSSNRAdamW(Optimizer):
 
                 _update_freeze_state(p, state, q, group)
 
+                if adaptive_collect:
+                    q_ad = q.detach()
+                    ad_gate_sums.append(q_ad.sum())
+                    ad_active_sums.append(
+                        (q_ad >= adaptive_cfg.active_gate_threshold).sum()
+                    )
+                    r = m_hat.detach().square() / (s_for_gate.detach() + gate_eps)
+                    ad_r_samples.append(sample_flat(r, adaptive_cfg.max_sampled_elements))
+                    ad_elem_count += q_ad.numel()
+                    if (
+                        adaptive_cfg.staleness_detection
+                        and grad_variances is not None
+                        and p in grad_variances
+                    ):
+                        q_internal = compute_gate(
+                            m_hat,
+                            s_hat,
+                            gate=gate_type,
+                            alpha=alpha_value,
+                            lambda_pop=lambda_pop,
+                            gate_eps=gate_eps,
+                        )
+                        ad_delta_sums.append((q_ad - q_internal.detach()).abs().sum())
+                        ad_delta_count += q_ad.numel()
+
                 if wd != 0:
                     p.add_(p, alpha=-lr * wd)
 
@@ -2183,6 +2302,19 @@ class MARSSNRAdamW(Optimizer):
                     m2_sums.append(m2_detached.sum())
                     elem_counts.append(q_detached.numel())
                     parameters_seen += 1
+
+            finalize_adaptive_group(
+                group,
+                adaptive_cfg,
+                adaptive_collect,
+                gate_sums=ad_gate_sums,
+                active_sums=ad_active_sums,
+                r_samples=ad_r_samples,
+                elem_count=ad_elem_count,
+                delta_sums=ad_delta_sums,
+                delta_count=ad_delta_count,
+                alpha_value=alpha_value,
+            )
 
         _maybe_recheck_freeze(self)
 
