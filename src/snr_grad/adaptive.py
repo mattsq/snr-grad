@@ -80,6 +80,11 @@ class AdaptiveThresholdConfig:
     # Hysteresis: ignore deviations smaller than this, and cap per-update log moves.
     tolerance: float = 0.02
     max_log_change: float = 0.25
+    # Absolute SNR floor on r = m^2 / s. When > 0, target_active_fraction becomes a
+    # *cap*: at most that fraction is made active, but the boundary is never lowered
+    # below this floor, so the controller can keep almost nothing active when no
+    # coordinate clears the floor (adaptive conservatism, not a quota).
+    min_snr_threshold: float = 0.0
     # Staleness-aware thresholding (optional; requires grad_variances).
     staleness_detection: bool = False
     stale_gate_delta_threshold: float = 0.15
@@ -92,6 +97,10 @@ class AdaptiveThresholdConfig:
     shock_steps: int = 100
     shock_fast_beta: float = 0.5
     shift_detect_threshold: float = 0.1
+    # The shock raises the active budget only if the top candidates separate from
+    # the bulk by at least this ratio (a label-free proxy for "real signal worth
+    # admitting"); otherwise the shift only triggers faster recalibration.
+    shock_separation_threshold: float = 2.0
 
     def __post_init__(self) -> None:
         valid_modes = {
@@ -157,6 +166,10 @@ class AdaptiveThresholdConfig:
             raise ValueError(f"shock_fast_beta must be in [0, 1), got {self.shock_fast_beta}.")
         if self.shift_detect_threshold < 0.0:
             raise ValueError("shift_detect_threshold must be >= 0.")
+        if self.min_snr_threshold < 0.0:
+            raise ValueError("min_snr_threshold must be >= 0.")
+        if self.shock_separation_threshold < 0.0:
+            raise ValueError("shock_separation_threshold must be >= 0.")
 
 
 AdaptiveThresholdSpec = Union[AdaptiveThresholdConfig, Mapping[str, Any], None]
@@ -354,6 +367,10 @@ def _update_by_active_fraction(
 
     q0 = cfg.active_gate_threshold
     r_threshold = torch.quantile(r_samples.float(), 1.0 - p).item()
+    # Absolute SNR floor turns the target into a cap: never go below the floor, so
+    # when nothing clears it the controller stays maximally conservative.
+    if cfg.min_snr_threshold > 0.0:
+        r_threshold = max(r_threshold, cfg.min_snr_threshold)
 
     def _set_lambda(proposed: float) -> None:
         group["lambda_pop"] = smooth_clamped_update(
@@ -415,6 +432,19 @@ def _detect_regime_shift(state: MutableMapping[str, Any], cfg: AdaptiveThreshold
     return abs(fast - slow) > cfg.shift_detect_threshold
 
 
+def _has_signal_separation(r_samples: Optional[Tensor], cfg: AdaptiveThresholdConfig) -> bool:
+    """
+    Label-free proxy for "there is real signal worth admitting": the top candidate
+    coordinates separate from the bulk by at least ``shock_separation_threshold``.
+    """
+    if r_samples is None or r_samples.numel() < 32:
+        return False
+    r = r_samples.float()
+    top = torch.quantile(r, 1.0 - cfg.sparse_target_active_fraction).item()
+    med = torch.quantile(r, 0.5).item()
+    return top > cfg.shock_separation_threshold * max(med, 1e-12)
+
+
 def _update_shock_then_sparsify(
     group: MutableMapping[str, Any],
     cfg: AdaptiveThresholdConfig,
@@ -422,17 +452,26 @@ def _update_shock_then_sparsify(
     alpha_value: float,
 ) -> None:
     """
-    Hold a sparse active-fraction target; on a detected regime shift, transiently
-    raise the target (broad exploration), then decay it back toward sparse.
+    Hold a sparse active-fraction target; on a detected regime shift, recalibrate
+    faster and -- only if the top coordinates actually separate from the bulk --
+    transiently raise the target, then decay it back toward sparse.
 
-    The elevated window lasts ``shock_steps`` controller updates; the effective
-    target decays linearly from ``shock_target_active_fraction`` back to
-    ``sparse_target_active_fraction`` across it.
+    Opening the budget unconditionally admits noise exactly when the system is
+    already unstable, so the budget raise is gated on a label-free separation proxy.
+    A shift always triggers faster recalibration (``stale_boost_steps`` window);
+    when it does not clear the separation bar, that recalibration is the only
+    response. The elevated window, when entered, lasts ``shock_steps`` controller
+    updates and decays linearly back to ``sparse_target_active_fraction``.
     """
     state = group["_adaptive_state"]
 
     if _detect_regime_shift(state, cfg, observed.mean_gate) and state.get("shock_countdown", 0) == 0:
-        state["shock_countdown"] = cfg.shock_steps
+        # Always recalibrate the threshold faster around a detected shift.
+        if cfg.stale_boost_steps > 0:
+            state["force_update_countdown"] = cfg.stale_boost_steps
+        # Open the budget only when there is genuine separation to exploit.
+        if _has_signal_separation(observed.r_samples, cfg):
+            state["shock_countdown"] = cfg.shock_steps
 
     countdown = state.get("shock_countdown", 0)
     if countdown > 0 and cfg.shock_steps > 0:

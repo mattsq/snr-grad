@@ -87,6 +87,8 @@ class TestConfig:
         {"shock_fast_beta": 1.0},
         {"shift_detect_threshold": -0.1},
         {"shock_steps": -1},
+        {"min_snr_threshold": -1.0},
+        {"shock_separation_threshold": -0.5},
     ])
     def test_invalid_config_raises(self, kwargs):
         with pytest.raises(ValueError):
@@ -271,19 +273,31 @@ class TestActiveFractionFormula:
 # shock_then_sparsify mode
 # ---------------------------------------------------------------------------
 
+def _concentrated_r(n=5000, frac_big=0.1, big=100.0, small=0.1):
+    """r with a clearly separated top fraction (signal present)."""
+    nb = int(n * frac_big)
+    return torch.cat([torch.full((nb,), big), torch.full((n - nb,), small)])
+
+
+def _flat_r(n=5000, val=1.0):
+    """r with no separation between top and bulk (no signal worth admitting)."""
+    return torch.full((n,), val)
+
+
 class TestShockThenSparsify:
     def _cfg(self, **kw):
         base = dict(
             mode="shock_then_sparsify", sparse_target_active_fraction=0.05,
             shock_target_active_fraction=0.3, shock_steps=10, shift_detect_threshold=0.1,
             shock_fast_beta=0.0, beta=0.9, warmup_steps=0, update_interval=1, tolerance=0.0,
+            shock_separation_threshold=2.0,
         )
         base.update(kw)
         return AdaptiveThresholdConfig(**base)
 
     def _r(self):
-        torch.manual_seed(0)
-        return torch.distributions.Exponential(1.0).sample((50_000,))
+        # Exponential r has a separated tail, so it clears the separation bar.
+        return _concentrated_r()
 
     def test_steady_state_holds_sparse_target(self):
         cfg = self._cfg()
@@ -360,6 +374,96 @@ class TestShockThenSparsify:
         assert peak_target > 0.05
         # ...and it has decayed back to sparse by the end.
         assert opt.get_threshold_state()["group_0"]["target_active_fraction"] == pytest.approx(0.05)
+
+    def test_shock_raised_only_with_separation(self):
+        cfg = self._cfg()
+        group = _fake_group(cfg, gate="snr")
+        r = _concentrated_r()
+        for _ in range(20):
+            apply_adaptive_update(
+                group, cfg, AdaptiveObservation(mean_gate=0.05, active_fraction=0.05, r_samples=r), 1.0,
+            )
+        apply_adaptive_update(
+            group, cfg, AdaptiveObservation(mean_gate=0.6, active_fraction=0.6, r_samples=r), 1.0,
+        )
+        assert group["_adaptive_state"]["shock_countdown"] == cfg.shock_steps - 1
+
+    def test_shock_gated_off_without_separation_but_recalibrates(self):
+        cfg = self._cfg()
+        group = _fake_group(cfg, gate="snr")
+        r = _flat_r()
+        for _ in range(20):
+            apply_adaptive_update(
+                group, cfg, AdaptiveObservation(mean_gate=0.05, active_fraction=0.05, r_samples=r), 1.0,
+            )
+        apply_adaptive_update(
+            group, cfg, AdaptiveObservation(mean_gate=0.6, active_fraction=0.6, r_samples=r), 1.0,
+        )
+        st = group["_adaptive_state"]
+        # No genuine separation => budget is NOT opened...
+        assert st["shock_countdown"] == 0
+        assert st["current_target_active_fraction"] == pytest.approx(cfg.sparse_target_active_fraction)
+        # ...but the shift still triggers faster recalibration.
+        assert st["force_update_countdown"] == cfg.stale_boost_steps
+
+
+# ---------------------------------------------------------------------------
+# Capped active fraction + absolute SNR floor
+# ---------------------------------------------------------------------------
+
+class TestSNRFloor:
+    def test_floor_binds_when_no_coord_clears_it(self):
+        # Floor far above the r distribution => threshold pinned to the floor.
+        cfg = AdaptiveThresholdConfig(
+            mode="target_active_fraction", target_active_fraction=0.2,
+            active_gate_threshold=0.5, min_snr_threshold=10.0,
+            warmup_steps=0, update_interval=1, tolerance=0.0, beta=0.0, max_log_change=100.0,
+        )
+        group = _fake_group(cfg, gate="snr", lambda_pop=1.0, alpha=1.0)
+        torch.manual_seed(0)
+        r = torch.distributions.Exponential(1.0).sample((50_000,))  # quantile(0.8) ~ 1.6 << 10
+        apply_adaptive_update(group, cfg, AdaptiveObservation(active_fraction=0.9, r_samples=r), 1.0)
+        # lambda = r_threshold*(1-q0)/(alpha*q0) with r_threshold floored to 10.
+        assert group["lambda_pop"] == pytest.approx(10.0 * 0.5 / 0.5, rel=1e-6)
+
+    def test_floor_more_conservative_than_no_floor(self):
+        torch.manual_seed(0)
+        r = torch.distributions.Exponential(1.0).sample((50_000,))
+
+        def run(floor):
+            cfg = AdaptiveThresholdConfig(
+                mode="target_active_fraction", target_active_fraction=0.2,
+                active_gate_threshold=0.5, min_snr_threshold=floor,
+                warmup_steps=0, update_interval=1, tolerance=0.0, beta=0.0, max_log_change=100.0,
+            )
+            group = _fake_group(cfg, gate="snr", lambda_pop=1.0, alpha=1.0)
+            apply_adaptive_update(group, cfg, AdaptiveObservation(active_fraction=0.9, r_samples=r), 1.0)
+            return group["lambda_pop"]
+
+        # A binding floor forces a larger lambda_pop (more suppression).
+        assert run(10.0) > run(0.0)
+
+    def test_floor_caps_active_fraction_in_training(self):
+        torch.manual_seed(0)
+        model = nn.Linear(200, 1, bias=False)
+        opt = SNRAdamW(
+            model.parameters(), lr=5e-2, gate="snr", lambda_pop=1.0,
+            adaptive_threshold=AdaptiveThresholdConfig(
+                mode="target_active_fraction", target_active_fraction=0.05,
+                active_gate_threshold=0.25, min_snr_threshold=2.0,
+                warmup_steps=20, update_interval=10, tolerance=0.0,
+            ),
+        )
+        for _ in range(300):
+            x = torch.randn(64, 200)
+            y = x[:, :5].sum(1) + torch.randn(64)  # only 5/200 coords carry signal
+            loss = ((model(x).squeeze(-1) - y) ** 2).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+        ema = opt.get_threshold_state()["group_0"]["ema_active_fraction"]
+        # The cap keeps the active fraction well under the nominal 5% target.
+        assert ema is not None and ema < 0.05
 
 
 # ---------------------------------------------------------------------------
