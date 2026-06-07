@@ -43,6 +43,7 @@ AdaptiveMode = Literal[
     "target_mean_gate",
     "target_active_fraction",
     "quantile_threshold",
+    "shock_then_sparsify",
 ]
 
 
@@ -84,6 +85,13 @@ class AdaptiveThresholdConfig:
     stale_gate_delta_threshold: float = 0.15
     stale_boost_steps: int = 50
     stale_update_interval: int = 5
+    # "shock_then_sparsify": hold a sparse active-fraction target in steady state,
+    # transiently raise it when a regime shift is detected, then decay back.
+    sparse_target_active_fraction: float = 0.05
+    shock_target_active_fraction: float = 0.2
+    shock_steps: int = 100
+    shock_fast_beta: float = 0.5
+    shift_detect_threshold: float = 0.1
 
     def __post_init__(self) -> None:
         valid_modes = {
@@ -91,6 +99,7 @@ class AdaptiveThresholdConfig:
             "target_mean_gate",
             "target_active_fraction",
             "quantile_threshold",
+            "shock_then_sparsify",
         }
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid adaptive mode: {self.mode!r}. Expected one of {valid_modes}.")
@@ -132,6 +141,22 @@ class AdaptiveThresholdConfig:
             raise ValueError("stale_update_interval must be >= 1.")
         if self.stale_boost_steps < 0:
             raise ValueError("stale_boost_steps must be >= 0.")
+        if not (0.0 < self.sparse_target_active_fraction < 1.0):
+            raise ValueError(
+                f"sparse_target_active_fraction must be in (0, 1), "
+                f"got {self.sparse_target_active_fraction}."
+            )
+        if not (0.0 < self.shock_target_active_fraction < 1.0):
+            raise ValueError(
+                f"shock_target_active_fraction must be in (0, 1), "
+                f"got {self.shock_target_active_fraction}."
+            )
+        if self.shock_steps < 0:
+            raise ValueError("shock_steps must be >= 0.")
+        if not (0.0 <= self.shock_fast_beta < 1.0):
+            raise ValueError(f"shock_fast_beta must be in [0, 1), got {self.shock_fast_beta}.")
+        if self.shift_detect_threshold < 0.0:
+            raise ValueError("shift_detect_threshold must be >= 0.")
 
 
 AdaptiveThresholdSpec = Union[AdaptiveThresholdConfig, Mapping[str, Any], None]
@@ -237,6 +262,7 @@ def init_adaptive_group(group: MutableMapping[str, Any]) -> None:
         "ema_mean_gate": None,
         "ema_active_fraction": None,
         "force_update_countdown": 0,
+        "shock_countdown": 0,
     }
 
 
@@ -305,10 +331,14 @@ def _update_by_active_fraction(
     cfg: AdaptiveThresholdConfig,
     observed: AdaptiveObservation,
     alpha_value: float,
+    target_active_fraction: Optional[float] = None,
 ) -> None:
     r_samples = observed.r_samples
     if r_samples is None or r_samples.numel() < 32:
         return
+
+    p = cfg.target_active_fraction if target_active_fraction is None else target_active_fraction
+    group["_adaptive_state"]["current_target_active_fraction"] = p
 
     state = group["_adaptive_state"]
     if observed.active_fraction is not None:
@@ -319,11 +349,10 @@ def _update_by_active_fraction(
             else cfg.beta * old + (1.0 - cfg.beta) * observed.active_fraction
         )
         state["ema_active_fraction"] = ema
-        if abs(ema - cfg.target_active_fraction) < cfg.tolerance:
+        if abs(ema - p) < cfg.tolerance:
             return
 
     q0 = cfg.active_gate_threshold
-    p = cfg.target_active_fraction
     r_threshold = torch.quantile(r_samples.float(), 1.0 - p).item()
 
     def _set_lambda(proposed: float) -> None:
@@ -368,6 +397,57 @@ def _update_by_active_fraction(
             _set_alpha(r_threshold)
 
 
+def _detect_regime_shift(state: MutableMapping[str, Any], cfg: AdaptiveThresholdConfig,
+                         mean_gate: Optional[float]) -> bool:
+    """
+    Self-contained regime-shift detector based on a fast/slow EMA split of the
+    observed mean gate. A shift drives the realized gate away from its operating
+    point before the controller re-adapts, so the fast and slow EMAs diverge.
+    """
+    if mean_gate is None:
+        return False
+    fast = state.get("shock_fast_ema")
+    slow = state.get("shock_slow_ema")
+    fast = mean_gate if fast is None else cfg.shock_fast_beta * fast + (1.0 - cfg.shock_fast_beta) * mean_gate
+    slow = mean_gate if slow is None else cfg.beta * slow + (1.0 - cfg.beta) * mean_gate
+    state["shock_fast_ema"] = fast
+    state["shock_slow_ema"] = slow
+    return abs(fast - slow) > cfg.shift_detect_threshold
+
+
+def _update_shock_then_sparsify(
+    group: MutableMapping[str, Any],
+    cfg: AdaptiveThresholdConfig,
+    observed: AdaptiveObservation,
+    alpha_value: float,
+) -> None:
+    """
+    Hold a sparse active-fraction target; on a detected regime shift, transiently
+    raise the target (broad exploration), then decay it back toward sparse.
+
+    The elevated window lasts ``shock_steps`` controller updates; the effective
+    target decays linearly from ``shock_target_active_fraction`` back to
+    ``sparse_target_active_fraction`` across it.
+    """
+    state = group["_adaptive_state"]
+
+    if _detect_regime_shift(state, cfg, observed.mean_gate) and state.get("shock_countdown", 0) == 0:
+        state["shock_countdown"] = cfg.shock_steps
+
+    countdown = state.get("shock_countdown", 0)
+    if countdown > 0 and cfg.shock_steps > 0:
+        frac = countdown / cfg.shock_steps  # 1.0 at shift -> 0.0 at end of window
+        target = (
+            cfg.sparse_target_active_fraction
+            + frac * (cfg.shock_target_active_fraction - cfg.sparse_target_active_fraction)
+        )
+        state["shock_countdown"] = countdown - 1
+    else:
+        target = cfg.sparse_target_active_fraction
+
+    _update_by_active_fraction(group, cfg, observed, alpha_value, target_active_fraction=target)
+
+
 def apply_adaptive_update(
     group: MutableMapping[str, Any],
     cfg: AdaptiveThresholdConfig,
@@ -379,7 +459,9 @@ def apply_adaptive_update(
     if state.get("force_update_countdown", 0) > 0:
         state["force_update_countdown"] -= 1
 
-    if cfg.mode == "target_mean_gate":
+    if cfg.mode == "shock_then_sparsify":
+        _update_shock_then_sparsify(group, cfg, observed, alpha_value)
+    elif cfg.mode == "target_mean_gate":
         _update_by_mean_gate(group, cfg, observed, alpha_value)
     elif cfg.mode in {"target_active_fraction", "quantile_threshold"}:
         _update_by_active_fraction(group, cfg, observed, alpha_value)
@@ -445,6 +527,8 @@ def get_threshold_state(optimizer: Any) -> dict:
             "alpha": alpha if isinstance(alpha, str) else float(alpha),
             "ema_mean_gate": state.get("ema_mean_gate"),
             "ema_active_fraction": state.get("ema_active_fraction"),
+            "target_active_fraction": state.get("current_target_active_fraction"),
+            "shock_countdown": state.get("shock_countdown", 0),
             "step": state.get("step", 0),
         }
     return out

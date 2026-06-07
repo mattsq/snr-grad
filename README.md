@@ -101,10 +101,13 @@ The same flag works on all four optimizers (`SNRAdamW`, `SNRMuon`, `RotatedSNRAd
 
 A fixed threshold says "suppress gradients when `m^2/s` is below a manually chosen boundary". As gradient statistics drift during training — noise level changes, the signal support moves — that fixed boundary stops meaning the same thing, so the gate quietly becomes too permissive or too suppressive. Adaptive thresholding instead *chooses* the boundary so the gate maintains a target behaviour.
 
-Pass an `adaptive_threshold` config (a dataclass or a plain dict) to `SNRAdamW` or `MARSSNRAdamW`. The controller adapts `lambda_pop` (by default) per parameter group, leaving your original setting recorded as `base_lambda_pop`. Two modes are implemented:
+Pass an `adaptive_threshold` config (a dataclass or a plain dict) to `SNRAdamW` or `MARSSNRAdamW`. The controller adapts `lambda_pop` (by default; set `adapt="alpha"` or `"both"`) per parameter group, leaving your original setting recorded as `base_lambda_pop`. Three modes are implemented:
 
 - **`target_mean_gate`** — keep the average gate value near a target. Robust and general.
 - **`target_active_fraction`** — keep a target fraction of coordinates "active" (`q >= active_gate_threshold`), via a closed-form quantile solve. More interpretable: "let roughly 20% of coordinates through strongly".
+- **`shock_then_sparsify`** — hold a *sparse* active-fraction target in steady state, transiently raise it when a regime shift is detected (broad exploration), then decay back. This treats adaptive thresholding as a regime-shift response mechanism rather than a permanent push toward high update density (see the benchmark note below).
+
+**Choosing a target.** The target should reflect the problem's expected signal density, not a generic value. On a genuinely sparse problem (e.g. `d=200`, `k=5` true signal coordinates → a 2.5% active fraction) a *low* mean gate is correct, not a pathology — most coordinates should be suppressed. Forcing a high target like `target_mean_gate=0.3` or `target_active_fraction=0.2` is over-permissive and hurts generalization there. The sweep in `benchmark_adaptive_threshold.py` shows excess test loss improving monotonically as the target approaches the true sparsity.
 
 ```python
 from snr_grad import SNRAdamW, AdaptiveThresholdConfig
@@ -122,15 +125,29 @@ optimizer = SNRAdamW(
     ),
 )
 
-# Or keep the top ~20% of coordinates strongly active (dict form also works).
+# Keep an active fraction near the problem's true sparsity (dict form also works).
 optimizer = SNRAdamW(
     model.parameters(),
     lr=3e-4,
     gate="snr",
     adaptive_threshold={
         "mode": "target_active_fraction",
-        "target_active_fraction": 0.2,
+        "target_active_fraction": 0.025,   # match expected signal density
         "active_gate_threshold": 0.5,
+    },
+)
+
+# Stay sparse, but open up briefly when the gradient regime shifts.
+optimizer = SNRAdamW(
+    model.parameters(),
+    lr=3e-4,
+    gate="snr",
+    adaptive_threshold={
+        "mode": "shock_then_sparsify",
+        "sparse_target_active_fraction": 0.025,
+        "shock_target_active_fraction": 0.2,
+        "shock_steps": 50,
+        "shift_detect_threshold": 0.05,
     },
 )
 ```
@@ -148,7 +165,7 @@ optimizer = SNRAdamW(
 )
 ```
 
-Inspect or reset the live state with `optimizer.get_threshold_state()` and `optimizer.reset_threshold_state()`. The adaptive state is saved and restored through `state_dict()` / `load_state_dict()`. `benchmark_adaptive_threshold.py` runs a nonstationary sparse-regression schedule (noise jump, then a shift in the signal support) and shows the static gate drifting away from its operating point while the adaptive gates recalibrate to hold their target.
+Inspect or reset the live state with `optimizer.get_threshold_state()` and `optimizer.reset_threshold_state()`. The adaptive state is saved and restored through `state_dict()` / `load_state_dict()`. `benchmark_adaptive_threshold.py` runs a nonstationary sparse-regression schedule (noise jump, then a shift in the signal support) with signal/noise gate diagnostics and a sparsity sweep; see [its writeup](#benchmark_adaptive_thresholdpy----adaptive-vs-static-gate-under-regime-shifts) for the finding that sparsity-matched targets matter more than the choice of controller.
 
 ## Exact and cheap variance estimation
 
@@ -672,13 +689,15 @@ The internal EMA estimates variance *over time* via `s_t = rho*s_{t-1} + (1-rho)
 
 ### `benchmark_adaptive_threshold.py` -- Adaptive vs static gate under regime shifts
 
-A sparse linear regression on a deliberately **nonstationary** schedule: the noise level jumps at step 1000 and the signal support moves at step 2000. A static `lambda_pop` is tuned for the first regime; once the statistics shift, the static gate's mean gate drifts (collapsing toward zero in the high-noise regime), while the `target_mean_gate` and `target_active_fraction` controllers re-tune `lambda_pop` on the fly to hold their operating point. The script prints a summary (final test loss, mean gate, `lambda_pop`, and steps-to-recover after the signal shift) and plots `lambda_pop`, mean gate, and test loss over training.
+A sparse linear regression (`d=200`, `k=5` true signal coordinates → 2.5% active fraction) on a deliberately **nonstationary** schedule: the noise level jumps at step 1000 and the signal support moves at step 2000. Because the true signal coordinates are known, the benchmark plots what mean gate alone cannot disambiguate -- *correctly sparse* vs *wrongly suppressed*: mean gate on signal vs noise coordinates, the signal/noise gate ratio, and the false pass-through (noise gated active) and false suppression (signal gated inactive) rates.
 
-This answers the design question the feature exists for -- *does adaptive thresholding track regime changes better than a static threshold?* -- rather than merely winning a single final test loss.
+**Key finding.** A low mean gate is the *right* behaviour on a sparse problem. Static SNR runs naturally sparse and has the best excess test loss; forcing a higher active fraction is over-permissive and monotonically hurts. The `--sweep` heatmap over `target_active_fraction ∈ {0.025, 0.05, 0.10, 0.20}` × `active_gate_threshold ∈ {0.25, 0.5, 0.75}` shows excess test loss improving as the target approaches the true 2.5% sparsity. The lesson: a fixed mean-gate/active-fraction target is only a good objective when it is tied to expected signal density. This reframes adaptive thresholding as a **regime-shift response mechanism** (the `shock_then_sparsify` mode: stay sparse, open up transiently around a detected shift, decay back) rather than a permanent controller forcing high update density.
 
-![Adaptive vs static gate under regime shifts](benchmarks/benchmark_adaptive_threshold.png)
+![Adaptive vs static gate, signal/noise diagnostics](benchmarks/benchmark_adaptive_threshold.png)
 
-**Output:** `benchmarks/benchmark_adaptive_threshold.png`
+![Sparsity target sweep](benchmarks/benchmark_adaptive_threshold_sweep.png)
+
+**Output:** `benchmarks/benchmark_adaptive_threshold.png`, `benchmarks/benchmark_adaptive_threshold_sweep.png`
 
 ## Diagnostics
 
@@ -720,7 +739,7 @@ Controls adaptive thresholding for `SNRAdamW` and `MARSSNRAdamW`. Key fields:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `mode` | `"off" \| "target_mean_gate" \| "target_active_fraction" \| "quantile_threshold"` | `"off"` | Control target |
+| `mode` | `"off" \| "target_mean_gate" \| "target_active_fraction" \| "quantile_threshold" \| "shock_then_sparsify"` | `"off"` | Control target |
 | `adapt` | `"lambda_pop" \| "alpha" \| "both"` | `"lambda_pop"` | Which threshold to move |
 | `target_mean_gate` | `float` | `0.2` | Target average gate value |
 | `target_active_fraction` | `float` | `0.2` | Target fraction with `q >= active_gate_threshold` |
@@ -733,6 +752,11 @@ Controls adaptive thresholding for `SNRAdamW` and `MARSSNRAdamW`. Key fields:
 | `max_log_change` | `float` | `0.25` | Cap on per-update log-space movement |
 | `min_lambda_pop` / `max_lambda_pop` | `float` | `1e-4` / `1e3` | Clamps on `lambda_pop` |
 | `min_alpha` / `max_alpha` | `float` | `1e-4` / `1e3` | Clamps on `alpha` |
+| `sparse_target_active_fraction` | `float` | `0.05` | `shock_then_sparsify` steady-state target |
+| `shock_target_active_fraction` | `float` | `0.2` | `shock_then_sparsify` elevated target right after a shift |
+| `shock_steps` | `int` | `100` | Controller updates over which the elevated target decays back |
+| `shift_detect_threshold` | `float` | `0.1` | Fast/slow mean-gate divergence that triggers a shock |
+| `shock_fast_beta` | `float` | `0.5` | Fast-EMA coefficient for shift detection |
 
 Use `opt.get_threshold_state()` to read the live thresholds and EMAs and `opt.reset_threshold_state()` to restore the base thresholds.
 

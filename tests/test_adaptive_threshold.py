@@ -29,6 +29,7 @@ def _fake_group(cfg, *, lambda_pop=1.0, alpha=1.0, gate="snr", step=1):
             "ema_mean_gate": None,
             "ema_active_fraction": None,
             "force_update_countdown": 0,
+            "shock_countdown": 0,
         },
     }
 
@@ -81,6 +82,11 @@ class TestConfig:
         {"beta": 1.0},
         {"max_log_change": 0.0},
         {"min_lambda_pop": 10.0, "max_lambda_pop": 1.0},
+        {"sparse_target_active_fraction": 0.0},
+        {"shock_target_active_fraction": 1.0},
+        {"shock_fast_beta": 1.0},
+        {"shift_detect_threshold": -0.1},
+        {"shock_steps": -1},
     ])
     def test_invalid_config_raises(self, kwargs):
         with pytest.raises(ValueError):
@@ -259,6 +265,101 @@ class TestActiveFractionFormula:
         apply_adaptive_update(group, cfg, AdaptiveObservation(active_fraction=0.9, r_samples=r), 1.0)
         assert group["alpha"] == pytest.approx(r_threshold, rel=1e-6)
         assert group["lambda_pop"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# shock_then_sparsify mode
+# ---------------------------------------------------------------------------
+
+class TestShockThenSparsify:
+    def _cfg(self, **kw):
+        base = dict(
+            mode="shock_then_sparsify", sparse_target_active_fraction=0.05,
+            shock_target_active_fraction=0.3, shock_steps=10, shift_detect_threshold=0.1,
+            shock_fast_beta=0.0, beta=0.9, warmup_steps=0, update_interval=1, tolerance=0.0,
+        )
+        base.update(kw)
+        return AdaptiveThresholdConfig(**base)
+
+    def _r(self):
+        torch.manual_seed(0)
+        return torch.distributions.Exponential(1.0).sample((50_000,))
+
+    def test_steady_state_holds_sparse_target(self):
+        cfg = self._cfg()
+        group = _fake_group(cfg, gate="snr")
+        r = self._r()
+        for _ in range(30):
+            apply_adaptive_update(
+                group, cfg,
+                AdaptiveObservation(mean_gate=0.05, active_fraction=0.05, r_samples=r), 1.0,
+            )
+        st = group["_adaptive_state"]
+        assert st["shock_countdown"] == 0
+        assert st["current_target_active_fraction"] == pytest.approx(0.05)
+
+    def test_shift_raises_target_then_decays(self):
+        cfg = self._cfg()
+        group = _fake_group(cfg, gate="snr")
+        r = self._r()
+        # Settle the slow EMA at a low gate.
+        for _ in range(20):
+            apply_adaptive_update(
+                group, cfg,
+                AdaptiveObservation(mean_gate=0.05, active_fraction=0.05, r_samples=r), 1.0,
+            )
+        # A regime shift surfaces as a sudden jump in the realized mean gate.
+        apply_adaptive_update(
+            group, cfg,
+            AdaptiveObservation(mean_gate=0.6, active_fraction=0.6, r_samples=r), 1.0,
+        )
+        st = group["_adaptive_state"]
+        assert st["shock_countdown"] == cfg.shock_steps - 1
+        assert st["current_target_active_fraction"] > 0.05
+
+        # Decay back toward sparse as the window elapses.
+        targets = []
+        for _ in range(cfg.shock_steps + 2):
+            apply_adaptive_update(
+                group, cfg,
+                AdaptiveObservation(mean_gate=0.05, active_fraction=0.05, r_samples=r), 1.0,
+            )
+            targets.append(group["_adaptive_state"]["current_target_active_fraction"])
+        assert all(targets[i] >= targets[i + 1] - 1e-9 for i in range(len(targets) - 1))
+        assert targets[-1] == pytest.approx(0.05)
+        assert group["_adaptive_state"]["shock_countdown"] == 0
+
+    def test_integration_recovers_after_regime_shift(self):
+        torch.manual_seed(0)
+        model = nn.Linear(200, 1, bias=False)
+        opt = SNRAdamW(
+            model.parameters(), lr=5e-2, gate="snr", lambda_pop=1.0,
+            adaptive_threshold=AdaptiveThresholdConfig(
+                mode="shock_then_sparsify", sparse_target_active_fraction=0.05,
+                shock_target_active_fraction=0.25, shock_steps=20,
+                shift_detect_threshold=0.04, warmup_steps=20, update_interval=5,
+                tolerance=0.0,
+            ),
+        )
+        peak_target = 0.0
+        sigma = 1.0
+        for step in range(600):
+            if step == 300:
+                sigma = 5.0
+            x = torch.randn(64, 200)
+            y = x[:, :5].sum(1) + sigma * torch.randn(64)
+            loss = ((model(x).squeeze(-1) - y) ** 2).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            if 300 <= step <= 420:
+                t = opt.get_threshold_state()["group_0"]["target_active_fraction"]
+                if t is not None:
+                    peak_target = max(peak_target, t)
+        # The shock raised the target above the sparse baseline...
+        assert peak_target > 0.05
+        # ...and it has decayed back to sparse by the end.
+        assert opt.get_threshold_state()["group_0"]["target_active_fraction"] == pytest.approx(0.05)
 
 
 # ---------------------------------------------------------------------------
