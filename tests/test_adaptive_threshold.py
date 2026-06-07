@@ -194,6 +194,72 @@ class TestActiveFractionFormula:
         assert ema is not None
         assert abs(ema - 0.3) < 0.2
 
+    def _active_fraction_group(self, adapt, *, lambda_pop=1.0, alpha=1.0):
+        cfg = AdaptiveThresholdConfig(
+            mode="target_active_fraction", adapt=adapt,
+            target_active_fraction=0.2, active_gate_threshold=0.5,
+            warmup_steps=0, update_interval=1, tolerance=0.0, beta=0.0,
+            max_log_change=100.0,
+        )
+        group = _fake_group(cfg, lambda_pop=lambda_pop, alpha=alpha, gate="snr")
+        torch.manual_seed(0)
+        r = torch.distributions.Exponential(1.0).sample((50_000,))
+        obs = AdaptiveObservation(active_fraction=0.9, r_samples=r)
+        return cfg, group, obs
+
+    def test_snr_adapt_lambda_pop_only(self):
+        cfg, group, obs = self._active_fraction_group("lambda_pop", lambda_pop=1.0, alpha=2.0)
+        apply_adaptive_update(group, cfg, obs, alpha_value=2.0)
+        assert group["lambda_pop"] != 1.0
+        assert group["alpha"] == 2.0  # alpha left untouched
+
+    def test_snr_adapt_alpha_only(self):
+        cfg, group, obs = self._active_fraction_group("alpha", lambda_pop=3.0, alpha=1.0)
+        apply_adaptive_update(group, cfg, obs, alpha_value=1.0)
+        assert group["alpha"] != 1.0
+        assert group["lambda_pop"] == 3.0  # lambda_pop left untouched
+
+    def test_snr_adapt_both_hits_product(self):
+        cfg, group, obs = self._active_fraction_group("both", lambda_pop=1.0, alpha=1.0)
+        # Recover the controller's target product (alpha * lambda) for this r sample.
+        q0 = cfg.active_gate_threshold
+        r_threshold = torch.quantile(obs.r_samples.float(), 1.0 - cfg.target_active_fraction).item()
+        target_scale = r_threshold * (1.0 - q0) / q0
+        apply_adaptive_update(group, cfg, obs, alpha_value=1.0)
+        assert group["alpha"] != 1.0
+        assert group["lambda_pop"] != 1.0
+        product = group["alpha"] * group["lambda_pop"]
+        assert product == pytest.approx(target_scale, rel=1e-6)
+
+    def test_soft_gate_respects_pinned_alpha(self):
+        # soft/hard control the active boundary through alpha; adapt="lambda_pop"
+        # must not silently mutate alpha (or lambda_pop, which has no effect here).
+        cfg = AdaptiveThresholdConfig(
+            mode="target_active_fraction", adapt="lambda_pop",
+            target_active_fraction=0.2, warmup_steps=0, update_interval=1,
+            tolerance=0.0, beta=0.0,
+        )
+        group = _fake_group(cfg, lambda_pop=1.0, alpha=1.0, gate="soft")
+        torch.manual_seed(0)
+        r = torch.distributions.Exponential(1.0).sample((50_000,))
+        apply_adaptive_update(group, cfg, AdaptiveObservation(active_fraction=0.9, r_samples=r), 1.0)
+        assert group["alpha"] == 1.0
+        assert group["lambda_pop"] == 1.0
+
+    def test_soft_gate_adapts_alpha(self):
+        cfg = AdaptiveThresholdConfig(
+            mode="target_active_fraction", adapt="alpha",
+            target_active_fraction=0.2, warmup_steps=0, update_interval=1,
+            tolerance=0.0, beta=0.0, max_log_change=100.0,
+        )
+        group = _fake_group(cfg, lambda_pop=1.0, alpha=1.0, gate="soft")
+        torch.manual_seed(0)
+        r = torch.distributions.Exponential(1.0).sample((50_000,))
+        r_threshold = torch.quantile(r.float(), 0.8).item()
+        apply_adaptive_update(group, cfg, AdaptiveObservation(active_fraction=0.9, r_samples=r), 1.0)
+        assert group["alpha"] == pytest.approx(r_threshold, rel=1e-6)
+        assert group["lambda_pop"] == 1.0
+
 
 # ---------------------------------------------------------------------------
 # 3. Clamp behaviour

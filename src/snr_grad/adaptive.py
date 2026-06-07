@@ -326,26 +326,46 @@ def _update_by_active_fraction(
     p = cfg.target_active_fraction
     r_threshold = torch.quantile(r_samples.float(), 1.0 - p).item()
 
-    if group["gate"] == "snr":
-        proposed_lambda = r_threshold * (1.0 - q0) / max(alpha_value * q0, 1e-12)
+    def _set_lambda(proposed: float) -> None:
         group["lambda_pop"] = smooth_clamped_update(
             old=group["lambda_pop"],
-            proposed=proposed_lambda,
+            proposed=proposed,
             beta=cfg.beta,
             min_value=cfg.min_lambda_pop,
             max_value=cfg.max_lambda_pop,
             max_log_change=cfg.max_log_change,
         )
-    else:
-        # soft / hard gates: "active" means r > alpha, so the boundary IS alpha.
+
+    def _set_alpha(proposed: float) -> None:
         group["alpha"] = smooth_clamped_update(
             old=alpha_value,
-            proposed=r_threshold,
+            proposed=proposed,
             beta=cfg.beta,
             min_value=cfg.min_alpha,
             max_value=cfg.max_alpha,
             max_log_change=cfg.max_log_change,
         )
+
+    if group["gate"] == "snr":
+        # active <=> r >= alpha * lambda_pop * q0 / (1 - q0), so the quantity the
+        # controller targets is the product (alpha * lambda_pop):
+        target_scale = r_threshold * (1.0 - q0) / max(q0, 1e-12)
+        lam = max(float(group["lambda_pop"]), 1e-30)
+        a = max(float(alpha_value), 1e-30)
+        if cfg.adapt == "lambda_pop":
+            _set_lambda(target_scale / a)
+        elif cfg.adapt == "alpha":
+            _set_alpha(target_scale / lam)
+        else:  # "both": move both geometrically so their product hits the target.
+            factor = math.sqrt(max(target_scale, 1e-30) / (a * lam))
+            _set_lambda(lam * factor)
+            _set_alpha(a * factor)
+    else:
+        # soft / hard gates: "active" means r > alpha, so the boundary IS alpha and
+        # lambda_pop does not move it. We can only honor the target by adapting alpha;
+        # if the user pinned alpha (adapt="lambda_pop") there is nothing sound to do.
+        if cfg.adapt in {"alpha", "both"}:
+            _set_alpha(r_threshold)
 
 
 def apply_adaptive_update(
