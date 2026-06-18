@@ -22,6 +22,11 @@ from snr_grad._core import (
 from snr_grad.adaptive import (
     AdaptiveThresholdConfig,
 )
+from snr_grad.activation import (
+    ActivationPrecondConfig,
+    ActivationPreconditioner,
+    DoPr,
+)
 from snr_grad.variance import (
     VarianceEstimator,
     ExactVarianceEstimator,
@@ -50,6 +55,9 @@ __all__ = [
     "per_sample_variance_term",
     "resolve_alpha",
     "AdaptiveThresholdConfig",
+    "ActivationPrecondConfig",
+    "ActivationPreconditioner",
+    "DoPr",
     "VarianceEstimator",
     "ExactVarianceEstimator",
     "MicrobatchVarianceEstimator",
