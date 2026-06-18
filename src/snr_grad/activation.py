@@ -95,10 +95,16 @@ class ActivationPrecondConfig:
 
     Args:
         damping:
-            ``gamma`` in ``S_z + gamma * tr(S_z)/d_z * I``. Scale-invariant: the
-            damping is set relative to the magnitude of ``S_z``. Must be > 0 so
-            the damped covariance is invertible even when the batch is smaller
-            than the layer fan-in (rank-deficient ``S_z``).
+            ``gamma`` in ``S_z + (gamma * tr(S_z)/d_z + damping_floor) * I``.
+            Scale-invariant: this term is set relative to the magnitude of
+            ``S_z``. Must be > 0. Note that the *relative* term alone does not
+            guarantee invertibility (it vanishes when ``S_z`` is all-zero, e.g. a
+            layer whose inputs are fully masked); the absolute ``damping_floor``
+            provides that guarantee.
+        damping_floor:
+            Absolute floor added to the damping (default ``1e-8``), so the damped
+            covariance is positive-definite even when ``S_z`` is zero or
+            rank-deficient. Must be >= 0.
         ema_beta:
             If set, the activation covariance is an exponential moving average
             ``S <- ema_beta * S + (1 - ema_beta) * S_batch`` instead of the raw
@@ -132,6 +138,7 @@ class ActivationPrecondConfig:
     """
 
     damping: float = 0.1
+    damping_floor: float = 1e-8
     ema_beta: Optional[float] = None
     warmup_steps: int = 0
     include_modules: Optional[Sequence[str]] = None
@@ -144,6 +151,8 @@ class ActivationPrecondConfig:
     def __post_init__(self) -> None:
         if self.damping <= 0:
             raise ValueError(f"damping must be > 0, got {self.damping}.")
+        if self.damping_floor < 0:
+            raise ValueError(f"damping_floor must be >= 0, got {self.damping_floor}.")
         if self.ema_beta is not None and not 0.0 <= self.ema_beta < 1.0:
             raise ValueError(f"ema_beta must be in [0, 1), got {self.ema_beta}.")
         if self.warmup_steps < 0:
@@ -193,10 +202,10 @@ class ActivationPreconditioner:
     def __init__(
         self,
         model: nn.Module,
-        config: ActivationPrecondConfig = ActivationPrecondConfig(),
+        config: Optional[ActivationPrecondConfig] = None,
     ) -> None:
         self.model = model
-        self.config = config
+        self.config = config if config is not None else ActivationPrecondConfig()
 
         # Per-module bookkeeping.
         self._kind: dict[nn.Module, str] = {}
@@ -230,10 +239,18 @@ class ActivationPreconditioner:
 
     def _register(self, model: nn.Module) -> None:
         cfg = self.config
-        # First pass: figure out which modules to register, detect tied weights
-        # and unsupported conv layers.
-        candidates: list[tuple[str, nn.Module, str]] = []
+        # Tied-weight detection scans the FULL module tree (not just the modules
+        # that survive include/exclude filtering): a weight tied to an excluded or
+        # filtered-out module is still ambiguous and must be skipped.
         weight_owners: dict[int, list[str]] = {}
+        for name, module in model.named_modules():
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, Tensor):
+                weight_owners.setdefault(id(weight), []).append(name)
+
+        # First pass: figure out which modules to register and reject unsupported
+        # conv layers / warn about layers whose hook will not fire.
+        candidates: list[tuple[str, nn.Module, str]] = []
         for name, module in model.named_modules():
             if _name_matches(name, cfg.exclude_modules):
                 continue
@@ -247,6 +264,16 @@ class ActivationPreconditioner:
                     f"not implemented; exclude it via "
                     f"ActivationPrecondConfig(exclude_modules=[...])."
                 )
+            if isinstance(module, nn.MultiheadAttention):
+                warnings.warn(
+                    f"ActivationPreconditioner: fused nn.MultiheadAttention {name!r} "
+                    f"computes its projections via F.linear and bypasses module hooks, "
+                    f"so activation preconditioning will NOT be applied to it. Use "
+                    f"explicit nn.Linear Q/K/V/out projections for AP support.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                continue
             kind = self._supported_kind(module)
             if kind is None:
                 continue
@@ -254,7 +281,6 @@ class ActivationPreconditioner:
             if weight is None:
                 continue
             candidates.append((name, module, kind))
-            weight_owners.setdefault(id(weight), []).append(name)
 
         for name, module, kind in candidates:
             weight = module.weight
@@ -326,22 +352,27 @@ class ActivationPreconditioner:
         solve ``S_d X = G^T`` for ``X`` and return ``X^T``.
         """
         d_z = sigma.shape[0]
-        tau = self.config.damping * (sigma.diagonal().sum() / d_z)
         eye = torch.eye(d_z, dtype=sigma.dtype, device=sigma.device)
-        sd = sigma + tau * eye
         gt = g.to(sigma.dtype).t().contiguous()
+        # Damping has a scale-invariant relative term plus an absolute floor; the
+        # floor keeps S_d positive-definite even when S_z is zero/rank-deficient.
+        tau = self._damping_tau(sigma.diagonal().sum(), d_z)
+        sd = sigma + tau * eye
         L, info = torch.linalg.cholesky_ex(sd)
-        if int(info) == 0:
-            x = torch.cholesky_solve(gt, L)
-        else:
-            # Numerical fallback: bump damping once, else a general solve.
-            sd2 = sigma + (tau * 10.0) * eye
-            L2, info2 = torch.linalg.cholesky_ex(sd2)
-            if int(info2) == 0:
-                x = torch.cholesky_solve(gt, L2)
-            else:
-                x = torch.linalg.solve(sd2, gt)
+        if int(info) != 0:
+            # Numerical safety net: bump the damping until the factorization
+            # succeeds (guaranteed to terminate as tau grows).
+            for _ in range(5):
+                tau = tau * 10.0
+                L, info = torch.linalg.cholesky_ex(sigma + tau * eye)
+                if int(info) == 0:
+                    break
+        x = torch.cholesky_solve(gt, L)
         return x.t()
+
+    def _damping_tau(self, trace: Tensor, d_z: int) -> Tensor:
+        """Scale-invariant relative damping plus an absolute floor."""
+        return self.config.damping * (trace / d_z) + self.config.damping_floor
 
     # -- main API -----------------------------------------------------------
 
@@ -354,6 +385,12 @@ class ActivationPreconditioner:
         clears the per-step activation cache. Modules that did not run a forward
         this step (no captured activations) are skipped, unless EMA is enabled and
         ``use_stale_ema_on_missing`` is set.
+
+        Note: the activation cache is populated by forward passes and consumed (and
+        cleared) here. Call this once per training step, in the usual
+        ``loss.backward(); precondition_(); optimizer.step()`` loop. If a forward
+        pass runs without a following ``precondition_()`` (or :meth:`zero_grad` /
+        :meth:`reset`), its activations carry over into the next step's covariance.
         """
         self._step += 1
         cfg = self.config
@@ -406,7 +443,7 @@ class ActivationPreconditioner:
         scales row ``v`` of ``G`` by ``1/(p_v + tau)`` (rare tokens upweighted).
         """
         d_z = sigma_diag.shape[0]
-        tau = self.config.damping * (sigma_diag.sum() / d_z)
+        tau = self._damping_tau(sigma_diag.sum(), d_z)
         denom = (sigma_diag + tau).to(g.dtype).unsqueeze(1)  # [vocab, 1]
         return g / denom
 
@@ -450,15 +487,31 @@ class ActivationPreconditioner:
         return {"step": self._step, "sigma_ema": ema}
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore step counter and EMA covariances from :meth:`state_dict`."""
+        """Restore step counter and EMA covariances from :meth:`state_dict`.
+
+        Emits a warning if saved EMA entries do not match any current module
+        (e.g. loading onto a structurally different model), since those
+        covariances would otherwise be silently dropped.
+        """
         self._step = int(state.get("step", 0))
         self._sigma_ema.clear()
         ema = state.get("sigma_ema", {})
         name_to_module = {n: m for m, n in self._name_of_module.items()}
+        unmatched = []
         for name, sigma in ema.items():
             module = name_to_module.get(name)
             if module is not None:
                 self._sigma_ema[module] = sigma.clone()
+            else:
+                unmatched.append(name)
+        if unmatched:
+            warnings.warn(
+                f"ActivationPreconditioner.load_state_dict: {len(unmatched)} saved EMA "
+                f"covariance(s) had no matching module and were dropped: {unmatched}. "
+                f"The model structure may differ from the checkpoint.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def __enter__(self) -> "ActivationPreconditioner":
         return self
@@ -494,13 +547,17 @@ class DoPr:
 
         opt = DoPr(SNRAdamW(model.parameters(), lr=3e-4), model)
         loss.backward(); opt.step(); opt.zero_grad()
+
+    Note: checkpoint via :meth:`state_dict` / :meth:`load_state_dict`. ``DoPr`` is
+    not picklable because the activation hooks hold module closures; use the state
+    dict rather than ``pickle``/``torch.save`` of the object itself.
     """
 
     def __init__(
         self,
         base_optimizer: Any,
         model: nn.Module,
-        config: ActivationPrecondConfig = ActivationPrecondConfig(),
+        config: Optional[ActivationPrecondConfig] = None,
     ) -> None:
         self.base = base_optimizer
         self.ap = ActivationPreconditioner(model, config)
@@ -535,5 +592,10 @@ class DoPr:
 
     def __getattr__(self, name: str) -> Any:
         # Only reached when normal lookup fails; delegate to the base optimizer.
-        # ``base`` itself is a normal attribute so this won't recurse for it.
-        return getattr(self.__dict__["base"], name)
+        # During copy/deepcopy/unpickle ``base`` may not be set yet -- raise
+        # AttributeError (not KeyError) so those protocols work correctly.
+        try:
+            base = self.__dict__["base"]
+        except KeyError:
+            raise AttributeError(name)
+        return getattr(base, name)

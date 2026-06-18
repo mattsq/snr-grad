@@ -455,6 +455,96 @@ class TestMaximize:
         assert torch.allclose(lin.weight.grad, -M_ref, atol=1e-10)
 
 
+class TestSingularInput:
+    """Regression: zero/dead activations must not crash the solve (damping floor)."""
+
+    def test_zero_activations_do_not_crash(self):
+        lin = nn.Linear(4, 3, bias=False).double()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.5, compute_dtype=torch.float64))
+        # All-zero input -> Sigma_z = 0; a nonzero grad arrives via another path.
+        lin(torch.zeros(6, 4, dtype=torch.float64)).sum().backward()
+        lin.weight.grad = torch.randn_like(lin.weight)
+        ap.precondition_()  # must not raise
+        assert torch.isfinite(lin.weight.grad).all()
+
+    def test_damping_floor_validation(self):
+        with pytest.raises(ValueError):
+            ActivationPrecondConfig(damping_floor=-1.0)
+
+    def test_floor_only_is_well_defined(self):
+        # damping floor alone (tiny relative term) still yields a finite, large
+        # update for a zero-covariance layer.
+        lin = nn.Linear(4, 3, bias=False).double()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, damping_floor=1e-6,
+                                         compute_dtype=torch.float64))
+        lin(torch.zeros(5, 4, dtype=torch.float64)).sum().backward()
+        G = torch.randn_like(lin.weight)
+        lin.weight.grad = G.clone()
+        ap.precondition_()
+        # With Sigma=0, M = G / floor (row/col-uniform scaling), finite.
+        assert torch.allclose(lin.weight.grad, G / 1e-6, rtol=1e-4)
+
+
+class TestDoPrCopyAndDelegation:
+    """Regression: __getattr__ must raise AttributeError so copy/pickle protocols work."""
+
+    def test_copy_works(self):
+        import copy
+        m = nn.Linear(5, 3)
+        opt = DoPr(SNRAdamW(m.parameters(), lr=1e-2), m)
+        copy.copy(opt)  # must not raise KeyError
+
+    def test_missing_attr_raises_attributeerror(self):
+        m = nn.Linear(5, 3)
+        opt = DoPr(SNRAdamW(m.parameters(), lr=1e-2), m)
+        with pytest.raises(AttributeError):
+            _ = opt.this_attr_does_not_exist
+
+
+class TestMultiheadAttention:
+    """Regression: fused MHA bypasses module hooks -> warn that it is not preconditioned."""
+
+    def test_mha_warns(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ActivationPreconditioner(
+                nn.MultiheadAttention(8, 2, batch_first=True),
+                ActivationPrecondConfig(damping=0.1))
+        assert any("multiheadattention" in str(w.message).lower() for w in caught)
+
+
+class TestTiedWeightExcludedPartner:
+    """Regression: a weight tied to an EXCLUDED/filtered module must still be skipped."""
+
+    def test_tied_to_excluded_is_skipped(self):
+        emb = nn.Embedding(6, 4)
+        head = nn.Linear(4, 6, bias=False)
+        head.weight = emb.weight  # tied to a module we will exclude
+        model = nn.ModuleDict({"emb": emb, "head": head})
+        ap = ActivationPreconditioner(
+            model, ActivationPrecondConfig(damping=0.1, exclude_modules=["head"]))
+        idx = torch.tensor([0, 1, 2])
+        (emb(idx) ** 2).sum().backward()
+        g_before = emb.weight.grad.clone()
+        ap.precondition_()
+        assert torch.equal(emb.weight.grad, g_before)  # not preconditioned (ambiguous tie)
+
+
+class TestStateDictMismatch:
+    """Regression: loading EMA onto a structurally different model warns, not silent."""
+
+    def test_unmatched_ema_warns(self):
+        m = nn.Linear(4, 3)
+        ap = ActivationPreconditioner(m, ActivationPrecondConfig(ema_beta=0.9))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ap.load_state_dict({"step": 3, "sigma_ema": {"nope": torch.eye(4)}})
+        assert ap.step_count == 3
+        assert any("no matching module" in str(w.message).lower() for w in caught)
+
+
 class TestStaleEMA:
 
     def test_skips_module_without_forward_when_no_ema(self):

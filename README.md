@@ -328,9 +328,12 @@ linear) and is orthogonal to decoupled weight decay and schedule-free parameter 
 substituting the AP gradient does not change the update norm -- so existing muP /
 learning-rate / weight-decay **scaling rules of the base GP transfer directly** to DoPr.
 
-**Supported layers:** `nn.Linear` (covers attention Q/K/V/out projections) and
-`nn.Embedding` (one-hot inputs => diagonal covariance = per-token counts, applied
-efficiently as a row-wise rescale that upweights rare tokens).
+**Supported layers:** `nn.Linear` (including the explicit Q/K/V/out `nn.Linear`
+projections used by custom transformer blocks) and `nn.Embedding` (one-hot inputs =>
+diagonal covariance = per-token counts, applied efficiently as a row-wise rescale that
+upweights rare tokens). Note: **fused `nn.MultiheadAttention` is not preconditioned** —
+it computes its projections via `F.linear` and bypasses module hooks, so a warning is
+emitted; use explicit `nn.Linear` projections for AP support.
 
 `benchmark_dopr.py` reproduces the paper's minimal LDS behavior-cloning TTF example and
 plots validation loss, feature-subspace distance, and rollout cost for `SNRAdamW` vs
@@ -348,8 +351,10 @@ uv run python benchmark_dopr.py            # or --quick
 - Tied / shared weights (e.g. tied input/output embeddings) are skipped with a warning,
   because the correct AP is ambiguous (different, even differently shaped, covariances).
 - The covariance and its solve run in fp32 by default for numerical stability.
-- The affine-invariance property is exact only for the undamped update; damping is set
-  scale-invariantly via `gamma`.
+- Damping combines a scale-invariant relative term (`gamma`) with a small absolute floor
+  (`damping_floor`, default `1e-8`) so the solve stays well-posed even for zero / masked /
+  rank-deficient activations. The affine-invariance property is exact only for the
+  undamped update.
 - Covariances are computed from local activations; distributed (DDP) aggregation is out of
   scope.
 
