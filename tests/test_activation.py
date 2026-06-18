@@ -208,29 +208,33 @@ class TestDamping:
         assert cos > 0.999
 
     def test_scale_invariance(self):
-        # Scaling z -> c z scales S -> c^2 S and tau -> c^2 tau, so M -> M / c^2.
+        # The preconditioning OPERATOR (S + tau I)^-1 scales by 1/c^2 when the
+        # activations scale z -> c z (S -> c^2 S, tau -> c^2 tau). Holding the
+        # gradient G FIXED, M(cx) must equal M(x) / c^2. This asserts the property
+        # directly, rather than re-deriving M from the same dense formula (which
+        # would only re-check test_matches_dense_reference and would not catch a
+        # scale/transpose regression in the operator).
         gamma, c = 0.25, 3.0
-        lin = _linear(5, 3)
         x = torch.randn(30, 5, dtype=torch.float64)
+        G = torch.randn(3, 5, dtype=torch.float64)
 
-        lin1 = _linear(5, 3)
+        lin1 = _linear(5, 3, dtype=torch.float64)
         ap1 = ActivationPreconditioner(
             lin1, ActivationPrecondConfig(damping=gamma, compute_dtype=torch.float64))
-        (lin1(x) ** 2).sum().backward()
+        lin1(x)  # grad-enabled forward captures S(x)
+        lin1.weight.grad = G.clone()
         ap1.precondition_()
         M1 = lin1.weight.grad.clone()
 
-        lin2 = _linear(5, 3)  # same seed -> same weights -> same G for same outputs
+        lin2 = _linear(5, 3, dtype=torch.float64)
         ap2 = ActivationPreconditioner(
             lin2, ActivationPrecondConfig(damping=gamma, compute_dtype=torch.float64))
-        # Use cx as input; the gradient G scales by c, and M(cx)=G(cx)@(c^2 S)^-1.
-        # Compare against analytic: M(cx) should equal (1/c) * [G(x)-derived]. Simpler:
-        # verify M(cx) == ref computed from the scaled inputs directly.
-        (lin2(c * x) ** 2).sum().backward()
-        G2 = lin2.weight.grad.clone()
-        ref = _ref_linear_M(G2, c * x, gamma)
+        lin2(c * x)  # captures S(cx) = c^2 S(x)
+        lin2.weight.grad = G.clone()  # SAME gradient
         ap2.precondition_()
-        assert torch.allclose(lin2.weight.grad, ref, atol=1e-9)
+        M2 = lin2.weight.grad.clone()
+
+        assert torch.allclose(M2, M1 / (c ** 2), atol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +392,45 @@ class TestHooks:
             assert len(ap._handles) == 1
         assert len(ap._handles) == 0
 
+    def test_no_grad_forward_does_not_corrupt_covariance(self):
+        # Regression (HIGH): an inference/validation forward (under no_grad) that
+        # runs between backward() and precondition_() must NOT leak its
+        # activations into the covariance. The result must match the run with no
+        # stray forward at all.
+        x = torch.randn(8, 5, dtype=torch.float64)
+        other = torch.randn(16, 5, dtype=torch.float64) * 7.0  # very different stats
+
+        def run(stray):
+            lin = _linear(5, 3, dtype=torch.float64)
+            ap = ActivationPreconditioner(
+                lin, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64))
+            (lin(x) ** 2).sum().backward()
+            if stray:
+                with torch.no_grad():
+                    lin(other)  # eval/validation pass — must be ignored
+            ap.precondition_()
+            return lin.weight.grad.clone()
+
+        assert torch.allclose(run(stray=True), run(stray=False), atol=1e-12)
+
+    def test_dopr_remove_hooks_and_context_manager(self):
+        # DoPr must expose remove_hooks / context-manager cleanup itself, not
+        # forward them to the base optimizer (which has no such methods).
+        model = nn.Linear(5, 3, bias=False).double()
+        opt = DoPr(SNRAdamW(model.parameters(), lr=1e-2), model,
+                   ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64))
+        assert opt.step_count == 0
+        opt.remove_hooks()  # delegates to ap, must not raise
+        (model(torch.randn(8, 5, dtype=torch.float64)) ** 2).sum().backward()
+        g_before = model.weight.grad.clone()
+        opt.ap.precondition_()  # hooks gone -> no-op
+        assert torch.equal(model.weight.grad, g_before)
+
+        model2 = nn.Linear(5, 3).double()
+        with DoPr(SNRAdamW(model2.parameters(), lr=1e-2), model2) as opt2:
+            assert len(opt2.ap._handles) == 1
+        assert len(opt2.ap._handles) == 0
+
 
 # ---------------------------------------------------------------------------
 # Edge cases
@@ -485,6 +528,21 @@ class TestSingularInput:
         ap.precondition_()
         # With Sigma=0, M = G / floor (row/col-uniform scaling), finite.
         assert torch.allclose(lin.weight.grad, G / 1e-6, rtol=1e-4)
+
+    def test_zero_floor_does_not_nan(self):
+        # Regression (CRITICAL): damping_floor == 0 is an allowed config. With a
+        # fully-masked (all-zero) input, tau used to collapse to 0 -> singular
+        # solve -> SILENT all-NaN gradients (the retry loop did tau *= 10, stuck
+        # at 0, and never re-checked the Cholesky info). The internal positive
+        # floor clamp must keep this finite.
+        lin = nn.Linear(4, 3, bias=False).double()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, damping_floor=0.0,
+                                         compute_dtype=torch.float64))
+        lin(torch.zeros(6, 4, dtype=torch.float64)).sum().backward()
+        lin.weight.grad = torch.randn_like(lin.weight)
+        ap.precondition_()  # must not raise, must not NaN
+        assert torch.isfinite(lin.weight.grad).all()
 
 
 class TestDoPrCopyAndDelegation:

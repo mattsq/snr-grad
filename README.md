@@ -300,8 +300,10 @@ W   <- (1 - eta*lambda) W - eta * D
 AP debiases the gradient from anisotropic activations, encouraging more uniform / isotropic
 **feature learning**. The paper shows this mitigates **test-time feedback (TTF)** -- the
 distribution shift that compounds when a model trained on a one-step loss is deployed by
-rolling out on its own outputs (autoregressive LLMs, robot policies) -- and improves
-downstream performance *even when validation loss does not improve*.
+rolling out on its own outputs (autoregressive LLMs, robot policies) -- trading one-step
+validation loss for **downstream (rollout) performance**. The improvement shows up in
+closed-loop rollout cost / feature-subspace distance and can come *at the cost of*
+validation loss, so judging AP by validation loss alone understates it (see `benchmark_dopr.py`).
 
 AP needs module/activation awareness, which the optimizers deliberately lack, so (like the
 variance estimators) it is an **external** helper that rewrites `p.grad` in place **after

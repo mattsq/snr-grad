@@ -104,7 +104,9 @@ class ActivationPrecondConfig:
         damping_floor:
             Absolute floor added to the damping (default ``1e-8``), so the damped
             covariance is positive-definite even when ``S_z`` is zero or
-            rank-deficient. Must be >= 0.
+            rank-deficient. Must be >= 0; internally clamped to a strictly
+            positive minimum (``1e-12``) so even ``damping_floor == 0`` cannot
+            produce a singular solve.
         ema_beta:
             If set, the activation covariance is an exponential moving average
             ``S <- ema_beta * S + (1 - ema_beta) * S_batch`` instead of the raw
@@ -115,6 +117,10 @@ class ActivationPrecondConfig:
             Number of initial :meth:`ActivationPreconditioner.precondition_`
             calls during which AP is the identity (plain GP). Useful when early
             activations are ill-conditioned (e.g. zero-initialized blocks).
+            Warmup is evaluated against the (possibly restored) internal step
+            counter, so after :meth:`load_state_dict` it counts from the resumed
+            step, not from zero -- changing ``warmup_steps`` on resume takes
+            effect relative to that restored counter.
         include_modules:
             If given, only modules whose qualified name contains one of these
             substrings are preconditioned.
@@ -165,6 +171,10 @@ class ActivationPrecondConfig:
 
 _LINEAR = "linear"
 _EMBEDDING = "embedding"
+
+# Strictly-positive lower bound for the damping floor, so the damped covariance is
+# always positive-definite even when ``S_z`` is exactly zero (fully masked inputs).
+_TINY = 1e-12
 
 
 def _name_matches(name: str, patterns: Optional[Sequence[str]]) -> bool:
@@ -302,6 +312,13 @@ class ActivationPreconditioner:
 
     def _make_hook(self, module: nn.Module, kind: str):
         def hook(_module: nn.Module, args: tuple) -> None:
+            # Ignore forwards that cannot contribute to the gradient we will
+            # precondition (inference / validation passes under torch.no_grad or
+            # inference_mode). Without this guard, an eval forward run between
+            # backward() and precondition_() would leak its activations into the
+            # next step's covariance and silently mis-precondition.
+            if not torch.is_grad_enabled():
+                return
             if not args:
                 return
             z = args[0]
@@ -360,19 +377,34 @@ class ActivationPreconditioner:
         sd = sigma + tau * eye
         L, info = torch.linalg.cholesky_ex(sd)
         if int(info) != 0:
-            # Numerical safety net: bump the damping until the factorization
-            # succeeds (guaranteed to terminate as tau grows).
-            for _ in range(5):
-                tau = tau * 10.0
+            # Numerical safety net: grow the damping ADDITIVELY from the matrix
+            # scale. A purely multiplicative bump (tau *= 10) cannot escape the
+            # tau == 0 fixed point, so we add a positive, scale-aware increment.
+            bump = sigma.diagonal().max().clamp_min(_TINY)
+            for _ in range(8):
+                tau = tau + bump
+                bump = bump * 10.0
                 L, info = torch.linalg.cholesky_ex(sigma + tau * eye)
                 if int(info) == 0:
                     break
+        if int(info) != 0:
+            # Still not positive-definite after the retries: fall back to
+            # isotropic scaling rather than running cholesky_solve on a failed
+            # factorization (which would silently produce NaN gradients).
+            denom = self._damping_tau(sigma.diagonal().sum(), d_z).clamp_min(_TINY)
+            return g / denom
         x = torch.cholesky_solve(gt, L)
         return x.t()
 
     def _damping_tau(self, trace: Tensor, d_z: int) -> Tensor:
-        """Scale-invariant relative damping plus an absolute floor."""
-        return self.config.damping * (trace / d_z) + self.config.damping_floor
+        """Scale-invariant relative damping plus a strictly-positive floor.
+
+        The floor is clamped to a positive minimum (``_TINY``) so the damped
+        covariance is invertible for *every* allowed config, including
+        ``damping_floor == 0`` on a layer whose inputs are entirely masked.
+        """
+        floor = max(self.config.damping_floor, _TINY)
+        return self.config.damping * (trace / d_z) + floor
 
     # -- main API -----------------------------------------------------------
 
@@ -386,11 +418,12 @@ class ActivationPreconditioner:
         this step (no captured activations) are skipped, unless EMA is enabled and
         ``use_stale_ema_on_missing`` is set.
 
-        Note: the activation cache is populated by forward passes and consumed (and
-        cleared) here. Call this once per training step, in the usual
-        ``loss.backward(); precondition_(); optimizer.step()`` loop. If a forward
-        pass runs without a following ``precondition_()`` (or :meth:`zero_grad` /
-        :meth:`reset`), its activations carry over into the next step's covariance.
+        Note: the activation cache is populated by grad-enabled forward passes and
+        consumed (and cleared) here. Inference/validation forwards (under
+        ``torch.no_grad`` / ``inference_mode``) are ignored by the capture hook, so
+        a validation loop between ``backward()`` and ``precondition_()`` is safe.
+        Multiple *grad-enabled* forwards before a single ``precondition_()`` (e.g.
+        gradient accumulation) intentionally accumulate into one covariance.
         """
         self._step += 1
         cfg = self.config
@@ -477,7 +510,8 @@ class ActivationPreconditioner:
         """Return a checkpointable dict (step counter + EMA covariances).
 
         EMA tensors are keyed by qualified module name so they survive being
-        re-loaded onto a freshly constructed preconditioner.
+        re-loaded onto a freshly constructed preconditioner. The persisted step
+        counter drives the warmup gate on resume (see ``warmup_steps``).
         """
         ema = {
             self._name_of_module[m]: sigma.detach().clone()
@@ -551,6 +585,13 @@ class DoPr:
     Note: checkpoint via :meth:`state_dict` / :meth:`load_state_dict`. ``DoPr`` is
     not picklable because the activation hooks hold module closures; use the state
     dict rather than ``pickle``/``torch.save`` of the object itself.
+
+    ``DoPr`` is also a context manager and exposes :meth:`remove_hooks`,
+    :meth:`reset`, and :attr:`step_count` (delegated to its preconditioner), so a
+    transient instance can clean up its forward hooks::
+
+        with DoPr(SNRAdamW(model.parameters(), lr=3e-4), model) as opt:
+            ...  # hooks removed on exit
     """
 
     def __init__(
@@ -589,6 +630,30 @@ class DoPr:
     @property
     def state(self) -> Any:
         return self.base.state
+
+    def remove_hooks(self) -> None:
+        """Remove the activation preconditioner's forward hooks.
+
+        After this, :meth:`step` still runs the base optimizer but applies no
+        activation preconditioning. Provided explicitly because ``__getattr__``
+        delegates to the *base optimizer*, which has no ``remove_hooks``.
+        """
+        self.ap.remove_hooks()
+
+    def reset(self) -> None:
+        """Reset the activation preconditioner (EMA covariances, cache, step)."""
+        self.ap.reset()
+
+    @property
+    def step_count(self) -> int:
+        """Number of activation-preconditioning steps taken so far."""
+        return self.ap.step_count
+
+    def __enter__(self) -> "DoPr":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.ap.remove_hooks()
 
     def __getattr__(self, name: str) -> Any:
         # Only reached when normal lookup fails; delegate to the base optimizer.
