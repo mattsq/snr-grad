@@ -281,6 +281,124 @@ spend exact probes only then. See the `benchmark_variance_estimators.py` entry u
 - Estimates are local to the current process; distributed aggregation is out of scope.
 
 
+## Double Preconditioning (DoPr) -- activation preconditioning for test-time feedback
+
+The SNR optimizers above are all **gradient preconditioners (GP)**: they shape the update
+purely from gradient statistics. [Double Preconditioning
+(DoPr)](https://arxiv.org/abs/2606.06418) adds an orthogonal stage, **activation
+preconditioning (AP)**, that left-conditions each layer's gradient by the inverse
+covariance of that layer's *input activations* before the GP sees it:
+
+```
+G    = dL/dW                                     # weight gradient, [out, in]
+S_z  = (1/n) sum_i z_i z_i^T                     # uncentered input-activation cov, [in, in]
+M    = G @ (S_z + gamma * tr(S_z)/d_z * I)^-1    # AP step (damped solve)
+D    = GP(M)                                     # base optimizer (SNRAdamW, Adam, ...) consumes M
+W   <- (1 - eta*lambda) W - eta * D
+```
+
+AP debiases the gradient from anisotropic activations, encouraging more uniform / isotropic
+**feature learning**. The paper shows this mitigates **test-time feedback (TTF)** -- the
+distribution shift that compounds when a model trained on a one-step loss is deployed by
+rolling out on its own outputs (autoregressive LLMs, robot policies) -- trading one-step
+validation loss for **downstream (rollout) performance**. The improvement shows up in
+closed-loop rollout cost / feature-subspace distance and can come *at the cost of*
+validation loss, so judging AP by validation loss alone understates it (see `benchmark_dopr.py`).
+
+AP needs module/activation awareness, which the optimizers deliberately lack, so (like the
+variance estimators) it is an **external** helper that rewrites `p.grad` in place **after
+`backward()` and before `step()`**. It composes with *any* optimizer, including baselines.
+
+```python
+from snr_grad import SNRAdamW, DoPr, ActivationPrecondConfig
+
+# Convenience wrapper: precondition_() then base.step()
+opt = DoPr(SNRAdamW(model.parameters(), lr=3e-4), model,
+           ActivationPrecondConfig(damping=0.1))
+loss.backward(); opt.step(); opt.zero_grad()
+
+# Or the external form (works with torch.optim.Adam, Muon, ... too):
+from snr_grad import ActivationPreconditioner
+ap = ActivationPreconditioner(model, ActivationPrecondConfig(damping=0.1))
+loss.backward(); ap.precondition_()
+optimizer.step(); optimizer.zero_grad(set_to_none=True); ap.zero_grad()
+```
+
+Because AP only rewrites `p.grad`, it commutes with `maximize` (the map `G -> G S^-1` is
+linear) and is orthogonal to decoupled weight decay and schedule-free parameter swapping
+(which act on `p.data` inside `step`). And because a GP normalizes the update magnitude,
+substituting the AP gradient does not change the update norm -- so existing muP /
+learning-rate / weight-decay **scaling rules of the base GP transfer directly** to DoPr.
+
+`DoPr` is a delegating wrapper, not a `torch.optim.Optimizer` subclass, so attach LR
+schedulers to the **base** optimizer (they enforce `isinstance(opt, Optimizer)`). `DoPr`
+shares the base's `param_groups`, so the scheduler still controls the learning rate it uses:
+
+```python
+base = SNRAdamW(model.parameters(), lr=3e-4)
+opt = DoPr(base, model, ActivationPrecondConfig(damping=0.1))
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(base, T_max=1000)
+loss.backward(); opt.step(); opt.zero_grad(); sched.step()
+```
+
+**Supported layers:** `nn.Linear` (including the explicit Q/K/V/out `nn.Linear`
+projections used by custom transformer blocks) and `nn.Embedding` (one-hot inputs =>
+diagonal covariance = per-token counts, applied efficiently as a row-wise rescale that
+upweights rare tokens). Note: **fused `nn.MultiheadAttention` is not preconditioned** —
+it computes its projections via `F.linear` and bypasses module hooks, so a warning is
+emitted; use explicit `nn.Linear` projections for AP support.
+
+`benchmark_dopr.py` reproduces the paper's minimal LDS behavior-cloning TTF example and
+plots validation loss, feature-subspace distance, and rollout cost for `SNRAdamW` vs
+`DoPr(SNRAdamW)` (and the same for `Adam`):
+
+```bash
+uv run python benchmark_dopr.py            # or --quick
+```
+
+**Does AP help on tasks it was *not* designed for?** `benchmark_dopr_existing.py` runs DoPr
+on the existing sparse-regression benchmark (`benchmark.py`) — a deliberately honest, even
+adversarial, check. The result is **negative**: AP slightly *worsens* both base optimizers
+(e.g. final excess test MSE `AdamW 61.4 → DoPr 63.5`, `SNRAdamW 40.2 → DoPr 42.8`; 8 seeds),
+and `SNRAdamW` remains the best arm with or without AP. This is expected: the model is a
+single `nn.Linear` whose per-minibatch input covariance is heavily rank-deficient
+(batch=32 ≪ d=200), so AP reweights gradients using a rank-32 estimate of a 200-dim
+covariance and amplifies noise directions. AP targets compounding test-time feedback (the
+`benchmark_dopr.py` task), not one-step generalization on isotropic-input regression — use it
+where that mechanism applies.
+
+```bash
+uv run python benchmark_dopr_existing.py    # or --quick
+```
+
+### Limitations
+
+- Supported layers are `nn.Linear` and `nn.Embedding`. Convolutions raise
+  `NotImplementedError` (conv unfold / SUA is a future extension); exclude them via
+  `ActivationPrecondConfig(exclude_modules=[...])`.
+- Tied / shared weights (e.g. tied input/output embeddings) are skipped with a warning,
+  because the correct AP is ambiguous (different, even differently shaped, covariances).
+- The covariance and its solve run in fp32 by default (`compute_dtype`) for numerical
+  stability; the result is cast back to the gradient's dtype. With an fp16 gradient and an
+  ill-conditioned covariance the cast-back can overflow (fp16 max ~6.5e4) — this is detected
+  and warned once; raise `damping`/`damping_floor` or widen `compute_dtype` if it fires.
+- Damping combines a scale-invariant relative term (`gamma`) with a small absolute floor
+  (`damping_floor`, default `1e-8`, internally clamped strictly positive) so the solve stays
+  well-posed even for zero / masked / rank-deficient activations. The affine-invariance
+  property is exact only for the undamped update.
+- Under `DistributedDataParallel` the activation covariance is all-reduced across the process
+  group before the solve (auto-detected from `torch.distributed.is_initialized()`; opt out with
+  `ActivationPrecondConfig(distributed=False)`). This is required for correctness: `.grad` is
+  already all-reduced when `precondition_` runs, so all ranks must solve with the same
+  covariance or they will diverge. The distributed path requires the ranks in lockstep:
+  identical model (same modules registered in the same order), identical step counter /
+  `warmup_steps`, and `.grad` genuinely all-reduced — so call `precondition_` only on a
+  synchronizing step (not inside DDP `no_sync()` or on non-final gradient-accumulation
+  microbatches). A desynced step counter or a non-DDP process group will hang or
+  mis-precondition; for a process group that is *not* the DDP grad-averaging group, pass
+  `distributed=False`.
+
+
 ## Experimental extensions
 
 This repo includes several experimental optimizers that extend SNR gating to matrix-aware update strategies for 2D weight parameters. Non-2D parameters (biases, norms, vectors) fall back to standard SNR-gated AdamW-style updates in all variants.
