@@ -352,6 +352,24 @@ class TestIntegration:
         ap.zero_grad()
         assert ap.step_count == 1
 
+    def test_lr_scheduler_on_base_drives_dopr_lr(self):
+        # DoPr is not an Optimizer subclass, so schedulers attach to the BASE
+        # optimizer; because DoPr shares the base's param_groups, the scheduled lr
+        # is the one DoPr uses. (Documents the supported pattern + the limitation.)
+        model = nn.Linear(4, 3)
+        base = SNRAdamW(model.parameters(), lr=0.1)
+        opt = DoPr(base, model, ActivationPrecondConfig(damping=0.1))
+        # Schedulers reject the wrapper itself.
+        with pytest.raises(TypeError):
+            torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.5)
+        # ...but attaching to the base works and is visible through DoPr.
+        sched = torch.optim.lr_scheduler.StepLR(base, step_size=1, gamma=0.5)
+        (model(torch.randn(8, 4)) ** 2).mean().backward()
+        opt.step()
+        opt.zero_grad()
+        sched.step()
+        assert opt.param_groups[0]["lr"] == pytest.approx(0.05)
+
     def test_closure_step_applies_ap(self):
         # Regression: a closure must NOT bypass AP. DoPr evaluates the closure
         # once, then preconditions, then steps the base WITHOUT the closure, so

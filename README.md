@@ -330,6 +330,17 @@ linear) and is orthogonal to decoupled weight decay and schedule-free parameter 
 substituting the AP gradient does not change the update norm -- so existing muP /
 learning-rate / weight-decay **scaling rules of the base GP transfer directly** to DoPr.
 
+`DoPr` is a delegating wrapper, not a `torch.optim.Optimizer` subclass, so attach LR
+schedulers to the **base** optimizer (they enforce `isinstance(opt, Optimizer)`). `DoPr`
+shares the base's `param_groups`, so the scheduler still controls the learning rate it uses:
+
+```python
+base = SNRAdamW(model.parameters(), lr=3e-4)
+opt = DoPr(base, model, ActivationPrecondConfig(damping=0.1))
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(base, T_max=1000)
+loss.backward(); opt.step(); opt.zero_grad(); sched.step()
+```
+
 **Supported layers:** `nn.Linear` (including the explicit Q/K/V/out `nn.Linear`
 projections used by custom transformer blocks) and `nn.Embedding` (one-hot inputs =>
 diagonal covariance = per-token counts, applied efficiently as a row-wise rescale that

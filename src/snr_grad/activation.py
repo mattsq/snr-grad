@@ -65,6 +65,11 @@ Limitations:
   warning, because the correct AP is ambiguous (different, even differently
   shaped, input covariances).
 * The covariance and its solve run in fp32 by default for numerical stability.
+* The covariance is formed from *all* positions in the layer input
+  (``z.reshape(-1, d_in)``). The module hook cannot see an attention/padding mask,
+  so padded positions in a ``[batch, seq, d]`` input are folded into ``S_z``; with
+  heavy right-padding this biases the preconditioner toward pad-token statistics.
+  Mask/pad-aware capture is a future extension.
 * Covariances are computed from *local* activations and, under DistributedDataParallel,
   are all-reduced across the process group before the solve (auto-detected via
   ``torch.distributed.is_initialized()``; set ``ActivationPrecondConfig(distributed=False)``
@@ -732,6 +737,17 @@ class DoPr:
     activation-preconditioned gradient. Unknown attributes (e.g. ``train``/
     ``eval`` on schedule-free optimizers, ``last_stats`` on SNR optimizers) are
     forwarded to the base optimizer.
+
+    ``DoPr`` is a delegating wrapper, **not** a ``torch.optim.Optimizer`` subclass,
+    so it fails the ``isinstance(opt, Optimizer)`` check that stock
+    ``torch.optim.lr_scheduler`` schedulers enforce. Attach any LR scheduler to the
+    **base** optimizer instead -- ``DoPr.param_groups`` *is* the base's
+    ``param_groups``, so the scheduler still drives the learning rate DoPr uses::
+
+        base = SNRAdamW(model.parameters(), lr=3e-4)
+        opt = DoPr(base, model)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(base, T_max=1000)
+        loss.backward(); opt.step(); opt.zero_grad(); sched.step()
 
     Args:
         base_optimizer:
