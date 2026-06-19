@@ -356,6 +356,21 @@ plots validation loss, feature-subspace distance, and rollout cost for `SNRAdamW
 uv run python benchmark_dopr.py            # or --quick
 ```
 
+**Does AP help on tasks it was *not* designed for?** `benchmark_dopr_existing.py` runs DoPr
+on the existing sparse-regression benchmark (`benchmark.py`) — a deliberately honest, even
+adversarial, check. The result is **negative**: AP slightly *worsens* both base optimizers
+(e.g. final excess test MSE `AdamW 61.4 → DoPr 63.5`, `SNRAdamW 40.2 → DoPr 42.8`; 8 seeds),
+and `SNRAdamW` remains the best arm with or without AP. This is expected: the model is a
+single `nn.Linear` whose per-minibatch input covariance is heavily rank-deficient
+(batch=32 ≪ d=200), so AP reweights gradients using a rank-32 estimate of a 200-dim
+covariance and amplifies noise directions. AP targets compounding test-time feedback (the
+`benchmark_dopr.py` task), not one-step generalization on isotropic-input regression — use it
+where that mechanism applies.
+
+```bash
+uv run python benchmark_dopr_existing.py    # or --quick
+```
+
 ### Limitations
 
 - Supported layers are `nn.Linear` and `nn.Embedding`. Convolutions raise
