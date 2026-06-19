@@ -144,6 +144,12 @@ class TestEmbeddingPrecondition:
         absent = emb.weight.grad[3:]
         assert torch.count_nonzero(absent) == 0
 
+    def test_float_index_raises_clear_error(self):
+        emb = nn.Embedding(8, 4)
+        ap = ActivationPreconditioner(emb, ActivationPrecondConfig(damping=0.1))
+        with pytest.raises(TypeError, match="integer index"):
+            ap._accumulate_embedding(emb, torch.randn(5))
+
 
 # ---------------------------------------------------------------------------
 # Affine invariance (Proposition 4.2) -- the headline property
@@ -345,6 +351,45 @@ class TestIntegration:
         opt.zero_grad(set_to_none=True)
         ap.zero_grad()
         assert ap.step_count == 1
+
+    def test_closure_step_applies_ap(self):
+        # Regression: a closure must NOT bypass AP. DoPr evaluates the closure
+        # once, then preconditions, then steps the base WITHOUT the closure, so
+        # the base cannot overwrite the AP-rewritten gradient.
+        torch.manual_seed(0)
+        model = nn.Linear(4, 3, bias=False)
+        x = torch.randn(16, 4)
+        opt = DoPr(SNRAdamW(model.parameters(), lr=0.0), model,
+                   ActivationPrecondConfig(damping=0.5, compute_dtype=torch.float64))
+
+        def closure():
+            opt.zero_grad()
+            loss = (model(x) ** 2).mean()
+            loss.backward()
+            return loss
+
+        # Reference raw gradient (no AP).
+        ref_loss = closure()
+        raw = model.weight.grad.clone()
+
+        returned = opt.step(closure)  # lr=0 -> weights unchanged, inspect grad
+        assert torch.is_tensor(returned)                      # closure loss returned
+        assert torch.allclose(returned, ref_loss)
+        assert not torch.allclose(model.weight.grad, raw)     # AP actually applied
+
+    def test_ema_buffer_lives_on_param_device(self):
+        # Guards the cross-device EMA fix: the combine moves operands to the grad's
+        # device first, so the stored EMA ends up on the parameter's device (the
+        # crash case is a CPU-resumed EMA combined with a CUDA batch covariance).
+        model = nn.Linear(5, 3, bias=False)
+        ap = ActivationPreconditioner(
+            model, ActivationPrecondConfig(damping=0.1, ema_beta=0.5))
+        for _ in range(2):
+            (model(torch.randn(8, 5)) ** 2).mean().backward()
+            ap.precondition_()
+            model.weight.grad = None
+        sigma = next(iter(ap._sigma_ema.values()))
+        assert sigma.device == model.weight.device
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +834,28 @@ class TestFp16:
 
         assert run_step()        # first overflow warns
         assert not run_step()    # one-time: does not warn again
+
+    def test_reset_rearms_overflow_warning(self):
+        # reset() advertises a fresh start, so a genuine new overflow must warn
+        # again (the one-time latch is cleared).
+        torch.manual_seed(0)
+        lin = nn.Linear(3, 2, bias=False).half()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float32))
+
+        def overflow_step():
+            x = (torch.randn(64, 3) * 1e-2).half()
+            lin(x)
+            lin.weight.grad = torch.full((2, 3), 50.0, dtype=torch.float16)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                ap.precondition_()
+            return [w for w in caught if "overflow" in str(w.message).lower()]
+
+        assert overflow_step()       # warns
+        assert not overflow_step()   # latched
+        ap.reset()
+        assert overflow_step()       # re-armed after reset
 
     def test_embedding_overflow_warns(self):
         # Regression: the fp16 overflow guard must also cover the EMBEDDING path.

@@ -385,6 +385,13 @@ class ActivationPreconditioner:
     def _accumulate_embedding(self, module: nn.Module, idx: Tensor) -> None:
         idx_flat = idx.detach().reshape(-1)
         vocab = module.num_embeddings
+        if torch.is_floating_point(idx_flat) or idx_flat.is_complex():
+            raise TypeError(
+                f"ActivationPreconditioner: nn.Embedding input must be an integer "
+                f"index tensor, got dtype {idx_flat.dtype}. Exclude this module via "
+                f"ActivationPrecondConfig(exclude_modules=[...]) if it is not a "
+                f"standard embedding lookup."
+            )
         counts = torch.bincount(idx_flat, minlength=vocab).to(
             dtype=self.config.compute_dtype or torch.float32
         )
@@ -500,10 +507,15 @@ class ActivationPreconditioner:
                     else:
                         continue
                 else:
-                    sigma = batch_sigma
+                    # Move to the grad's device BEFORE the EMA combine: after a
+                    # `map_location="cpu"` resume the stored EMA may live on CPU
+                    # while the fresh batch covariance is on CUDA, and there is no
+                    # implicit cross-device promotion.
+                    sigma = batch_sigma.to(device=g.device)
                     if cfg.ema_beta is not None:
                         prev = self._sigma_ema.get(module)
                         if prev is not None:
+                            prev = prev.to(device=g.device)
                             sigma = cfg.ema_beta * prev + (1.0 - cfg.ema_beta) * sigma
                         self._sigma_ema[module] = sigma
 
@@ -620,6 +632,8 @@ class ActivationPreconditioner:
         self._accum.clear()
         self._sigma_ema.clear()
         self._step = 0
+        # Fresh start: let a genuine new fp16 overflow warn again.
+        self._warned_fp16_overflow = False
 
     def remove_hooks(self) -> None:
         """Remove all forward-pre-hooks. After this, ``precondition_`` is a no-op."""
@@ -734,9 +748,24 @@ class DoPr:
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> Any:
-        """Precondition the gradients, then take one base-optimizer step."""
+        """Precondition the gradients, then take one base-optimizer step.
+
+        When a ``closure`` is given it is evaluated **here, exactly once** (with
+        grad enabled) to populate ``.grad`` *before* activation preconditioning, and
+        the base optimizer is then stepped without a closure. This is required for
+        correctness: if the closure were forwarded to ``base.step``, the base would
+        re-run ``backward()`` and overwrite the AP-rewritten gradient, silently
+        making AP a no-op. Consequently DoPr is incompatible with optimizers that
+        require *multiple* closure evaluations per step (e.g. ``torch.optim.LBFGS``).
+        """
+        if closure is None:
+            self.ap.precondition_()
+            return self.base.step()
+        with torch.enable_grad():
+            loss = closure()
         self.ap.precondition_()
-        return self.base.step(closure)
+        self.base.step()
+        return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Zero the base optimizer's grads and clear the AP activation cache."""
