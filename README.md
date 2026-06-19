@@ -371,6 +371,45 @@ where that mechanism applies.
 uv run python benchmark_dopr_existing.py    # or --quick
 ```
 
+**Does the AP/GP *order* matter?** DoPr applies AP **before** the base gradient
+preconditioner (`M = G @ S_z^-1`, then `D = GP(M)` — the "AP→GP" order above).
+`benchmark_dopr_order.py` tests the swapped "GP→AP" order, where the SNR gate /
+Adam normalization runs first on the raw gradient and AP conditions the resulting
+**update direction** (`D = GP(G)`, then `W <- W - eta * (D @ S_z^-1)`), against the
+shipped order and the no-AP baseline on both canonical tasks. The finding is that
+**reordering does not improve on the shipped order**, and the swapped order's
+apparent early gains are a **step-size confound**:
+
+- On the **DoPr canonical task** (`benchmark_dopr.py`'s LDS test-time-feedback
+  problem; 5 seeds, 800 steps, damping 0.1), the shipped AP→GP order already
+  captures essentially all of the rollout benefit (SNRAdamW final rollout cost
+  `0.022 → 0.0007`; Adam `0.0081 → 0.0003`). The swapped GP→AP order *looks*
+  dramatically faster early and ends marginally lower (`0.0004` / `0.0000`), but at
+  convergence it is within noise of AP→GP. The reason it isn't a real geometric
+  win: AP→GP is **magnitude-neutral** (Adam's per-coordinate `1/√v` re-normalizes
+  AP's magnitude reweighting, the property that lets LR rules transfer), whereas
+  GP→AP rescales an already-normalized update by `S_z^-1` and so inflates the
+  effective step in low-variance activation directions. Controlling for that with a
+  norm-matched variant (`post,norm`, which rescales each conditioned update back to
+  the base GP update's norm) makes GP→AP **worse than the no-AP baseline**
+  (`0.046` / `0.041`) — i.e. the swapped-order *direction*, magnitude held fixed,
+  hurts; the early "speedup" was a disguised learning-rate increase.
+- On the **repo canonical task** (sparse regression; 10 seeds, 5000 steps), where AP
+  is already off-target, the swapped order hurts *more* than the shipped one — for
+  Adam it blows up (excess test MSE `61.5 → 91.1` vs `63.5` for AP→GP). The no-AP
+  baseline remains best.
+
+Takeaway: keep the shipped **AP→GP** order. Putting AP after the GP forfeits the
+magnitude-neutrality that makes DoPr a drop-in (LR/weight-decay rules stop
+transferring), and the geometry it adds — once the step size is controlled — does
+not help on either task.
+
+```bash
+uv run python benchmark_dopr_order.py                 # DoPr canonical (TTF) task
+uv run python benchmark_dopr_order.py --task sparse   # repo canonical task
+uv run python benchmark_dopr_order.py --quick         # fast smoke run
+```
+
 ### Limitations
 
 - Supported layers are `nn.Linear` and `nn.Embedding`. Convolutions raise
