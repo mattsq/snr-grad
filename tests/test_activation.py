@@ -144,6 +144,28 @@ class TestEmbeddingPrecondition:
         absent = emb.weight.grad[3:]
         assert torch.count_nonzero(absent) == 0
 
+    def test_rare_token_is_upweighted(self):
+        # The actual embedding-AP claim ("rare tokens upweighted") -- the absent
+        # rows are zero out of backward(), so test_absent_tokens_stay_zero is
+        # vacuous about AP. Fabricate equal grads on a frequent and an absent row
+        # and assert the absent (rare) row is scaled by 1/tau while the frequent
+        # row is scaled by 1/(p+tau) < 1/tau.
+        gamma, vocab = 0.1, 8
+        emb = nn.Embedding(vocab, 3).double()
+        idx = torch.zeros(10, dtype=torch.long)  # token 0 frequent, 1..7 absent
+        ap = ActivationPreconditioner(
+            emb, ActivationPrecondConfig(damping=gamma, compute_dtype=torch.float64))
+        emb(idx).sum().backward()
+        emb.weight.grad = torch.ones(vocab, 3, dtype=torch.float64)  # equal grads
+        ap.precondition_()
+        # sum(p)=1 over present mass -> tau = gamma/vocab; p_0 = 10/10 = 1.0.
+        tau = gamma * 1.0 / vocab
+        assert torch.allclose(emb.weight.grad[1], torch.full((3,), 1.0 / tau,
+                                                             dtype=torch.float64))
+        assert torch.allclose(emb.weight.grad[0], torch.full((3,), 1.0 / (1.0 + tau),
+                                                             dtype=torch.float64))
+        assert (emb.weight.grad[1] > emb.weight.grad[0]).all()  # rare upweighted
+
     def test_float_index_raises_clear_error(self):
         emb = nn.Embedding(8, 4)
         ap = ActivationPreconditioner(emb, ActivationPrecondConfig(damping=0.1))
@@ -572,6 +594,31 @@ class TestMaximize:
         lin.weight.grad.copy_(-G)
         ap.precondition_()
         assert torch.allclose(lin.weight.grad, -M_ref, atol=1e-10)
+
+
+class TestCheckpointing:
+    """Uniform activation checkpointing recomputes the forward (hook fires twice),
+    but gram and count both double so S_z -- and the preconditioned grad -- is
+    unchanged. (Mixed checkpointing is a documented limitation, not tested here.)"""
+
+    def test_uniform_checkpoint_matches_plain(self):
+        from torch.utils.checkpoint import checkpoint
+
+        x = torch.randn(8, 5, dtype=torch.float64)
+        cfg = dict(damping=0.1, compute_dtype=torch.float64)
+
+        lin_p = _linear(5, 3, bias=False)
+        ap_p = ActivationPreconditioner(lin_p, ActivationPrecondConfig(**cfg))
+        (lin_p(x) ** 2).sum().backward()
+        ap_p.precondition_()
+
+        lin_c = _linear(5, 3, bias=False)  # same seed -> same weights
+        ap_c = ActivationPreconditioner(lin_c, ActivationPrecondConfig(**cfg))
+        out = checkpoint(lambda z: lin_c(z), x, use_reentrant=False)
+        (out ** 2).sum().backward()
+        ap_c.precondition_()
+
+        assert torch.allclose(lin_c.weight.grad, lin_p.weight.grad, atol=1e-10)
 
 
 class TestSingularInput:

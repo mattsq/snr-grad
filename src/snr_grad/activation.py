@@ -70,6 +70,17 @@ Limitations:
   so padded positions in a ``[batch, seq, d]`` input are folded into ``S_z``; with
   heavy right-padding this biases the preconditioner toward pad-token statistics.
   Mask/pad-aware capture is a future extension.
+* Activation/gradient checkpointing (``torch.utils.checkpoint`` with the modern
+  ``use_reentrant=False``) recomputes the wrapped forward during backward, so the
+  capture hook fires twice for a checkpointed module. When checkpointing is applied
+  *uniformly* (every registered module recomputed once -- the usual "checkpoint each
+  block" pattern) both ``gram`` and ``count`` double and ``S_z`` is unchanged, so AP
+  is correct. But if the *same* module runs both inside and outside a checkpoint in
+  one step (e.g. checkpointing the blocks but not the final ``nn.Linear`` head, or a
+  shared module reused across checkpointed and non-checkpointed regions), the
+  checkpointed call's samples are weighted 2x in ``S_z`` -- a silent bias (no crash).
+  Keep checkpointing uniform across registered modules, or exclude the offending
+  module via ``exclude_modules``.
 * Covariances are computed from *local* activations and, under DistributedDataParallel,
   are all-reduced across the process group before the solve (auto-detected via
   ``torch.distributed.is_initialized()``; set ``ActivationPrecondConfig(distributed=False)``
@@ -456,7 +467,7 @@ class ActivationPreconditioner:
             # isotropic scaling rather than running cholesky_solve on a failed
             # factorization (which would silently produce NaN gradients).
             denom = self._damping_tau(sigma.diagonal().sum(), d_z).clamp_min(_TINY)
-            return g / denom
+            return g.to(sigma.dtype) / denom  # match the main path's solve dtype
         x = torch.cholesky_solve(gt, L)
         return x.t()
 
