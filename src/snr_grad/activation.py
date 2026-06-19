@@ -148,12 +148,17 @@ class ActivationPrecondConfig:
             Register :class:`torch.nn.Embedding` layers (default True).
         compute_dtype:
             Dtype for forming the covariance and its solve (default fp32). Set to
-            ``None`` to use the activation's native dtype.
+            ``None`` to use the activation's native dtype. The linear Cholesky solve
+            is internally promoted to fp32 when this dtype is fp16/bf16 (which
+            ``torch.linalg.cholesky`` does not support), then cast back to the grad
+            dtype.
         use_stale_ema_on_missing:
             When ``ema_beta`` is set and a registered module did not run a forward
             pass this step (so there is no fresh covariance) but its weight still
-            has a gradient, reuse the most recent EMA covariance. If False, such a
-            weight is left as plain GP for that step. Ignored when ``ema_beta`` is
+            has a gradient, reuse the most recent EMA covariance (so calling
+            ``precondition_`` twice without an intervening backward re-applies that
+            stale covariance). If False, such a weight is left as plain GP for that
+            step. Ignored when ``ema_beta`` is
             ``None``.
         distributed:
             Whether to all-reduce the activation covariance across the process
@@ -371,10 +376,14 @@ class ActivationPreconditioner:
 
     def _accumulate_linear(self, module: nn.Module, z: Tensor) -> None:
         z = z.detach().reshape(-1, z.shape[-1])
+        n = z.shape[0]
+        if n == 0:
+            # Empty batch contributes nothing; skip so an all-empty step is a
+            # clean "no forward" (plain GP) rather than a 0/0 -> NaN covariance.
+            return
         if self.config.compute_dtype is not None:
             z = z.to(self.config.compute_dtype)
         gram = z.t() @ z  # [in, in]
-        n = z.shape[0]
         acc = self._accum.get(module)
         if acc is None:
             self._accum[module] = {"gram": gram, "count": n}
@@ -392,10 +401,12 @@ class ActivationPreconditioner:
                 f"ActivationPrecondConfig(exclude_modules=[...]) if it is not a "
                 f"standard embedding lookup."
             )
+        n = int(idx_flat.numel())
+        if n == 0:
+            return  # empty batch contributes nothing (see _accumulate_linear)
         counts = torch.bincount(idx_flat, minlength=vocab).to(
             dtype=self.config.compute_dtype or torch.float32
         )
-        n = int(idx_flat.numel())
         acc = self._accum.get(module)
         if acc is None:
             self._accum[module] = {"counts": counts, "count": n}
@@ -411,6 +422,11 @@ class ActivationPreconditioner:
         ``M = G S_d^-1`` and ``S_d`` symmetric give ``M^T = S_d^-1 G^T``, i.e. we
         solve ``S_d X = G^T`` for ``X`` and return ``X^T``.
         """
+        # torch.linalg.cholesky does not support fp16/bf16, which is the covariance
+        # dtype when compute_dtype=None on a half/bf16 model. Promote the solve to
+        # fp32 (the result is cast back to the grad dtype by _copy_back anyway).
+        if sigma.dtype in (torch.float16, torch.bfloat16):
+            sigma = sigma.float()
         d_z = sigma.shape[0]
         eye = torch.eye(d_z, dtype=sigma.dtype, device=sigma.device)
         gt = g.to(sigma.dtype).t().contiguous()
@@ -601,7 +617,11 @@ class ActivationPreconditioner:
             return None
         return stat / total
 
-    def _batch_sigma(self, kind: str, acc: dict[str, Any]) -> Tensor:
+    def _batch_sigma(self, kind: str, acc: dict[str, Any]) -> Optional[Tensor]:
+        # Defense in depth (the accumulators already skip empty batches): never
+        # divide by a zero count, matching the distributed reduce path's guard.
+        if acc["count"] <= 0:
+            return None
         if kind == _LINEAR:
             return acc["gram"] / acc["count"]
         return acc["counts"] / acc["count"]  # diagonal of S_z
@@ -642,7 +662,9 @@ class ActivationPreconditioner:
         self._handles.clear()
         self._kind.clear()
         self._weight_of_module.clear()
+        self._name_of_module.clear()
         self._accum.clear()
+        self._sigma_ema.clear()
 
     @property
     def step_count(self) -> int:

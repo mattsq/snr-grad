@@ -602,6 +602,37 @@ class TestSingularInput:
         ap.precondition_()  # must not raise, must not NaN
         assert torch.isfinite(lin.weight.grad).all()
 
+    def test_empty_batch_is_clean_skip_and_does_not_poison_ema(self):
+        # Regression (HIGH): a forward with an empty batch (count == 0) used to
+        # divide 0/0 -> NaN grads, and with EMA it poisoned _sigma_ema so every
+        # later step (even on good data) stayed NaN. An all-empty step must be a
+        # clean "no forward" (plain GP), and good steps after it must be finite.
+        lin = nn.Linear(4, 3, bias=False).double()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, ema_beta=0.5,
+                                         compute_dtype=torch.float64))
+        lin(torch.empty(0, 4, dtype=torch.float64)).sum().backward()
+        lin.weight.grad = torch.randn_like(lin.weight)
+        raw = lin.weight.grad.clone()
+        ap.precondition_()
+        assert torch.equal(lin.weight.grad, raw)  # plain GP, untouched
+        for _ in range(3):
+            lin.weight.grad = None
+            (lin(torch.randn(8, 4, dtype=torch.float64)) ** 2).sum().backward()
+            ap.precondition_()
+            assert torch.isfinite(lin.weight.grad).all()  # EMA not poisoned
+
+    def test_bf16_compute_dtype_none_promotes_solve(self):
+        # Regression (MEDIUM): compute_dtype=None on a bf16/fp16 model used to
+        # crash (cholesky has no half/bf16 kernel). The solve is promoted to fp32.
+        lin = nn.Linear(4, 3, bias=False).to(torch.bfloat16)
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, compute_dtype=None))
+        lin(torch.randn(8, 4, dtype=torch.bfloat16)).sum().backward()
+        ap.precondition_()  # must not raise
+        assert lin.weight.grad.dtype == torch.bfloat16
+        assert torch.isfinite(lin.weight.grad).all()
+
 
 class TestDoPrCopyAndDelegation:
     """Regression: __getattr__ must raise AttributeError so copy/pickle protocols work."""
