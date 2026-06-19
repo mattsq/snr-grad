@@ -352,13 +352,19 @@ uv run python benchmark_dopr.py            # or --quick
   `ActivationPrecondConfig(exclude_modules=[...])`.
 - Tied / shared weights (e.g. tied input/output embeddings) are skipped with a warning,
   because the correct AP is ambiguous (different, even differently shaped, covariances).
-- The covariance and its solve run in fp32 by default for numerical stability.
+- The covariance and its solve run in fp32 by default (`compute_dtype`) for numerical
+  stability; the result is cast back to the gradient's dtype. With an fp16 gradient and an
+  ill-conditioned covariance the cast-back can overflow (fp16 max ~6.5e4) — this is detected
+  and warned once; raise `damping`/`damping_floor` or widen `compute_dtype` if it fires.
 - Damping combines a scale-invariant relative term (`gamma`) with a small absolute floor
-  (`damping_floor`, default `1e-8`) so the solve stays well-posed even for zero / masked /
-  rank-deficient activations. The affine-invariance property is exact only for the
-  undamped update.
-- Covariances are computed from local activations; distributed (DDP) aggregation is out of
-  scope.
+  (`damping_floor`, default `1e-8`, internally clamped strictly positive) so the solve stays
+  well-posed even for zero / masked / rank-deficient activations. The affine-invariance
+  property is exact only for the undamped update.
+- Under `DistributedDataParallel` the activation covariance is all-reduced across the process
+  group before the solve (auto-detected from `torch.distributed`; opt out with
+  `ActivationPrecondConfig(distributed=False)`). This is required for correctness: `.grad` is
+  already all-reduced when `precondition_` runs, so all ranks must solve with the same
+  covariance or they will diverge. Assumes standard DDP (identical model on every rank).
 
 
 ## Experimental extensions

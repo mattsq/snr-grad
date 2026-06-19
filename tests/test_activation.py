@@ -1,5 +1,8 @@
 """Tests for activation preconditioning (DoPr) in snr_grad.activation."""
 
+import os
+import socket
+import sys
 import warnings
 
 import pytest
@@ -12,6 +15,16 @@ from snr_grad import (
     DoPr,
     SNRAdamW,
 )
+
+_DIST_AVAILABLE = torch.distributed.is_available()
+
+
+def _free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 # ---------------------------------------------------------------------------
@@ -619,3 +632,228 @@ class TestStaleEMA:
         b_before = lin_b.weight.grad.clone()
         ap.precondition_()
         assert torch.equal(lin_b.weight.grad, b_before)  # skipped (no activations, no EMA)
+
+
+# ---------------------------------------------------------------------------
+# Real-transformer end-to-end integration
+# ---------------------------------------------------------------------------
+
+class _TinyTransformerBlock(nn.Module):
+    """Minimal decoder block from primitives (no fused MultiheadAttention).
+
+    Token embedding -> explicit Q/K/V/out nn.Linear projections with manual
+    single-head self-attention -> residual -> 2-layer MLP -> residual -> output
+    head. The head is tied to the embedding iff ``tie_head`` (the common LM
+    weight-tying pattern, which AP must skip as ambiguous).
+    """
+
+    def __init__(self, vocab=16, d=8, hidden=16, tie_head=True, dtype=torch.float64):
+        super().__init__()
+        self.embed = nn.Embedding(vocab, d)
+        self.q = nn.Linear(d, d, bias=False)
+        self.k = nn.Linear(d, d, bias=False)
+        self.v = nn.Linear(d, d, bias=False)
+        self.out = nn.Linear(d, d, bias=False)
+        self.mlp1 = nn.Linear(d, hidden)
+        self.mlp2 = nn.Linear(hidden, d)
+        self.head = nn.Linear(d, vocab, bias=False)
+        if tie_head:
+            self.head.weight = self.embed.weight
+        self.to(dtype)
+
+    def forward(self, idx):
+        z = self.embed(idx)  # [b, s, d]
+        q, k, v = self.q(z), self.k(z), self.v(z)
+        d = q.shape[-1]
+        att = torch.softmax(q @ k.transpose(-1, -2) / d ** 0.5, dim=-1)
+        h = z + self.out(att @ v)
+        h = h + self.mlp2(torch.relu(self.mlp1(h)))
+        return self.head(h)  # [b, s, vocab]
+
+
+class TestTransformerIntegration:
+    """End-to-end DoPr on a realistic (custom) transformer block."""
+
+    def test_tied_block_registers_projections_skips_tied(self):
+        torch.manual_seed(0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            block = _TinyTransformerBlock(tie_head=True)
+            ap = ActivationPreconditioner(
+                block, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64))
+        assert any("tied" in str(w.message).lower() or "shared" in str(w.message).lower()
+                   for w in caught)
+        names = set(ap._name_of_module.values())
+        # All explicit projections + MLP are registered; the tied embed/head are not.
+        assert {"q", "k", "v", "out", "mlp1", "mlp2"} <= names
+        assert "embed" not in names and "head" not in names
+
+        idx = torch.randint(0, 16, (4, 6))
+        (block(idx) ** 2).mean().backward()
+        raw = {m: m.weight.grad.clone() for m in ap._name_of_module}
+        embed_raw = block.embed.weight.grad.clone()
+        ap.precondition_()
+        # Every registered projection's gradient was actually rewritten...
+        for m in ap._name_of_module:
+            assert not torch.equal(m.weight.grad, raw[m])
+            assert torch.isfinite(m.weight.grad).all()
+        # ...and the tied embedding was left untouched (plain GP).
+        assert torch.equal(block.embed.weight.grad, embed_raw)
+
+    def test_untied_head_is_preconditioned(self):
+        block = _TinyTransformerBlock(tie_head=False)
+        ap = ActivationPreconditioner(
+            block, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64))
+        names = set(ap._name_of_module.values())
+        assert "head" in names and "embed" in names
+
+    def test_dopr_train_step_moves_weights(self):
+        torch.manual_seed(0)
+        block = _TinyTransformerBlock(tie_head=True)
+        opt = DoPr(SNRAdamW(block.parameters(), lr=1e-3), block,
+                   ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64))
+        idx = torch.randint(0, 16, (4, 6))
+        before = block.q.weight.detach().clone()
+        logits = block(idx).reshape(-1, 16)
+        loss = torch.nn.functional.cross_entropy(logits, idx.reshape(-1))
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+        assert torch.isfinite(loss)
+        assert not torch.equal(block.q.weight, before)
+
+    def test_eval_forward_does_not_corrupt_block(self):
+        # End-to-end: an interleaved no_grad validation forward must be ignored.
+        idx = torch.randint(0, 16, (4, 6))
+        val_idx = torch.randint(0, 16, (8, 6))
+
+        def run(stray):
+            torch.manual_seed(0)
+            block = _TinyTransformerBlock(tie_head=False)
+            ap = ActivationPreconditioner(
+                block, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64))
+            (block(idx) ** 2).mean().backward()
+            if stray:
+                with torch.no_grad():
+                    block(val_idx)
+            ap.precondition_()
+            return block.q.weight.grad.clone()
+
+        assert torch.allclose(run(stray=True), run(stray=False), atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# fp16 round-trip
+# ---------------------------------------------------------------------------
+
+class TestFp16:
+    """The solve runs in compute_dtype (fp32); verify the cast-back to fp16."""
+
+    def test_illconditioned_direction_preserved(self):
+        torch.manual_seed(0)
+        # Ill-conditioned inputs: dims with very different scales (cond ~ 1e3).
+        scales = torch.tensor([1e2, 1e1, 1e0, 1e-1], dtype=torch.float64)
+        x = torch.randn(64, 4, dtype=torch.float64) * scales
+        x16 = x.half()
+        G = torch.randn(3, 4, dtype=torch.float64)
+        # fp64 reference built from the SAME (fp16-rounded) activations.
+        ref = _ref_linear_M(G, x16.double(), 0.1).reshape(-1)
+
+        lin = nn.Linear(4, 3, bias=False).half()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float32))
+        lin(x16)  # capture activations (covariance only depends on inputs)
+        lin.weight.grad = G.half()
+        ap.precondition_()
+        m = lin.weight.grad.double().reshape(-1)
+
+        assert torch.isfinite(m).all()
+        cos = torch.dot(m, ref) / (m.norm() * ref.norm())
+        assert cos > 0.99
+
+    def test_overflow_warns_once(self):
+        torch.manual_seed(0)
+        lin = nn.Linear(3, 2, bias=False).half()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float32))
+
+        def run_step():
+            x = (torch.randn(64, 3) * 1e-2).half()  # tiny cov -> tiny tau -> huge M
+            lin(x)
+            lin.weight.grad = torch.full((2, 3), 50.0, dtype=torch.float16)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                ap.precondition_()
+            # The fp32 solve itself stays finite even though the fp16 grad overflows.
+            return [w for w in caught if "overflow" in str(w.message).lower()]
+
+        assert run_step()        # first overflow warns
+        assert not run_step()    # one-time: does not warn again
+
+
+# ---------------------------------------------------------------------------
+# Distributed (DDP) covariance aggregation
+# ---------------------------------------------------------------------------
+
+def _ddp_worker(rank, world_size, port, distributed, q):
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        torch.manual_seed(0)  # identical initial weights on every rank
+        lin = nn.Linear(4, 3, bias=False).double()
+        ap = ActivationPreconditioner(
+            lin, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64,
+                                         distributed=distributed))
+        # Different activations per rank -> different LOCAL covariance.
+        torch.manual_seed(100 + rank)
+        x = torch.randn(8, 4, dtype=torch.float64) + rank * 3.0
+        (lin(x) ** 2).sum().backward()
+        # Simulate DDP: average the gradient so .grad is identical on every rank
+        # before precondition_() runs (this is what DDP guarantees).
+        dist.all_reduce(lin.weight.grad, op=dist.ReduceOp.SUM)
+        lin.weight.grad /= world_size
+        ap.precondition_()
+        q.put((rank, lin.weight.grad.detach().cpu().tolist()))
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_ddp(distributed):
+    import torch.multiprocessing as mp
+
+    port = _free_port()
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_ddp_worker, args=(r, 2, port, distributed, q))
+             for r in range(2)]
+    for p in procs:
+        p.start()
+    results = {}
+    try:
+        for _ in range(2):
+            rank, grad = q.get(timeout=120)
+            results[rank] = torch.tensor(grad)
+    finally:
+        for p in procs:
+            p.join(timeout=120)
+    return results[0], results[1]
+
+
+@pytest.mark.skipif(not _DIST_AVAILABLE, reason="torch.distributed unavailable")
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="gloo spawn flaky on Windows")
+class TestDistributed:
+    """The covariance must be all-reduced so every rank stays in sync under DDP."""
+
+    def test_distributed_yields_identical_grads(self):
+        g0, g1 = _run_ddp(distributed=True)
+        # Same DDP-averaged grad + same (all-reduced) covariance -> identical M.
+        assert torch.allclose(g0, g1, atol=1e-10)
+
+    def test_local_only_diverges_across_ranks(self):
+        # Negative control: without the all-reduce, local covariances differ, so
+        # the ranks would silently desync.
+        g0, g1 = _run_ddp(distributed=False)
+        assert not torch.allclose(g0, g1, atol=1e-6)

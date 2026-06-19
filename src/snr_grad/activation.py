@@ -65,8 +65,11 @@ Limitations:
   warning, because the correct AP is ambiguous (different, even differently
   shaped, input covariances).
 * The covariance and its solve run in fp32 by default for numerical stability.
-* Covariances are computed from *local* activations; distributed (DDP)
-  aggregation is out of scope (same stance as :mod:`snr_grad.variance`).
+* Covariances are computed from *local* activations and, under DistributedDataParallel,
+  are all-reduced across the process group before the solve (auto-detected; set
+  ``ActivationPrecondConfig(distributed=False)`` to opt out). This is required for
+  correctness: ``.grad`` is already all-reduced by the time ``precondition_`` runs, so
+  every rank must solve with the same covariance to stay in sync.
 """
 
 from __future__ import annotations
@@ -141,6 +144,21 @@ class ActivationPrecondConfig:
             has a gradient, reuse the most recent EMA covariance. If False, such a
             weight is left as plain GP for that step. Ignored when ``ema_beta`` is
             ``None``.
+        distributed:
+            Whether to all-reduce the activation covariance across the process
+            group before solving. Required for correctness under DDP: ``.grad`` is
+            already all-reduced (identical on every rank) by the time
+            :meth:`ActivationPreconditioner.precondition_` runs, but the
+            covariance is computed from *local* activations, so without this every
+            rank would solve with a different ``S_z`` and the ranks would diverge.
+            ``None`` (default) auto-detects (enabled iff
+            ``torch.distributed.is_initialized()``); pass ``True``/``False`` to
+            force. Assumes standard DDP: every rank runs an identical model so the
+            same set of modules is registered and the collective is issued once per
+            registered module per step (lockstep, no deadlock).
+        process_group:
+            Process group for the covariance all-reduce (default group when
+            ``None``). Ignored unless distributed reduction is active.
     """
 
     damping: float = 0.1
@@ -153,6 +171,8 @@ class ActivationPrecondConfig:
     include_embedding: bool = True
     compute_dtype: Optional[torch.dtype] = torch.float32
     use_stale_ema_on_missing: bool = True
+    distributed: Optional[bool] = None
+    process_group: Any = None
 
     def __post_init__(self) -> None:
         if self.damping <= 0:
@@ -234,6 +254,9 @@ class ActivationPreconditioner:
         self._sigma_ema: dict[nn.Module, Tensor] = {}
 
         self._step = 0
+
+        # One-time guard so a fp16 cast-back overflow warns at most once.
+        self._warned_fp16_overflow = False
 
         self._register(model)
 
@@ -432,22 +455,38 @@ class ActivationPreconditioner:
             self._accum.clear()
             return
 
+        distributed = self._distributed_enabled()
+        # Under DDP the all-reduce must be issued in lockstep on every rank. Run a
+        # deterministic pre-pass over the (rank-identical) registered modules that
+        # reduces each covariance up front, decoupling the collective from per-rank
+        # grad presence so a rank that later skips the solve cannot deadlock the
+        # others.
+        reduced: dict[nn.Module, Optional[Tensor]] = {}
+        if distributed:
+            for module, kind in self._kind.items():
+                reduced[module] = self._reduce_batch_sigma(module, kind)
+
         for module, kind in self._kind.items():
             weight = self._weight_of_module[module]
             g = weight.grad
             if g is None:
                 continue
 
-            acc = self._accum.get(module)
-            if acc is None:
-                # No forward this step.
+            if distributed:
+                batch_sigma = reduced[module]
+            else:
+                acc = self._accum.get(module)
+                batch_sigma = self._batch_sigma(kind, acc) if acc is not None else None
+
+            if batch_sigma is None:
+                # No forward anywhere this step.
                 if cfg.ema_beta is not None and cfg.use_stale_ema_on_missing \
                         and module in self._sigma_ema:
                     sigma = self._sigma_ema[module]
                 else:
                     continue
             else:
-                sigma = self._batch_sigma(kind, acc)
+                sigma = batch_sigma
                 if cfg.ema_beta is not None:
                     prev = self._sigma_ema.get(module)
                     if prev is not None:
@@ -459,9 +498,83 @@ class ActivationPreconditioner:
                 m = self._solve_linear(sigma, g)
             else:
                 m = self._apply_embedding(sigma, g)
-            weight.grad.copy_(m.to(weight.grad.dtype))
+            self._copy_back(weight, m)
 
         self._accum.clear()
+
+    def _copy_back(self, weight: Tensor, m: Tensor) -> None:
+        """Write ``m`` into ``weight.grad``, warning once on a fp16 downcast overflow.
+
+        The solve runs in ``compute_dtype`` (fp32 by default); casting the result
+        back to a low-precision ``grad`` dtype can overflow (fp16 max ~6.5e4) when
+        ``S_z`` is ill-conditioned, which would otherwise silently produce inf
+        gradients. Detect that and warn once (no behavior change otherwise).
+        """
+        m_cast = m.to(weight.grad.dtype)
+        if (not self._warned_fp16_overflow and m_cast.dtype != m.dtype
+                and not torch.isfinite(m_cast).all()
+                and bool(torch.isfinite(m).all())):
+            self._warned_fp16_overflow = True
+            warnings.warn(
+                f"ActivationPreconditioner: preconditioned gradient overflowed when "
+                f"cast from {m.dtype} to {weight.grad.dtype} (ill-conditioned "
+                f"activation covariance). Increase `damping`/`damping_floor` or use a "
+                f"wider `compute_dtype`. This warning is shown once.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        weight.grad.copy_(m_cast)
+
+    def _distributed_enabled(self) -> bool:
+        """Whether to all-reduce the covariance across the process group."""
+        if self.config.distributed is not None:
+            return bool(self.config.distributed)
+        try:
+            import torch.distributed as dist
+            return dist.is_available() and dist.is_initialized()
+        except Exception:
+            return False
+
+    def _reduce_batch_sigma(self, module: nn.Module, kind: str) -> Optional[Tensor]:
+        """All-reduce a module's covariance across the group; return the batch sigma.
+
+        Sums the raw accumulator (linear ``gram`` + ``count``, embedding ``counts``
+        + ``count``) over all ranks with ``ReduceOp.SUM``, contributing zeros when
+        this rank did not run a forward for the module (so the collective is issued
+        on every rank). Returns ``S_z = stat_total / count_total``, or ``None`` if
+        no rank produced any samples this step.
+        """
+        import torch.distributed as dist
+
+        pg = self.config.process_group
+        weight = self._weight_of_module[module]
+        device = weight.device
+        acc = self._accum.get(module)
+        if kind == _LINEAR:
+            in_dim = weight.shape[1]
+            dtype = self.config.compute_dtype or weight.dtype
+            if acc is None:
+                stat = torch.zeros(in_dim, in_dim, dtype=dtype, device=device)
+                count = 0.0
+            else:
+                stat = acc["gram"].to(device=device).clone()
+                count = float(acc["count"])
+        else:  # embedding
+            vocab = weight.shape[0]
+            dtype = self.config.compute_dtype or torch.float32
+            if acc is None:
+                stat = torch.zeros(vocab, dtype=dtype, device=device)
+                count = 0.0
+            else:
+                stat = acc["counts"].to(device=device).clone()
+                count = float(acc["count"])
+        cnt = torch.tensor([count], dtype=stat.dtype, device=device)
+        dist.all_reduce(stat, op=dist.ReduceOp.SUM, group=pg)
+        dist.all_reduce(cnt, op=dist.ReduceOp.SUM, group=pg)
+        total = float(cnt.item())
+        if total <= 0.0:
+            return None
+        return stat / total
 
     def _batch_sigma(self, kind: str, acc: dict[str, Any]) -> Tensor:
         if kind == _LINEAR:
