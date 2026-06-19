@@ -361,10 +361,16 @@ uv run python benchmark_dopr.py            # or --quick
   well-posed even for zero / masked / rank-deficient activations. The affine-invariance
   property is exact only for the undamped update.
 - Under `DistributedDataParallel` the activation covariance is all-reduced across the process
-  group before the solve (auto-detected from `torch.distributed`; opt out with
+  group before the solve (auto-detected from `torch.distributed.is_initialized()`; opt out with
   `ActivationPrecondConfig(distributed=False)`). This is required for correctness: `.grad` is
   already all-reduced when `precondition_` runs, so all ranks must solve with the same
-  covariance or they will diverge. Assumes standard DDP (identical model on every rank).
+  covariance or they will diverge. The distributed path requires the ranks in lockstep:
+  identical model (same modules registered in the same order), identical step counter /
+  `warmup_steps`, and `.grad` genuinely all-reduced — so call `precondition_` only on a
+  synchronizing step (not inside DDP `no_sync()` or on non-final gradient-accumulation
+  microbatches). A desynced step counter or a non-DDP process group will hang or
+  mis-precondition; for a process group that is *not* the DDP grad-averaging group, pass
+  `distributed=False`.
 
 
 ## Experimental extensions

@@ -790,6 +790,23 @@ class TestFp16:
         assert run_step()        # first overflow warns
         assert not run_step()    # one-time: does not warn again
 
+    def test_embedding_overflow_warns(self):
+        # Regression: the fp16 overflow guard must also cover the EMBEDDING path.
+        # Previously _apply_embedding divided in fp16 (overflowing to inf) before
+        # _copy_back's guard ran, so the warning never fired.
+        torch.manual_seed(0)
+        emb = nn.Embedding(8, 4).half()
+        ap = ActivationPreconditioner(
+            emb, ActivationPrecondConfig(damping=1e-6, damping_floor=0.0,
+                                         compute_dtype=torch.float32))
+        idx = torch.randint(0, 3, (32,))  # tokens 3..7 absent -> tiny denom -> huge M
+        emb(idx).sum().backward()
+        emb.weight.grad = torch.full_like(emb.weight, 5000.0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ap.precondition_()
+        assert any("overflow" in str(w.message).lower() for w in caught)
+
 
 # ---------------------------------------------------------------------------
 # Distributed (DDP) covariance aggregation
@@ -842,6 +859,55 @@ def _run_ddp(distributed):
     return results[0], results[1]
 
 
+def _ddp_embedding_worker(rank, world_size, port, q):
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        torch.manual_seed(0)  # identical weights on every rank
+        emb = nn.Embedding(8, 4).double()
+        ap = ActivationPreconditioner(
+            emb, ActivationPrecondConfig(damping=0.1, compute_dtype=torch.float64,
+                                         distributed=True))
+        # Only rank 0 runs a forward (firing the capture hook) -> rank 1 hits the
+        # zeros-fallback in the reduce pre-pass. The collective must still run in
+        # lockstep on both ranks (no deadlock).
+        if rank == 0:
+            idx = torch.randint(0, 8, (12,))
+            emb(idx).sum().backward()
+        # Simulate DDP: identical grad on every rank (set directly, no forward on
+        # rank 1 so its covariance accumulator stays empty).
+        torch.manual_seed(7)
+        emb.weight.grad = torch.randn(8, 4, dtype=torch.float64)
+        ap.precondition_()
+        q.put((rank, emb.weight.grad.detach().cpu().tolist()))
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_ddp_embedding():
+    import torch.multiprocessing as mp
+
+    port = _free_port()
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=_ddp_embedding_worker, args=(r, 2, port, q))
+             for r in range(2)]
+    for p in procs:
+        p.start()
+    results = {}
+    try:
+        for _ in range(2):
+            rank, grad = q.get(timeout=120)
+            results[rank] = torch.tensor(grad)
+    finally:
+        for p in procs:
+            p.join(timeout=120)
+    return results[0], results[1]
+
+
 @pytest.mark.skipif(not _DIST_AVAILABLE, reason="torch.distributed unavailable")
 @pytest.mark.skipif(sys.platform.startswith("win"), reason="gloo spawn flaky on Windows")
 class TestDistributed:
@@ -857,3 +923,10 @@ class TestDistributed:
         # the ranks would silently desync.
         g0, g1 = _run_ddp(distributed=False)
         assert not torch.allclose(g0, g1, atol=1e-6)
+
+    def test_embedding_reduce_and_missing_module_lockstep(self):
+        # Exercises the embedding distributed path AND the zeros-fallback branch
+        # (a module that fired on only one rank): the collective must run in
+        # lockstep (no deadlock) and both ranks must end with identical grads.
+        g0, g1 = _run_ddp_embedding()
+        assert torch.allclose(g0, g1, atol=1e-10)
