@@ -148,6 +148,11 @@ def probe_batch(
                 fb_s += float(s)
                 fb_n += float(n)
                 fallback += 1
+    # For quadratic norms, E||g_B||² = ||E g||² + tr(C)/B. Correct the
+    # finite-probe upward bias in the signal; a nonpositive result means the
+    # probe cannot identify signal and the controller must hold.
+    eu_s = max(0., eu_s - eu_n / B)
+    ad_s = max(0., ad_s - ad_n / B)
     return BatchProbe(B, splits, time.perf_counter() - start,
                       _ratio(torch.tensor(eu_s), torch.tensor(eu_n)),
                       _ratio(torch.tensor(ad_s), torch.tensor(ad_n)),

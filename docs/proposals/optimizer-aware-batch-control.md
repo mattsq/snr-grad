@@ -37,6 +37,11 @@ the singular values of the centered subbatch gradient matrix to compute
 `(tr(C_row**0.5) / ||mean_gradient||_*)**2`; it never reads the SVD gates.
 The probe does not change parameter gradients or optimizer state. Training
 BatchNorm and Dropout are rejected because they confound the variance estimate.
+For Euclidean and frozen AdamW quadratic norms, the measured mean-gradient
+square includes `noise / probe_batch_size`. Subtract this finite-probe bias
+before forming the scale, clipping an unresolved signal to zero and holding
+the current batch. The nuclear-norm matrix sensor remains a finite-split
+heuristic; its scale depends substantially on the number of disjoint splits.
 
 `BatchController.observe(probe)` and `recommend()` operate in the training loop.
 The caller must use the recommendation on the *next* step, record the actual
@@ -60,3 +65,36 @@ the same three views as the other benchmarks: validation loss against steps,
 samples, and measured training time; controller batch trajectories and probe
 cost; and paired local-continuation efficiency alongside the raw sensor scales.
 The plots expose both the chosen policy and the limits of its calibration.
+
+## Held-out validation and outcome
+
+`README.md` gives the exact digit benchmark and probe-resolution commands,
+figures, and cross-seed results. This follow-up uses real handwritten digit
+images with a held-out validation partition, a 1,500-example synthetic label
+permutation, five held-out seeds, a 3,000-training-example cap, and fixed
+`B=4`, `B=16`, `B=128`, and preset-ramp controls. The learning rates and the
+heuristic `0.2` multiplier were chosen on separate development seeds. Short
+paired continuations at checkpoints on either side of the shift measure local
+per-step, per-example, and per-second improvement. Probe examples are separate
+from the training-example cap; probe wall time is included in policy time.
+
+The result does not support deploying this adaptive policy as a default.
+Stationary SNRMuon has nearly equal final validation cross-entropy at fixed
+`B=16` (0.166) and optimizer-aware control (0.161), while fixed `B=16` takes
+about 0.25 CPU seconds versus 0.55. Following the label permutation,
+optimizer-aware SNRMuon ends at 0.250 versus 0.199 for fixed `B=4`; its
+cross-entropy is worse in all five seeds. AdamW-aware control helps relative
+to fixed `B=16` after the shift, but has no clear advantage over other adaptive
+or small-batch controls once probe cost is considered. These results use fixed
+learning rates and a small CPU model; they do not establish GPU throughput or
+batch/LR coupling behavior.
+
+Keeping the sensor diagnostics is useful. On the same 128 digit examples and
+the same trained checkpoint, increasing the number of disjoint probe splits
+from eight to 128 raises the median raw Muon scale from roughly 143 to 350
+and median probe time from 10 ms to 127 ms across five seeds. No split count
+is a population ground truth. Calibration must specify probe resolution,
+compute cost, and a measured loss horizon before a noise scale can justify a
+controller action. A subsequent controller study should tune its policy on
+development tasks and require held-out gains against fixed and Euclidean
+controls at matched example and wall-time budgets.

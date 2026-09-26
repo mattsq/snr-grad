@@ -832,17 +832,17 @@ The takeaway: tie the target to expected signal density, prefer a **cap + SNR fl
 
 ### `benchmark_batch_control.py` -- Optimizer-aware batch-size diagnostics
 
-Run `python benchmark_batch_control.py --steps 120 --seeds 3 --probe-every 5 --output benchmarks/benchmark_batch_control.jsonl.gz`, then `python plot_batch_control.py benchmarks/benchmark_batch_control.jsonl.gz`. The run compares fixed `B=8` and `B=64`, a preset ramp, Euclidean-sensor control, and optimizer-aware control on stationary regression, an abrupt target change, and a small matrix-heavy model. It also includes ungated AdamW controls. The paired local continuations use independent model and optimizer clones so calibration cannot change the main training path. All policies use the same per-step training sample prefix. The loss, controller decisions, sensor values, mean SNRAdamW gate, probe cost, and local efficiency measurements are recorded in the compressed JSONL file.
+Run `python benchmark_batch_control.py --steps 120 --seeds 3 --probe-every 5 --probe-size 64 --probe-splits 8 --sizes 8 16 32 64 --reference-batch 16 --output benchmarks/benchmark_batch_control.jsonl.gz`, then `python plot_batch_control.py benchmarks/benchmark_batch_control.jsonl.gz`. The synthetic run compares fixed `B=8`, `16`, and `64`, a preset ramp, Euclidean-sensor control, and optimizer-aware control on stationary regression, an abrupt target change, and a small matrix-heavy model. It includes ungated AdamW controls. The paired local continuations use independent model and optimizer clones so calibration cannot change the main training path. Each policy starts from the same seed and uses the same per-step draw prefix. Loss, controller decisions, sensors, mean SNRAdamW gate, probe cost, and local efficiency are recorded in compressed JSONL.
 
-**Loss against three budgets.** Fixed `B=64` advances farther per optimizer step, while `B=8` uses examples more efficiently. Neither adaptive sensor improves the loss frontier in this three-seed run. The ungated AdamW baseline learns far faster than this SNRMuon setup on the matrix task, so that task does not establish a benefit for Muon-based control.
+**Loss against three budgets.** With a fixed 120-step cap, `B=64` consumes more examples and achieves lower final loss than the other policies in this synthetic run. The sample and wall-time panels show the corresponding costs. The ungated AdamW baseline learns far faster than this SNRMuon setup on the matrix task, so that task does not establish a benefit for Muon-based control.
 
 ![Batch-control validation loss versus steps, examples, and training time](benchmarks/benchmark_batch_control_frontiers.png)
 
-**Controller behavior and cost.** Both controllers stay at `B=8` on stationary and shifted regression. The Muon-aware controller briefly chooses `B=16` on the matrix task, while Euclidean control stays at `B=8`. Probing every five steps accounts for roughly 30% of the measured training time in this tiny CPU workload. These are raw, uncalibrated sensor values; the controller's smoothing and deadband decide actual changes.
+**Controller behavior and cost.** The controllers now move among several candidate batches, particularly on the matrix task. The controller smooths the raw scales, applies a deadband, and limits changes to one rung. Probing every five steps is a material fraction of elapsed training time on this tiny CPU workload.
 
 ![Batch sizes, sensor values, and probe overhead](benchmarks/benchmark_batch_control_diagnostics.png)
 
-**Measured local batch range.** Four-step continuations at each candidate batch show the per-step and per-example trade-off from a shared mid-run checkpoint. The right panels compare raw noise scales with the smallest batch reaching 80% of the best measured per-step gain. The shift task's measured knee lies above both raw sensor values, while the Muon sensor sometimes overpredicts the matrix task's measured knee. Three seeds and four continuation steps make this a diagnostic, not a calibrated critical-batch estimate.
+**Measured local batch range.** Four-step continuations at each candidate batch show the per-step and per-example trade-off from a shared mid-run checkpoint. The right panels compare raw noise scales with the smallest batch reaching 80% of the best measured per-step gain. Three seeds and four continuation steps make this a diagnostic, not a calibrated critical-batch estimate.
 
 ![Local batch-efficiency curves and raw-sensor calibration](benchmarks/benchmark_batch_control_calibration.png)
 
@@ -851,6 +851,41 @@ Run `python benchmark_batch_control.py --steps 120 --seeds 3 --probe-every 5 --o
 ![Mean SNRAdamW gate across policies](benchmarks/benchmark_batch_control_gates.png)
 
 **Output:** `benchmarks/benchmark_batch_control_{frontiers,diagnostics,calibration,gates}.png` and `benchmarks/benchmark_batch_control.jsonl.gz`.
+
+### Held-out handwritten digits and probe resolution
+
+The larger experiment uses the real scikit-learn digits images, a held-out validation split, and a `64→128→64→10` classifier. `digits_shift` changes every training and validation label by `+3 mod 10` after 1,500 training examples; the images remain the same. Development seeds 0–1 informed the fixed learning rates (SNRMuon `0.1`, AdamW `0.003`) and the heuristic sensor multiplier `0.2`; the figures below use held-out seeds 2–6. Every policy has a 3,000-training-example cap, while the separate probe examples and CPU probe time are logged. The fixed `B=16` control is a useful practical reference. Run:
+
+```bash
+python benchmark_batch_control.py --tasks digits digits_shift --seed-start 2 --seeds 5 --steps 750 --sample-budget 3000 --sizes 4 8 16 32 64 128 --reference-batch 16 --probe-every 20 --probe-size 64 --probe-splits 8 --target-multiplier 0.2 --muon-lr 0.1 --adamw-lr 0.003 --calibration-points quarters --continuation-steps 12 --output benchmarks/benchmark_batch_control_digits.jsonl.gz
+python plot_batch_control.py benchmarks/benchmark_batch_control_digits.jsonl.gz --tasks digits digits_shift --tag digits_
+python benchmark_batch_probe_resolution.py
+```
+
+At the sample cap, mean validation cross-entropy over five held-out seeds is:
+
+| Task / optimizer | B=4 | B=16 | B=128 | Ramp | Euclidean | Aware |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Digits / SNRMuon | 0.165 | 0.166 | 0.629 | 0.166 | 0.166 | 0.161 |
+| Shift / SNRMuon | 0.199 | 0.336 | 1.733 | 0.286 | 0.225 | 0.250 |
+| Digits / AdamW | 0.197 | 0.185 | 0.738 | 0.169 | 0.156 | 0.168 |
+| Shift / AdamW | 0.255 | 0.474 | 1.810 | 0.413 | 0.293 | 0.243 |
+
+The stationary SNRMuon difference between aware and fixed `B=16` is only −0.0055 mean cross-entropy (paired standard deviation 0.0126). Under the label shift, aware SNRMuon is worse than fixed `B=4` in every seed (mean difference +0.0507). Stationary SNRMuon takes about 0.55 CPU seconds with aware control versus 0.25 with fixed `B=16`; on this small model, probes consume about 26% of the aware run's measured time. AdamW adaptive probes consume roughly 46%. Thus the current optimizer-aware policy does not establish a better loss/cost frontier than the fixed or Euclidean controls. These are fixed-learning-rate, CPU-only results; no GPU throughput or coupled batch/LR claim follows.
+
+![Held-out digit validation cross-entropy against steps, examples, and measured training time](benchmarks/benchmark_batch_control_digits_frontiers.png)
+
+The sample axis aligns the label change across policies; the step axis shows each policy reaching it at a different step. Controller decisions and paired local 12-step continuations before and after the shift are shown separately. Local curves measure short-horizon gains from a shared checkpoint, not a universal critical batch size.
+
+![Digit controller trajectories and probe overhead](benchmarks/benchmark_batch_control_digits_diagnostics.png)
+
+![Digit paired local batch-efficiency curves and sensor scales](benchmarks/benchmark_batch_control_digits_calibration.png)
+
+At a fixed trained checkpoint, the resolution experiment reuses the same 128 digit examples and varies the number of disjoint microbatches. Median raw Muon scale rises from about 143 at eight splits to about 350 at 128 splits, while median probe time rises from about 10 ms to 127 ms. Six of 30 Euclidean scale estimates have no resolved signal and are held by the controller. The 128-split result is still a finite-sample reference, not population truth. The multiplier calibrated with eight splits should not be transferred to another probe resolution without recalibration.
+
+![Noise-scale estimates and probe time as the split count changes](benchmarks/benchmark_batch_probe_resolution.png)
+
+**Output:** `benchmarks/benchmark_batch_control_digits.jsonl.gz`, the three `benchmark_batch_control_digits_*.png` figures, `benchmarks/benchmark_batch_probe_resolution.json`, and its PNG figure.
 
 ## Diagnostics
 

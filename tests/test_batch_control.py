@@ -19,8 +19,8 @@ def test_per_example_scaling_and_gradient_preservation():
     p = probe_batch(model, _loss, batch, splits=4)
     # Unbiased variance of [0, 2, 4, 6] = 20/3, mean gradient = 3.
     assert p.euclidean.noise == pytest.approx(20 / 3)
-    assert p.euclidean.signal == pytest.approx(9)
-    assert p.euclidean.scale == pytest.approx(20 / 27)
+    assert p.euclidean.signal == pytest.approx(9 - (20 / 3) / 4)
+    assert p.euclidean.scale == pytest.approx((20 / 3) / (9 - 5 / 3))
     assert p.muon.scale == pytest.approx(20 / 27)
     assert model.weight.grad.item() == 17
     # With only two contiguous chunks the estimate is noisy; b=2 restores
@@ -79,3 +79,14 @@ def test_probe_cost_guard_and_invalid_splits():
     assert c.recommend().reason == "expensive_probe"
     with pytest.raises(ValueError, match="equal"):
         probe_batch(nn.Linear(1, 1), _loss, torch.ones(5, 1), splits=2)
+
+
+def test_noise_dominated_probe_does_not_force_batch_change():
+    model = nn.Linear(1, 1, bias=False)
+    p = probe_batch(model, _loss, torch.tensor([[-1.], [1.]]), splits=2)
+    assert p.euclidean.signal == 0
+    assert math.isinf(p.euclidean.scale)
+    controller = BatchController([2, 4], initial=2, warmup=0)
+    controller.observe(p)
+    assert controller.recommend().reason == "unstable_probe"
+    assert controller.recommend().batch_size == 2
