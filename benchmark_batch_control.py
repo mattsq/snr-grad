@@ -37,10 +37,12 @@ def data(seed, task, n=2048, d=12):
         rng = torch.Generator().manual_seed(seed)
         x = torch.tensor(digits.data, dtype=torch.float32) / 16.
         y = torch.tensor(digits.target, dtype=torch.long)
+        shifted_y = (torch.where(y == 0, 1, torch.where(y == 1, 0, y))
+                     if task == "digits_partial_shift" else (y + 3) % 10)
         permutation = torch.randperm(len(x), generator=rng)
         train_ids, val_ids = permutation[:1437], permutation[1437:]
-        return (x[train_ids], y[train_ids], (y[train_ids] + 3) % 10), (
-            x[val_ids], y[val_ids], (y[val_ids] + 3) % 10)
+        return (x[train_ids], y[train_ids], shifted_y[train_ids]), (
+            x[val_ids], y[val_ids], shifted_y[val_ids])
     rng = torch.Generator().manual_seed(seed)
     x = torch.randn(n, d, generator=rng)
     w = torch.randn(d, 1, generator=rng)
@@ -104,12 +106,14 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
     sensor = "euclidean" if policy == "euclidean" else ("muon" if kind == "snr_muon" else "adamw")
     controller = BatchController(sizes, initial=sizes[0], sensor=sensor,
                                  warmup=2, dwell=3, target_multiplier=target_multiplier,
-                                 max_probe_fraction=15.) if policy in ("euclidean", "aware") else None
+                                 max_probe_fraction=15.) if policy in ("euclidean", "aware", "aware_shift_reset", "aware_alarm") else None
     probe_rng = torch.Generator().manual_seed(seed + 40000)
     consumed = 0
-    shifting = task in ("shift", "digits_shift")
+    shifting = task in ("shift", "digits_shift", "digits_partial_shift")
     shift_at = steps * sizes[0] // 2
     clock = 0.
+    loss_ema = None
+    last_alarm = -100000
     records = []
     checkpoints = ({steps // 4, steps // 2, 3 * steps // 4}
                    if calibration_points == "quarters" else {steps // 2})
@@ -118,8 +122,12 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
     for step in range(steps):
         if policy == "fixed_large":
             B = sizes[-1]
+        elif policy == "fixed_mid":
+            B = sizes[1]
         elif policy == "fixed_reference":
             B = sizes[min(2, len(sizes) - 1)] if reference_batch is None else reference_batch
+        elif policy == "shift_reset":
+            B = sizes[0] if shifting and consumed >= shift_at else (sizes[min(2, len(sizes) - 1)] if reference_batch is None else reference_batch)
         elif policy == "ramp":
             B = sizes[min(len(sizes) - 1, step * len(sizes) // steps)]
         elif controller:
@@ -136,10 +144,28 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
         batch = train[0][indices], target[indices]
         start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        criterion(model, batch).backward()
+        training_loss = criterion(model, batch)
+        training_loss.backward()
         update(optimizer, B)
         train_seconds = time.perf_counter() - start
         consumed += B
+        alarm = False
+        if policy == "aware_alarm":
+            observed_loss = float(training_loss.detach())
+            alarm = (step >= 20 and step - last_alarm >= 80 and loss_ema is not None
+                     and observed_loss > max(1., 4. * loss_ema))
+            if alarm:
+                last_alarm = step
+                controller = BatchController(sizes, initial=sizes[0], sensor=sensor,
+                                             warmup=2, dwell=3, target_multiplier=target_multiplier,
+                                             max_probe_fraction=15.)
+            loss_ema = observed_loss if loss_ema is None else .95 * loss_ema + .05 * observed_loss
+        if policy == "aware_shift_reset" and shifting and consumed - B < shift_at <= consumed:
+            # Diagnostic with oracle change-point knowledge: isolate slow
+            # controller response from the sensor's intrinsic usefulness.
+            controller = BatchController(sizes, initial=sizes[0], sensor=sensor,
+                                         warmup=2, dwell=3, target_multiplier=target_multiplier,
+                                         max_probe_fraction=15.)
         # The next probe and local continuations evaluate the post-step task.
         probe_target = train[2] if shifting and consumed >= shift_at else train[1]
         probe = None
@@ -169,6 +195,7 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
                             reason=None if decision is None else decision.reason,
                             probe_examples=probe_examples,
                             probe_seconds=None if decision is None else decision.probe_seconds,
+                            alarm=alarm,
                             euclidean=None if probe is None else probe.euclidean.scale,
                             adamw=None if probe is None else probe.adamw.scale,
                             muon=None if probe is None or probe.muon is None else probe.muon.scale,
@@ -220,8 +247,10 @@ def main():
     parser.add_argument("--target-multiplier", type=float, default=1.)
     parser.add_argument("--continuation-steps", type=int, default=4)
     parser.add_argument("--calibration-points", choices=("mid", "quarters"), default="mid")
-    parser.add_argument("--tasks", nargs="+", choices=("stationary", "shift", "matrix", "digits", "digits_shift"),
+    parser.add_argument("--tasks", nargs="+", choices=("stationary", "shift", "matrix", "digits", "digits_shift", "digits_partial_shift"),
                         default=("stationary", "shift", "matrix"))
+    parser.add_argument("--policies", nargs="+", choices=("fixed_small", "fixed_mid", "fixed_reference", "fixed_large", "ramp", "euclidean", "aware", "shift_reset", "aware_shift_reset", "aware_alarm"),
+                        default=("fixed_small", "fixed_reference", "fixed_large", "ramp", "euclidean", "aware"))
     parser.add_argument("--lr", type=float, default=.003)
     parser.add_argument("--muon-lr", type=float)
     parser.add_argument("--adamw-lr", type=float)
@@ -235,12 +264,12 @@ def main():
     opener = gzip.open if args.output.endswith(".gz") else open
     with opener(args.output, "wt", encoding="utf8") as output:
         for task in args.tasks:
-            for kind in (("snr_muon", "adamw") if task in ("matrix", "digits", "digits_shift") else ("snr_adamw", "adamw")):
+            for kind in (("snr_muon", "adamw") if task in ("matrix", "digits", "digits_shift", "digits_partial_shift") else ("snr_adamw", "adamw")):
                 kind_lr = {"snr_muon": args.muon_lr, "snr_adamw": args.snr_adamw_lr,
                            "adamw": args.adamw_lr}[kind]
                 kind_lr = args.lr if kind_lr is None else kind_lr
                 for seed in range(args.seed_start, args.seed_start + args.seeds):
-                    for policy in ("fixed_small", "fixed_reference", "fixed_large", "ramp", "euclidean", "aware"):
+                    for policy in args.policies:
                         rows = run(seed, task, kind, policy, sizes=args.sizes, steps=args.steps,
                                    lr=kind_lr, probe_every=args.probe_every, budget=args.sample_budget,
                                    coupled_lr=args.coupled_lr, curve=policy == "fixed_small",

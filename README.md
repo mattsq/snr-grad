@@ -887,6 +887,40 @@ At a fixed trained checkpoint, the resolution experiment reuses the same 128 dig
 
 **Output:** `benchmarks/benchmark_batch_control_digits.jsonl.gz`, the three `benchmark_batch_control_digits_*.png` figures, `benchmarks/benchmark_batch_probe_resolution.json`, and its PNG figure.
 
+### Why the digit controller misses the useful batch
+
+The original sensor multiplier was fitted to a **per-step** local batch knee, but the held-out comparison capped **training examples**. To separate that objective mismatch from response lag, a follow-up repeats 12-step paired local continuations eight times at each fixed checkpoint and adds fixed `B=8`, a known-change-point `B=16→4` schedule, a controller reset at the known change point, and a reset triggered by a training-loss spike. The last two change-point schedules are diagnostic controls; the known-change-point policies receive privileged timing information. The exploratory loss alarm compares the current training loss with a 0.95 EMA and fires above `max(1, 4 × EMA)`, with an 80-step cooldown. Its threshold was not selected by a separate alarm-validation experiment.
+
+![Replicated local per-step and per-example gains before and after the label switch](benchmarks/benchmark_batch_local_replication.png)
+
+Across the five post-shift checkpoints, the batch with the greatest **mean per-step** gain is `B=64` or `128` in all five seeds; the batch with the greatest **mean per-example** gain is `B=4` in three seeds and `B=8` in two. The same checkpoints have raw eight-split Muon scale estimates of roughly 36–83. Per-repetition 80%-of-best knees vary widely even at identical parameters, so a single 12-step knee is noisy. The controller's `0.2` multiplier tends to choose `B=8–16`, which improves updates per step but uses some of the limited example budget less efficiently. The shaded region is standard deviation across five independent splits after averaging eight paired draws within each split.
+
+At 3,000 training examples, mean validation cross-entropy across the same five held-out seeds is:
+
+| Shift / optimizer | B=4 | B=8 | B=16 | Aware | Oracle B=16→4 | Oracle aware reset | Loss-alarm reset |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| All labels / SNRMuon | 0.199 | 0.253 | 0.336 | 0.250 | 0.203 | 0.219 | 0.204 |
+| All labels / AdamW | 0.255 | 0.288 | 0.474 | 0.243 | 0.274 | 0.219 | 0.217 |
+| Classes 0↔1 / SNRMuon | 0.172 | 0.192 | 0.198 | 0.173 | 0.209 | — | 0.178 |
+| Classes 0↔1 / AdamW | 0.220 | 0.191 | 0.215 | 0.251 | 0.202 | — | 0.180 |
+
+The all-label reset result shows that part of the previous aware-control gap is delayed response to the change. It does not establish a sensor advantage: fixed `B=4` nearly matches the reset outcomes without probe cost, and the two-class shift does not reward resetting SNRMuon. On stationary digits, the loss alarm fires spuriously for SNRMuon in three of five seeds and AdamW in all five. On the all-label shift, it fires on the first shifted minibatch in four of five SNRMuon seeds; a false alarm before the shift blocks the fifth by cooldown. AdamW produces frequent false alarms. These results are exploratory: the alarm and follow-up task were designed after inspecting the initial held-out results, so fresh tasks and seeds are needed to assess generalization.
+
+![All-label shift: sample-aligned losses and batch paths](benchmarks/benchmark_batch_control_failure_modes.png)
+
+![Two-class shift: sample-aligned losses and batch paths](benchmarks/benchmark_batch_control_partial_shift.png)
+
+The scripts retain all trajectories and paired local repetitions. To reproduce the follow-up with the same hyperparameters as the original digit run, use:
+
+```bash
+python benchmark_batch_local_replication.py
+python benchmark_batch_control.py --tasks digits digits_shift --policies fixed_mid shift_reset aware_shift_reset --seed-start 2 --seeds 5 --steps 750 --sample-budget 3000 --sizes 4 8 16 32 64 128 --reference-batch 16 --probe-every 20 --probe-size 64 --probe-splits 8 --target-multiplier 0.2 --muon-lr 0.1 --adamw-lr 0.003 --output benchmarks/benchmark_batch_control_ablation.jsonl.gz
+python benchmark_batch_control.py --tasks digits digits_shift --policies aware_alarm --seed-start 2 --seeds 5 --steps 750 --sample-budget 3000 --sizes 4 8 16 32 64 128 --reference-batch 16 --probe-every 20 --probe-size 64 --probe-splits 8 --target-multiplier 0.2 --muon-lr 0.1 --adamw-lr 0.003 --output benchmarks/benchmark_batch_control_alarm.jsonl.gz
+python benchmark_batch_control.py --tasks digits_partial_shift --policies fixed_small fixed_mid fixed_reference aware shift_reset aware_alarm --seed-start 2 --seeds 5 --steps 750 --sample-budget 3000 --sizes 4 8 16 32 64 128 --reference-batch 16 --probe-every 20 --probe-size 64 --probe-splits 8 --target-multiplier 0.2 --muon-lr 0.1 --adamw-lr 0.003 --output benchmarks/benchmark_batch_control_partial_shift.jsonl.gz
+python plot_batch_control_failure_modes.py
+python plot_batch_control_failure_modes.py --partial
+```
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):

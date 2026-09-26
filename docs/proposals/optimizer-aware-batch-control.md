@@ -98,3 +98,46 @@ compute cost, and a measured loss horizon before a noise scale can justify a
 controller action. A subsequent controller study should tune its policy on
 development tasks and require held-out gains against fixed and Euclidean
 controls at matched example and wall-time budgets.
+
+## Failure-mode follow-up
+
+The follow-up in `README.md` and `benchmark_batch_local_replication.py`
+separates three possible explanations for the first result. Eight paired
+12-step continuations at each of two checkpoints and five seeds show that
+larger batches reliably improve **gain per step**, whereas `B=4` or `B=8`
+maximizes mean **gain per training example** at all five post-shift
+checkpoints. The original controller was calibrated to an 80%-of-best
+per-step knee, then judged under an example cap. Its sensor can be useful
+for identifying diminishing returns per update and still choose the wrong
+action for the evaluated resource. A cost-aware decision must directly
+specify the relative prices of examples, steps, and device time.
+
+`benchmark_batch_control.py` now supports `fixed_mid`, `shift_reset`,
+`aware_shift_reset`, and `aware_alarm` as explicit diagnostic policies.
+With an abrupt permutation of all digit labels, resetting from `B=16` to
+`B=4` at the known change point reduces SNRMuon's final mean CE from
+0.336 to 0.203. Resetting the aware controller reduces it from 0.250 to
+0.219. A training-loss alarm reduces it to 0.204, near the fixed `B=4`
+result of 0.199. Thus lag across a large change point explains part of
+the gap, while small-batch sample efficiency explains the remaining
+advantage of `B=4`. The oracle policies know the change time and do not
+represent deployable performance.
+
+The two-class label swap (0↔1) is a less extreme follow-up. Aware SNRMuon
+and fixed `B=4` tie at roughly 0.173 and 0.172; the known-change reset
+is worse at 0.209. The simple loss alarm has false positives even on the
+stationary digit task, especially with AdamW. Its apparent gains on a
+large shift are not evidence for reliable unsupervised shift detection.
+The alarm and second task were designed after seeing the initial held-out
+outcomes and require fresh, independently selected problems for
+confirmatory inference. The figures `benchmark_batch_control_failure_modes.png`,
+`benchmark_batch_control_partial_shift.png`, and
+`benchmark_batch_local_replication.png` show sample-aligned losses,
+controller paths, and the competing local efficiency objectives.
+
+The viable next question is whether optimizer-specific geometry predicts
+**throughput-adjusted** local improvement on a larger model and device,
+with probe time amortized and a controller calibrated for that exact cost.
+These CPU experiments do not answer it; they rule out treating a raw
+dual-norm noise scale as a generally useful batch action under an example
+budget.
