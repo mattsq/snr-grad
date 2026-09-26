@@ -27,3 +27,30 @@ First test **batch-only** adaptation with a fixed learning-rate schedule. Then a
 Use one stationary task and one task with a distribution or signal-support shift, then a small matrix-heavy model for Muon. Compare fixed small/large batch, a predetermined batch ramp, Euclidean-sensor control, and optimizer-aware-sensor control, with matched starting checkpoints and seeds. Report validation loss against **samples, optimizer steps, and wall time**, plus probe overhead and controller trajectories. The proposal is supported if the optimizer-aware sensor predicts the measured useful batch range better and its controller improves the chosen cost/loss frontier across seeds; otherwise retain the diagnostics and drop the adaptive policy.
 
 Related work: [Naganuma et al., *Adaptive Batch Sizes Using Non-Euclidean Gradient Noise Scales*](https://arxiv.org/abs/2602.03001) motivates optimizer-specific dual norms; [Merrill et al., *Critical Batch Size Revisited*](https://arxiv.org/abs/2505.23971) motivates checking a noise-scale proxy against measured batch efficiency, especially under Adam.
+
+## Initial implementation
+
+`snr_grad.batch_control.probe_batch` takes equal, disjoint microbatches and returns
+per-example Euclidean, frozen AdamW, and nuclear-norm matrix noise scales, with
+a separate L1 fallback for nonmatrix Muon parameters. The nuclear sensor uses
+the singular values of the centered subbatch gradient matrix to compute
+`(tr(C_row**0.5) / ||mean_gradient||_*)**2`; it never reads the SVD gates.
+The probe does not change parameter gradients or optimizer state. Training
+BatchNorm and Dropout are rejected because they confound the variance estimate.
+
+`BatchController.observe(probe)` and `recommend()` operate in the training loop.
+The caller must use the recommendation on the *next* step, record the actual
+size, and pass it to `SNRAdamW.step(batch_size=actual_size)` when using finite
+alpha. The target multiplier is an empirical calibration parameter. With no
+local batch-efficiency calibration, the initial value of 1 is illustrative.
+
+Run `python benchmark_batch_control.py --steps 80 --seeds 3 --output batch-control.jsonl`
+for paired synthetic stationary, shifted, and matrix-heavy comparisons. The
+JSONL records validation loss against steps, examples, and elapsed training
+time, probe overhead, gate mean where available, and local batch-efficiency
+continuations from a shared mid-run checkpoint. `--sample-budget` caps consumed
+training examples; `--coupled-lr` enables a separate square-root LR coupling
+run to compare against the predetermined ramp under the same budget. Probe
+examples and their cost are recorded separately from training examples. The
+small synthetic study is a starting diagnostic; assess calibration and
+cross-seed frontiers before interpreting policy gains.
