@@ -6,6 +6,7 @@ The synthetic tasks are diagnostic, not evidence that a controller generalizes.
 
 import argparse
 import copy
+import gzip
 import json
 import math
 import time
@@ -29,7 +30,7 @@ def data(seed, task, n=2048, d=12):
     shifted = x @ torch.roll(w, 3, 0) + .6 * torch.randn(n, 1, generator=rng)
     xv = torch.randn(1024, d, generator=rng)
     yv = xv @ (torch.roll(w, 3, 0) if task == "shift" else w)
-    return (x, y, shifted), (xv, yv)
+    return (x, y, shifted), (xv, xv @ w, xv @ torch.roll(w, 3, 0))
 
 
 def build_model(seed, task):
@@ -41,7 +42,8 @@ def build_model(seed, task):
 
 def optimizer_for(model, kind, lr, n):
     if kind == "snr_adamw":
-        return SNRAdamW(model.parameters(), lr=lr, alpha="finite", dataset_size=n)
+        return SNRAdamW(model.parameters(), lr=lr, alpha="finite", dataset_size=n,
+                        track_stats=True)
     if kind == "snr_muon":
         return SNRMuon(model.parameters(), lr=lr)
     return torch.optim.AdamW(model.parameters(), lr=lr)
@@ -54,9 +56,9 @@ def update(optimizer, batch_size):
         optimizer.step()
 
 
-def evaluate(model, validation):
+def evaluate(model, validation, shifted=False):
     with torch.no_grad():
-        return float(loss_fn(model, validation))
+        return float(loss_fn(model, (validation[0], validation[2] if shifted else validation[1])))
 
 
 def gate_mean(optimizer):
@@ -75,6 +77,7 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
                                  max_probe_fraction=5.) if policy in ("euclidean", "aware") else None
     probe_rng = torch.Generator().manual_seed(seed + 40000)
     consumed = 0
+    shift_at = steps * sizes[0] // 2
     clock = 0.
     records = []
     for step in range(steps):
@@ -92,7 +95,7 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
         # Same per-step draw prefix for every policy, even when batch sizes differ.
         sample_rng = torch.Generator().manual_seed(seed + 20000 + step)
         indices = torch.randint(len(train[0]), (B,), generator=sample_rng)
-        target = train[2] if task == "shift" and consumed >= steps * sizes[0] // 2 else train[1]
+        target = train[2] if task == "shift" and consumed >= shift_at else train[1]
         batch = train[0][indices], target[indices]
         start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
@@ -118,7 +121,9 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
         clock += time.perf_counter() - start
         records.append(dict(seed=seed, task=task, optimizer=kind, policy=policy,
                             step=step + 1, samples=consumed, seconds=clock, actual_batch=B,
-                            validation=evaluate(model, validation), gate_mean=gate_mean(optimizer),
+                            validation=evaluate(model, validation, task == "shift" and consumed >= shift_at),
+                            shift_at=shift_at if task == "shift" else None,
+                            gate_mean=gate_mean(optimizer),
                             recommendation=None if decision is None else decision.batch_size,
                             reason=None if decision is None else decision.reason,
                             probe_examples=probe_examples,
@@ -132,25 +137,30 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
             # state copies and the same random sample stream for each candidate.
             state = copy.deepcopy(model.state_dict())
             opt_state = copy.deepcopy(optimizer.state_dict())
-            baseline = evaluate(model, validation)
+            baseline = evaluate(model, validation, task == "shift" and consumed >= shift_at)
+            calibration_ids = torch.randperm(len(train[0]), generator=torch.Generator().manual_seed(seed + 50000))[:sizes[0]]
+            calibration = probe_batch(model, loss_fn, (train[0][calibration_ids], target[calibration_ids]),
+                                      splits=4, optimizer=optimizer)
             for candidate in sizes:
-                model.load_state_dict(state)
-                optimizer.load_state_dict(opt_state)
+                branch = build_model(seed, task)
+                branch.load_state_dict(state)
+                branch_optimizer = optimizer_for(branch, kind, lr, len(train[0]))
+                branch_optimizer.load_state_dict(copy.deepcopy(opt_state))
                 t0 = time.perf_counter()
                 for local_step in range(4):
                     local_rng = torch.Generator().manual_seed(seed + 30000 + step * 4 + local_step)
                     ids = torch.randint(len(train[0]), (candidate,), generator=local_rng)
-                    optimizer.zero_grad(set_to_none=True)
-                    loss_fn(model, (train[0][ids], target[ids])).backward()
-                    update(optimizer, candidate)
+                    branch_optimizer.zero_grad(set_to_none=True)
+                    loss_fn(branch, (train[0][ids], target[ids])).backward()
+                    update(branch_optimizer, candidate)
                 dt = time.perf_counter() - t0
-                gain = baseline - evaluate(model, validation)
+                gain = baseline - evaluate(branch, validation, task == "shift" and consumed >= shift_at)
                 records.append(dict(seed=seed, task=task, optimizer=kind, policy=policy,
                                     kind="local_curve", checkpoint_step=step + 1, candidate=candidate,
+                                    euclidean=calibration.euclidean.scale, adamw=calibration.adamw.scale,
+                                    muon=None if calibration.muon is None else calibration.muon.scale,
                                     improvement_per_step=gain / 4, improvement_per_sample=gain / (4 * candidate),
                                     improvement_per_second=gain / dt))
-            model.load_state_dict(state)
-            optimizer.load_state_dict(opt_state)
     return records
 
 
@@ -167,7 +177,8 @@ def main():
     args = parser.parse_args()
     if args.probe_every < 1 or args.steps < 2 or args.seeds < 1:
         parser.error("steps, seeds and probe-every must be positive")
-    with open(args.output, "w", encoding="utf8") as output:
+    opener = gzip.open if args.output.endswith(".gz") else open
+    with opener(args.output, "wt", encoding="utf8") as output:
         for task in ("stationary", "shift", "matrix"):
             for kind in (("snr_muon", "adamw") if task == "matrix" else ("snr_adamw", "adamw")):
                 for seed in range(args.seeds):

@@ -742,6 +742,8 @@ python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
 python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
 python benchmark_adaptive_threshold.py  # Adaptive vs static gate under regime shifts
+python benchmark_batch_control.py --steps 120 --seeds 3 --output benchmarks/benchmark_batch_control.jsonl.gz
+python plot_batch_control.py benchmarks/benchmark_batch_control.jsonl.gz
 ```
 
 ### `benchmark.py` -- Core SNR gating evaluation
@@ -827,6 +829,28 @@ The takeaway: tie the target to expected signal density, prefer a **cap + SNR fl
 ![Sparsity and SNR-floor sweeps](benchmarks/benchmark_adaptive_threshold_sweep.png)
 
 **Output:** `benchmarks/benchmark_adaptive_threshold.png`, `benchmarks/benchmark_adaptive_threshold_rdist.png`, `benchmarks/benchmark_adaptive_threshold_sweep.png`
+
+### `benchmark_batch_control.py` -- Optimizer-aware batch-size diagnostics
+
+Run `python benchmark_batch_control.py --steps 120 --seeds 3 --probe-every 5 --output benchmarks/benchmark_batch_control.jsonl.gz`, then `python plot_batch_control.py benchmarks/benchmark_batch_control.jsonl.gz`. The run compares fixed `B=8` and `B=64`, a preset ramp, Euclidean-sensor control, and optimizer-aware control on stationary regression, an abrupt target change, and a small matrix-heavy model. It also includes ungated AdamW controls. The paired local continuations use independent model and optimizer clones so calibration cannot change the main training path. All policies use the same per-step training sample prefix. The loss, controller decisions, sensor values, mean SNRAdamW gate, probe cost, and local efficiency measurements are recorded in the compressed JSONL file.
+
+**Loss against three budgets.** Fixed `B=64` advances farther per optimizer step, while `B=8` uses examples more efficiently. Neither adaptive sensor improves the loss frontier in this three-seed run. The ungated AdamW baseline learns far faster than this SNRMuon setup on the matrix task, so that task does not establish a benefit for Muon-based control.
+
+![Batch-control validation loss versus steps, examples, and training time](benchmarks/benchmark_batch_control_frontiers.png)
+
+**Controller behavior and cost.** Both controllers stay at `B=8` on stationary and shifted regression. The Muon-aware controller briefly chooses `B=16` on the matrix task, while Euclidean control stays at `B=8`. Probing every five steps accounts for roughly 30% of the measured training time in this tiny CPU workload. These are raw, uncalibrated sensor values; the controller's smoothing and deadband decide actual changes.
+
+![Batch sizes, sensor values, and probe overhead](benchmarks/benchmark_batch_control_diagnostics.png)
+
+**Measured local batch range.** Four-step continuations at each candidate batch show the per-step and per-example trade-off from a shared mid-run checkpoint. The right panels compare raw noise scales with the smallest batch reaching 80% of the best measured per-step gain. The shift task's measured knee lies above both raw sensor values, while the Muon sensor sometimes overpredicts the matrix task's measured knee. Three seeds and four continuation steps make this a diagnostic, not a calibrated critical-batch estimate.
+
+![Local batch-efficiency curves and raw-sensor calibration](benchmarks/benchmark_batch_control_calibration.png)
+
+**Gate coupling.** Mean SNRAdamW gate values differ across batch policies; changing the actual batch also changes finite-dataset alpha and the gating trajectory. This is a confound to measure when testing a batch controller on gated optimizers.
+
+![Mean SNRAdamW gate across policies](benchmarks/benchmark_batch_control_gates.png)
+
+**Output:** `benchmarks/benchmark_batch_control_{frontiers,diagnostics,calibration,gates}.png` and `benchmarks/benchmark_batch_control.jsonl.gz`.
 
 ## Diagnostics
 

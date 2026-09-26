@@ -44,9 +44,9 @@ size, and pass it to `SNRAdamW.step(batch_size=actual_size)` when using finite
 alpha. The target multiplier is an empirical calibration parameter. With no
 local batch-efficiency calibration, the initial value of 1 is illustrative.
 
-Run `python benchmark_batch_control.py --steps 80 --seeds 3 --output batch-control.jsonl`
+Run `python benchmark_batch_control.py --steps 80 --seeds 3 --output batch-control.jsonl.gz`
 for paired synthetic stationary, shifted, and matrix-heavy comparisons. The
-JSONL records validation loss against steps, examples, and elapsed training
+compressed JSONL records validation loss against steps, examples, and elapsed training
 time, probe overhead, gate mean where available, and local batch-efficiency
 continuations from a shared mid-run checkpoint. `--sample-budget` caps consumed
 training examples; `--coupled-lr` enables a separate square-root LR coupling
@@ -54,3 +54,9 @@ run to compare against the predetermined ramp under the same budget. Probe
 examples and their cost are recorded separately from training examples. The
 small synthetic study is a starting diagnostic; assess calibration and
 cross-seed frontiers before interpreting policy gains.
+
+`python plot_batch_control.py benchmarks/benchmark_batch_control.jsonl.gz` renders
+the same three views as the other benchmarks: validation loss against steps,
+samples, and measured training time; controller batch trajectories and probe
+cost; and paired local-continuation efficiency alongside the raw sensor scales.
+The plots expose both the chosen policy and the limits of its calibration.
