@@ -1002,6 +1002,67 @@ python plot_batch_control_failure_modes.py
 python plot_batch_control_failure_modes.py --partial
 ```
 
+### Held-out checkpoint test of budget-aware batch decisions
+
+`benchmark_batch_budget.py` tests whether the corrected sensors **predict** a
+useful batch outside the fixed-small trajectory. For each of five evaluation
+digit splits (seeds 2–6), it saves pre- and post-shift checkpoints from fixed
+`B=4`, `16`, and `64` training. At every checkpoint it measures the corrected
+eight-split probe on 64 examples, then makes three independently paired,
+eight-step continuations at `B=4,8,16,32,64` from identical model and optimizer
+states. The same candidate draw prefix is used within each repetition. A
+five-nearest-neighbor calibration fitted **only on seeds 0–1** predicts the
+batch with highest gain per processed example or CPU second. Its Euclidean and
+optimizer-aware versions are compared with the best constant batch selected
+on the development seeds. The shift phase is never passed to the predictor.
+
+The example objective charges the adaptive policy for its 64 probe examples
+amortized over 20 training steps; the time objective likewise charges measured
+probe CPU time. The constant comparator incurs neither charge. The local
+oracle chooses the best no-probe candidate separately at each held-out
+checkpoint and is an unattainable lower bound on decision regret. A separate
+no-probe counterfactual isolates sensor prediction from probe cost.
+
+Mean regret to this local oracle across 30 held-out checkpoints per optimizer
+(lower is better; cross-entropy reduction per resource unit):
+
+| Optimizer / resource | Constant | Euclidean | Aware |
+| --- | ---: | ---: | ---: |
+| SNRMuon / example, charged | 0.000517 | 0.002450 | 0.002388 |
+| SNRMuon / example, probes free | 0.000517 | 0.000699 | 0.000638 |
+| SNRMuon / CPU second, charged | 0.310 | 5.999 | 5.999 |
+| SNRMuon / CPU second, probes free | 0.310 | 0.310 | 0.358 |
+| AdamW / example, charged | 0.000661 | 0.002343 | 0.002240 |
+| AdamW / example, probes free | 0.000661 | 0.000661 | 0.000661 |
+| AdamW / CPU second, charged | 1.033 | 16.761 | 16.769 |
+| AdamW / CPU second, probes free | 1.033 | 1.121 | 1.033 |
+
+![Held-out budget-aware batch-choice regret](benchmarks/benchmark_batch_budget.png)
+
+The fitted example-budget policy sometimes chooses larger batches but does
+not outperform fixed `B=4`; with no probe charge, its small remaining
+differences do not show an optimizer-specific advantage. The CPU-time
+calibration largely chooses the same batch as the constant policy (`B=64`
+for SNRMuon, usually `B=32` for AdamW), so its large charged regret is mainly
+the cost of probing, not wrong batch choices. These are *offline decisions*,
+not an end-to-end rollout: changing a batch changes future checkpoints.
+The short-horizon local oracle can itself be noisy, and CPU times need not
+transfer to GPU. The earlier five evaluation seeds have already been examined
+in this PR, so the outcome is exploratory rather than a fresh confirmation.
+
+Run from a checkout with the development dependencies installed:
+
+```bash
+python benchmark_batch_budget.py --output benchmarks/benchmark_batch_budget.json.gz
+python plot_batch_budget.py benchmarks/benchmark_batch_budget.json.gz benchmarks/benchmark_batch_budget.png
+```
+
+The JSON includes every repetition, aggregated candidate curves, and held-out
+decisions. The fitting rule scores each feasible candidate directly under a
+specified example or time budget; it does not map a raw noise scale to a batch
+with a fixed multiplier. With the present measurements, there is no evidence
+to justify rolling that fitted rule into the live controller.
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):
