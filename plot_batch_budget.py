@@ -21,6 +21,8 @@ def plot(records, output):
                     subset = [p for p in records if p["optimizer"] == optimizer and
                               p["objective"] == objective and p["sensor"] == sensor and
                               p["shifted"] == shifted]
+                    if not subset:
+                        continue
                     # Average source checkpoints within a seed before showing
                     # dispersion across independent held-out digit splits.
                     seeds = sorted({p["seed"] for p in subset})
