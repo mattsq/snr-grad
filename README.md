@@ -1063,6 +1063,93 @@ specified example or time budget; it does not map a raw noise scale to a batch
 with a fixed multiplier. With the present measurements, there is no evidence
 to justify rolling that fitted rule into the live controller.
 
+### On-policy rollout and generalization check
+
+`benchmark_batch_rollout.py` freezes the development-only calibration above,
+then actually applies the predicted batch at the next step. Seeds 11–15 have
+shared, example-indexed training draws across policies. The complete study
+has two optimizers and four tasks: stationary digits, the +3 label shift,
+90-degree rotation of digit images with unchanged labels, and a separate
+shifted-target matrix regression problem. Each run stops at **3,000 training
+examples**, with any batch crossing the change at 1,500 shortened. All
+adaptive policies start at `B=4`; their 64-example, eight-split probes run
+every 20 steps. Training plus probe CPU time and processed probe examples are
+recorded separately from validation work. The comparison includes every
+fixed size `B=4,8,16,32,64`, the development-selected fast fixed size, and
+Euclidean and optimizer-aware policies for both explicit cost objectives.
+
+An initial run was excluded after an audit found that adaptive policies had
+started at the fast fixed size instead of `B=4`. The 400-policy corrected run
+was repeated with all arms interleaved in randomized order. A post-hoc
+no-probe `20 steps at B=4 → fast fixed size` control adds 40 trajectories.
+The initial outcomes exposed seeds 11–15 before this correction, so the
+corrected comparisons remain exploratory rather than independent confirmation.
+
+Mean final validation loss across five seeds (CE for digits, MSE for matrix):
+
+| Task / optimizer | Best fixed size, loss¹ | Euclidean / example | Aware / example | Aware / time |
+| --- | ---: | ---: | ---: | ---: |
+| Stationary / SNRMuon | B=8, 0.179 | 0.205 | 0.177 | 0.282 |
+| Shift / SNRMuon | B=4, 0.199 | 0.220 | 0.258 | 1.075 |
+| Rotation / SNRMuon | B=4, 0.249 | 0.277 | 0.284 | 0.973 |
+| Matrix shift / SNRMuon | B=8, 0.159 | 0.182 | 0.169 | 4.461 |
+| Stationary / AdamW | B=4, 0.184 | 0.179 | 0.185 | 0.297 |
+| Shift / AdamW | B=4, 0.203 | 0.222 | 0.231 | 0.748 |
+| Rotation / AdamW | B=4, 0.258 | 0.238 | 0.264 | 0.718 |
+| Matrix shift / AdamW | B=4, 0.177 | 0.183 | 0.177 | 4.001 |
+
+¹ The best fixed size is identified **after** looking at these results. It
+describes the fixed-batch frontier, not a deployable task-selection policy.
+The full summary includes all fixed sizes, the preset warmup and both time
+policies, every seed, total examples including probes, and elapsed CPU time.
+
+The small stationary SNRMuon mean advantage over fixed `B=8` is −0.0017 CE,
+with a paired standard deviation of 0.0275, while taking roughly 1.35 versus
+0.86 CPU seconds and processing another 1,203 probe examples on average.
+Under the +3 label shift, aware SNRMuon is worse than fixed `B=4` in **all
+five** new splits (paired mean +0.0598 CE); on rotated images it is worse in
+four of five. On the separate matrix regression task it does not exceed the
+fixed `B=8` sample endpoint. AdamW-aware example control has no consistent
+advantage over Euclidean control. Some aware time policies improve on the
+preset warmup's final loss, but their results are generally matched or
+bettered at comparable time by a fixed intermediate batch. Per-seed dominance
+against the fixed and warmup controls, and the complete paths, are in the
+summary and figures.
+
+![Stationary digits: examples and CPU-time frontiers](benchmarks/benchmark_batch_rollout_digits.png)
+
+![Full label shift: examples and CPU-time frontiers](benchmarks/benchmark_batch_rollout_digits_shift.png)
+
+![Image rotation: examples and CPU-time frontiers](benchmarks/benchmark_batch_rollout_digits_rotate.png)
+
+![Matrix regression shift: examples and CPU-time frontiers](benchmarks/benchmark_batch_rollout_matrix_shift.png)
+
+The time panels align each seed only over the time all policies reached; before
+the change point they evaluate against the **final** regime, so early losses
+are intentionally high for policies still training on the original labels.
+CPU timings of the post-hoc warmup schedule were obtained in a separate pass.
+These tasks remain small CPU workloads with fixed learning rates, and the
+digits variants share one underlying dataset. They cannot settle whether
+an optimizer-aware controller helps on a model and GPU where larger batches
+improve hardware throughput. On these workloads the present policy has no
+reliable loss/resource frontier advantage.
+
+The exact corrected per-step records are stored as seven parts in
+`benchmarks/benchmark_batch_rollout_parts/`, with an archive digest checked
+by `plot_batch_rollout.py`. The no-probe warmup records and per-seed summary
+are separate. To regenerate the complete study and figures locally:
+
+```bash
+python benchmark_batch_rollout.py --output benchmarks/benchmark_batch_rollout_corrected.jsonl.gz
+python benchmark_batch_rollout.py --policies warmup_time --output benchmarks/benchmark_batch_rollout_warmup.jsonl.gz
+python plot_batch_rollout.py benchmarks/benchmark_batch_rollout_corrected.jsonl.gz benchmarks/benchmark_batch_rollout_warmup.jsonl.gz
+```
+
+To redraw from the committed observations, replace the first plot input with
+`benchmarks/benchmark_batch_rollout_parts`. The experiment specification and
+excluded-first-pass explanation are in
+`docs/proposals/batch-control-on-policy-study.md`.
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):
