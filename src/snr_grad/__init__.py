@@ -37,7 +37,17 @@ from snr_grad.variance import (
     tree_batch_size,
     tree_split,
 )
-from snr_grad.batch_control import BatchController, BatchDecision, BatchProbe, NoiseScale, probe_batch
+from snr_grad.batch_control import (
+    BatchController,
+    BatchDecision,
+    BatchProbe,
+    CostAwareBatchController,
+    GradientNoiseAccumulator,
+    NoiseScale,
+    StepTimeModel,
+    coupled_lr,
+    probe_batch,
+)
 
 __all__ = [
     "AlphaSpec",
@@ -67,5 +77,6 @@ __all__ = [
     "compare_gate_with_external_variance",
     "tree_batch_size",
     "tree_split",
-    "BatchController", "BatchDecision", "BatchProbe", "NoiseScale", "probe_batch",
+    "BatchController", "BatchDecision", "BatchProbe", "CostAwareBatchController",
+    "GradientNoiseAccumulator", "NoiseScale", "StepTimeModel", "coupled_lr", "probe_batch",
 ]

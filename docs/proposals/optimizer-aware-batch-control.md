@@ -1,5 +1,10 @@
 # Proposal: optimizer-aware batch control
 
+> **Status.** The CPU experiments described here are complete and negative.
+> [`../batch-control-cpu-results.md`](../batch-control-cpu-results.md) reviews
+> why their design could not show a benefit. The follow-up accelerator study
+> is [`batch-control-gpu-study.md`](batch-control-gpu-study.md).
+
 ## Question
 
 Can the gradient statistics already used by `snr-grad` tell us when another sample is worth its cost? The existing gates decide which **update directions** to trust. This experiment adds a separate decision about **how many samples** to use for the next update. It should not equate the mean coordinate gate value with a critical batch size.
@@ -69,7 +74,7 @@ The plots expose both the chosen policy and the limits of its calibration.
 
 ## Held-out validation and outcome
 
-`README.md` gives the exact digit benchmark and probe-resolution commands,
+`docs/batch-control-cpu-results.md` gives the exact digit benchmark and probe-resolution commands,
 figures, and cross-seed results. This follow-up uses real handwritten digit
 images with a held-out validation partition, a 1,500-example synthetic label
 permutation, five held-out seeds, a 3,000-training-example cap, and fixed
@@ -102,7 +107,7 @@ controls at matched example and wall-time budgets.
 
 ## Failure-mode follow-up
 
-The follow-up in `README.md` and `benchmark_batch_local_replication.py`
+The follow-up in `docs/batch-control-cpu-results.md` and `benchmark_batch_local_replication.py`
 separates three possible explanations for the first result. Eight paired
 12-step continuations at each of two checkpoints and five seeds show that
 larger batches reliably improve **gain per step**, whereas `B=4` or `B=8`
@@ -137,7 +142,7 @@ confirmatory inference. The figures `benchmark_batch_control_failure_modes.png`,
 controller paths, and the competing local efficiency objectives.
 
 The corrected row-covariance implementation and a separate probe-cost-guard
-ablation are reported in the README. Earlier raw Muon scales and policies
+ablation are reported in `docs/batch-control-cpu-results.md`. Earlier raw Muon scales and policies
 derived from them are superseded; their figures remain historical records of
 the erroneous flattening. The permissive AdamW-aware controller chooses
 larger batches but fares badly after the label change. On this CPU, the
