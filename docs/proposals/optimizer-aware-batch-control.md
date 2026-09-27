@@ -33,7 +33,8 @@ Related work: [Naganuma et al., *Adaptive Batch Sizes Using Non-Euclidean Gradie
 `snr_grad.batch_control.probe_batch` takes equal, disjoint microbatches and returns
 per-example Euclidean, frozen AdamW, and nuclear-norm matrix noise scales, with
 a separate L1 fallback for nonmatrix Muon parameters. The nuclear sensor uses
-the singular values of the centered subbatch gradient matrix to compute
+the singular values of centered matrix residuals concatenated along their
+columns to estimate the square root of the row covariance and compute
 `(tr(C_row**0.5) / ||mean_gradient||_*)**2`; it never reads the SVD gates.
 The probe does not change parameter gradients or optimizer state. Training
 BatchNorm and Dropout are rejected because they confound the variance estimate.
@@ -134,6 +135,16 @@ confirmatory inference. The figures `benchmark_batch_control_failure_modes.png`,
 `benchmark_batch_control_partial_shift.png`, and
 `benchmark_batch_local_replication.png` show sample-aligned losses,
 controller paths, and the competing local efficiency objectives.
+
+The corrected row-covariance implementation and a separate probe-cost-guard
+ablation are reported in the README. Earlier raw Muon scales and policies
+derived from them are superseded; their figures remain historical records of
+the erroneous flattening. The permissive AdamW-aware controller chooses
+larger batches but fares badly after the label change. On this CPU, the
+probe-time guard often holds AdamW at its initial size. An exploratory sweep
+of the corrected Muon multiplier improves shifted sample efficiency as it
+shrinks, reaching the fixed-small result only when the controller never
+leaves that initial batch.
 
 The viable next question is whether optimizer-specific geometry predicts
 **throughput-adjusted** local improvement on a larger model and device,

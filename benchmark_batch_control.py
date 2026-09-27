@@ -98,7 +98,7 @@ def gate_mean(optimizer):
 def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
         coupled_lr=False, curve=False, probe_size=64, probe_splits=8,
         target_multiplier=1., continuation_steps=4, calibration_points="mid",
-        reference_batch=None):
+        reference_batch=None, max_probe_fraction=15.):
     train, validation = data(seed, task)
     model = build_model(seed, task)
     optimizer = optimizer_for(model, kind, lr, len(train[0]))
@@ -106,7 +106,7 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
     sensor = "euclidean" if policy == "euclidean" else ("muon" if kind == "snr_muon" else "adamw")
     controller = BatchController(sizes, initial=sizes[0], sensor=sensor,
                                  warmup=2, dwell=3, target_multiplier=target_multiplier,
-                                 max_probe_fraction=15.) if policy in ("euclidean", "aware", "aware_shift_reset", "aware_alarm") else None
+                                 max_probe_fraction=max_probe_fraction) if policy in ("euclidean", "aware", "aware_shift_reset", "aware_alarm") else None
     probe_rng = torch.Generator().manual_seed(seed + 40000)
     consumed = 0
     shifting = task in ("shift", "digits_shift", "digits_partial_shift")
@@ -158,14 +158,14 @@ def run(seed, task, kind, policy, *, sizes, steps, lr, probe_every, budget,
                 last_alarm = step
                 controller = BatchController(sizes, initial=sizes[0], sensor=sensor,
                                              warmup=2, dwell=3, target_multiplier=target_multiplier,
-                                             max_probe_fraction=15.)
+                                             max_probe_fraction=max_probe_fraction)
             loss_ema = observed_loss if loss_ema is None else .95 * loss_ema + .05 * observed_loss
         if policy == "aware_shift_reset" and shifting and consumed - B < shift_at <= consumed:
             # Diagnostic with oracle change-point knowledge: isolate slow
             # controller response from the sensor's intrinsic usefulness.
             controller = BatchController(sizes, initial=sizes[0], sensor=sensor,
                                          warmup=2, dwell=3, target_multiplier=target_multiplier,
-                                         max_probe_fraction=15.)
+                                         max_probe_fraction=max_probe_fraction)
         # The next probe and local continuations evaluate the post-step task.
         probe_target = train[2] if shifting and consumed >= shift_at else train[1]
         probe = None
@@ -245,10 +245,14 @@ def main():
     parser.add_argument("--probe-size", type=int, default=64)
     parser.add_argument("--probe-splits", type=int, default=8)
     parser.add_argument("--target-multiplier", type=float, default=1.)
+    parser.add_argument("--max-probe-fraction", type=float, default=15.,
+                        help="Reject probes slower than this multiple of the preceding training step")
     parser.add_argument("--continuation-steps", type=int, default=4)
     parser.add_argument("--calibration-points", choices=("mid", "quarters"), default="mid")
     parser.add_argument("--tasks", nargs="+", choices=("stationary", "shift", "matrix", "digits", "digits_shift", "digits_partial_shift"),
                         default=("stationary", "shift", "matrix"))
+    parser.add_argument("--optimizers", nargs="+", choices=("snr_adamw", "snr_muon", "adamw"),
+                        help="Restrict the task's compatible optimizers for a focused ablation")
     parser.add_argument("--policies", nargs="+", choices=("fixed_small", "fixed_mid", "fixed_reference", "fixed_large", "ramp", "euclidean", "aware", "shift_reset", "aware_shift_reset", "aware_alarm"),
                         default=("fixed_small", "fixed_reference", "fixed_large", "ramp", "euclidean", "aware"))
     parser.add_argument("--lr", type=float, default=.003)
@@ -259,12 +263,22 @@ def main():
     parser.add_argument("--coupled-lr", action="store_true")
     parser.add_argument("--output", default="batch-control.jsonl")
     args = parser.parse_args()
-    if args.probe_every < 1 or args.steps < 2 or args.seeds < 1 or args.continuation_steps < 1 or args.probe_size < args.probe_splits * 2 or args.probe_size % args.probe_splits or (args.reference_batch is not None and args.reference_batch not in args.sizes):
-        parser.error("steps, seeds and probe-every must be positive")
+    if (args.probe_every < 1 or args.steps < 2 or args.seeds < 1 or args.continuation_steps < 1
+            or args.probe_splits < 2 or args.probe_size < args.probe_splits * 2
+            or args.probe_size % args.probe_splits or args.max_probe_fraction <= 0
+            or not args.sizes or sorted(set(args.sizes)) != args.sizes or args.sizes[0] < 1
+            or (args.reference_batch is not None and args.reference_batch not in args.sizes)):
+        parser.error("invalid steps, sizes, probe resolution, or reference batch")
+    if args.sample_budget is not None and args.sample_budget < 1:
+        parser.error("sample budget must be positive")
     opener = gzip.open if args.output.endswith(".gz") else open
     with opener(args.output, "wt", encoding="utf8") as output:
         for task in args.tasks:
-            for kind in (("snr_muon", "adamw") if task in ("matrix", "digits", "digits_shift", "digits_partial_shift") else ("snr_adamw", "adamw")):
+            compatible = (("snr_muon", "adamw") if task in ("matrix", "digits", "digits_shift", "digits_partial_shift")
+                          else ("snr_adamw", "adamw"))
+            for kind in compatible:
+                if args.optimizers is not None and kind not in args.optimizers:
+                    continue
                 kind_lr = {"snr_muon": args.muon_lr, "snr_adamw": args.snr_adamw_lr,
                            "adamw": args.adamw_lr}[kind]
                 kind_lr = args.lr if kind_lr is None else kind_lr
@@ -275,12 +289,13 @@ def main():
                                    coupled_lr=args.coupled_lr, curve=policy == "fixed_small",
                                    probe_size=args.probe_size, probe_splits=args.probe_splits,
                                    target_multiplier=args.target_multiplier,
+                                   max_probe_fraction=args.max_probe_fraction,
                                    continuation_steps=args.continuation_steps,
                                    calibration_points=args.calibration_points,
                                    reference_batch=args.reference_batch)
                         for row in rows:
                             output.write(json.dumps(row) + "\n")
-                        print(task, kind, seed, policy, rows[-1].get("validation"))
+                        print(task, kind, seed, policy, rows[-1].get("validation") if rows else None)
 
 
 if __name__ == "__main__":

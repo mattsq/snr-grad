@@ -5,6 +5,8 @@ optimizer gradients or optimizer state. Call it before the training step, then
 apply the controller's recommendation to the *next* training batch.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import math
 import time
@@ -69,13 +71,16 @@ def _adam_denominator(optimizer: Optional[Optimizer], parameter: Tensor) -> Tens
 
 
 def _nuclear_statistics(grads: Sequence[Tensor], b: int) -> tuple[Tensor, Tensor]:
-    """Nuclear signal and squared trace of the square root of per-example covariance."""
+    """Nuclear signal and squared trace of the square root of row covariance."""
     stack = torch.stack(grads).float()
     mean = stack.mean(0)
     residual = stack - mean
-    # Nonzero singular values of C^(1/2) equal those of the centered K x (m*n)
-    # matrix, scaled by sqrt(b/(K-1)); this avoids an m x m Gram allocation.
-    noise_root = torch.linalg.svdvals(residual.reshape(len(grads), -1)).sum()
+    # C_row = b/(K-1) sum_k R_k R_k^T. Concatenate the centered m x n
+    # residuals along columns; its singular values are those of C_row^1/2
+    # before the scalar factor. Flattening m*n would instead measure the
+    # covariance across microbatches, a different geometry.
+    columns = residual.permute(1, 0, 2).reshape(mean.shape[0], -1)
+    noise_root = torch.linalg.svdvals(columns).sum()
     noise = noise_root.square() * (b / (len(grads) - 1))
     signal = torch.linalg.svdvals(mean).sum().square()
     return signal, noise

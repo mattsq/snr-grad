@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from snr_grad.batch_control import BatchController, BatchProbe, NoiseScale, probe_batch
+from snr_grad.batch_control import BatchController, BatchProbe, NoiseScale, _nuclear_statistics, probe_batch
 
 
 def _loss(model, batch):
@@ -49,6 +49,16 @@ def test_muon_dual_norm_is_rotation_invariant_and_fallback_separate():
     assert p.muon.noise > 0
     assert math.isfinite(p.muon_fallback.noise)
     assert p.muon.signal > 0
+
+
+def test_muon_noise_uses_row_covariance_for_rank_two_residuals():
+    mean = torch.diag(torch.tensor([2., 1.]))
+    residuals = [torch.diag(torch.tensor(pair)) for pair in
+                 ((1., 0.), (-1., 0.), (0., 1.), (0., -1.))]
+    signal, noise = _nuclear_statistics([mean + r for r in residuals], b=1)
+    # C_row = diag(2/3, 2/3), so tr(sqrt(C_row))**2 = 8/3.
+    assert signal.item() == pytest.approx(9.)
+    assert noise.item() == pytest.approx(8 / 3)
 
 
 def _probe(scale, seconds=0.):

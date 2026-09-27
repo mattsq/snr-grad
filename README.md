@@ -854,6 +854,14 @@ Run `python benchmark_batch_control.py --steps 120 --seeds 3 --probe-every 5 --p
 
 ### Held-out handwritten digits and probe resolution
 
+**Reproducibility note (27 September 2026):** The figures and tables immediately
+below were generated before fixing the Muon row-covariance calculation. They
+document the initial experiment but their Muon scale, aware-controller paths,
+and comparisons are superseded by the corrected rerun below. Fixed-batch
+trajectories and local improvement curves do not depend on that sensor. AdamW
+decisions also depend on CPU probe timing; the previous reported AdamW outcomes
+are not stable under a change of execution environment.
+
 The larger experiment uses the real scikit-learn digits images, a held-out validation split, and a `64→128→64→10` classifier. `digits_shift` changes every training and validation label by `+3 mod 10` after 1,500 training examples; the images remain the same. Development seeds 0–1 informed the fixed learning rates (SNRMuon `0.1`, AdamW `0.003`) and the heuristic sensor multiplier `0.2`; the figures below use held-out seeds 2–6. Every policy has a 3,000-training-example cap, while the separate probe examples and CPU probe time are logged. The fixed `B=16` control is a useful practical reference. Run:
 
 ```bash
@@ -881,19 +889,92 @@ The sample axis aligns the label change across policies; the step axis shows eac
 
 ![Digit paired local batch-efficiency curves and sensor scales](benchmarks/benchmark_batch_control_digits_calibration.png)
 
-At a fixed trained checkpoint, the resolution experiment reuses the same 128 digit examples and varies the number of disjoint microbatches. Median raw Muon scale rises from about 143 at eight splits to about 350 at 128 splits, while median probe time rises from about 10 ms to 127 ms. Six of 30 Euclidean scale estimates have no resolved signal and are held by the controller. The 128-split result is still a finite-sample reference, not population truth. The multiplier calibrated with eight splits should not be transferred to another probe resolution without recalibration.
+At a fixed trained checkpoint, the resolution experiment reuses the same 128 digit examples and varies the number of disjoint microbatches. The initial run reported a median raw Muon scale of about 143 at eight splits and 350 at 128 splits; these values used the incorrect flattening. Six of 30 Euclidean scale estimates had no resolved signal. The 128-split result is still a finite-sample reference, not population truth. The multiplier calibrated with eight splits should not be transferred to another probe resolution without recalibration.
 
 ![Noise-scale estimates and probe time as the split count changes](benchmarks/benchmark_batch_probe_resolution.png)
 
-**Output:** `benchmarks/benchmark_batch_control_digits.jsonl.gz`, the three `benchmark_batch_control_digits_*.png` figures, `benchmarks/benchmark_batch_probe_resolution.json`, and its PNG figure.
+**Initial output:** `benchmarks/benchmark_batch_control_digits.jsonl.gz` and the three `benchmark_batch_control_digits_*.png` figures. The probe-resolution JSON and PNG have since been regenerated with the corrected formula.
+
+#### Corrected covariance and probe-cost ablation
+
+The Muon sensor now estimates `C_row = b/(K-1) Σ R_k R_kᵀ` using the singular
+values of the centered matrix gradients concatenated along columns. The
+previous code flattened each matrix, which instead measured variation across
+microbatches. An analytic rank-two test checks the distinction. On the same
+128 digit examples at a fixed checkpoint, the corrected median Muon scale is
+164 with eight splits and 224 with 128 splits (five seeds); median probe time
+in this CPU rerun is 13 and 127 ms respectively. The resolution dependence
+remains, though its old numerical description is invalid.
+
+The corrected digit rerun uses the original learning rates, `0.2` multiplier,
+five seeds, example cap, and probe schedule, with four selected policies. The
+multiplier was selected against the **old** geometry, so these outcomes test
+that frozen choice after a bug fix, rather than a recalibrated sensor. Mean
+final validation cross-entropy:
+
+| Task / optimizer | Fixed B=4 | Fixed B=16 | Euclidean | Aware, guarded |
+| --- | ---: | ---: | ---: | ---: |
+| Digits / SNRMuon | 0.165 | 0.166 | 0.166 | 0.160 |
+| Shift / SNRMuon | 0.199 | 0.336 | 0.225 | 0.244 |
+| Digits / AdamW | 0.197 | 0.185 | 0.197 | 0.228 |
+| Shift / AdamW | 0.255 | 0.474 | 0.243 | 0.292 |
+
+The guarded AdamW result is especially sensitive to execution time: at the
+configured limit of 15 times the preceding training step, `expensive_probe`
+accounts for 167/168 aware decisions on stationary digits and 163/165 after
+the shift. The corresponding Euclidean controller holds for 185/185 and
+183/184 decisions. These paths mostly remain at `B=4`, so they do not validate
+the scale. With the guard set effectively infinite, aware AdamW moves up to
+`B=32` and ends at mean CE 0.184 stationary and **0.863 shifted**; permissive
+Euclidean control ends at 0.168 and 0.276. All five permissive aware shifted
+seeds are worse than their Euclidean counterparts. This guard ablation changes
+the control policy as well as its outcome; CPU wall times are device and load
+dependent, and this permissive setting is diagnostic rather than economical.
+
+![Corrected validation loss versus training examples, steps and time](benchmarks/benchmark_batch_control_corrected_frontiers.png)
+
+![Corrected sensor paths and probe overhead](benchmarks/benchmark_batch_control_corrected_diagnostics.png)
+
+![Corrected local batch efficiency and sensor calibration](benchmarks/benchmark_batch_control_corrected_calibration.png)
+
+![AdamW guard ablation: final loss and batch paths](benchmarks/benchmark_batch_guard_ablation.png)
+
+An exploratory SNRMuon multiplier sweep on the **same** five shifted-digit
+seeds tests sensitivity after correcting the geometry. Multipliers 0.05,
+0.1, 0.2, and 0.4 give mean final CE 0.199, 0.208, 0.244, and 0.375;
+their mean batch sizes are 4.0, 5.0, 9.3, and 12.3. At 0.05 the policy
+never leaves B=4 and reproduces the fixed-small trajectory exactly. A
+smaller multiplier recovers sample efficiency here by behaving increasingly
+like the fixed-small baseline. These seeds have now been inspected repeatedly;
+the sweep is a mechanism check, not independent hyperparameter validation.
+
+![Corrected Muon multiplier sensitivity](benchmarks/benchmark_batch_muon_multiplier.png)
+
+The corrected records and figures are `benchmark_batch_control_corrected.jsonl.gz`,
+`benchmark_batch_control_corrected_*.png`, `benchmark_batch_control_no_guard.jsonl.gz`,
+`benchmark_batch_guard_ablation.png`, `benchmark_batch_muon_multiplier_*.jsonl.gz`,
+`benchmark_batch_muon_multiplier.png`, and `benchmark_batch_probe_resolution.{json,png}`
+in `benchmarks/`. Reproduce the guarded run with the digit command above,
+adding `--policies fixed_small fixed_reference euclidean aware --max-probe-fraction 15`
+and changing `--output` to the corrected filename. For the guard ablation add
+`--optimizers adamw --policies euclidean aware --max-probe-fraction 1000000000`;
+then run `plot_batch_guard_ablation.py` on both JSONL files. Use
+`plot_batch_control.py ... --tasks digits digits_shift --tag corrected_` for
+the three corrected digit figures.
 
 ### Why the digit controller misses the useful batch
+
+The follow-up outcomes below are historical runs made with the old Muon
+sensor; its replicated local **loss gains** are unchanged, but their attached
+probe scales were regenerated with the corrected formula. Controller policy
+outcomes below should be interpreted as mechanism diagnostics, not corrected
+sensor results. The corrected guarded comparison is in the section above.
 
 The original sensor multiplier was fitted to a **per-step** local batch knee, but the held-out comparison capped **training examples**. To separate that objective mismatch from response lag, a follow-up repeats 12-step paired local continuations eight times at each fixed checkpoint and adds fixed `B=8`, a known-change-point `B=16→4` schedule, a controller reset at the known change point, and a reset triggered by a training-loss spike. The last two change-point schedules are diagnostic controls; the known-change-point policies receive privileged timing information. The exploratory loss alarm compares the current training loss with a 0.95 EMA and fires above `max(1, 4 × EMA)`, with an 80-step cooldown. Its threshold was not selected by a separate alarm-validation experiment.
 
 ![Replicated local per-step and per-example gains before and after the label switch](benchmarks/benchmark_batch_local_replication.png)
 
-Across the five post-shift checkpoints, the batch with the greatest **mean per-step** gain is `B=64` or `128` in all five seeds; the batch with the greatest **mean per-example** gain is `B=4` in three seeds and `B=8` in two. The same checkpoints have raw eight-split Muon scale estimates of roughly 36–83. Per-repetition 80%-of-best knees vary widely even at identical parameters, so a single 12-step knee is noisy. The controller's `0.2` multiplier tends to choose `B=8–16`, which improves updates per step but uses some of the limited example budget less efficiently. The shaded region is standard deviation across five independent splits after averaging eight paired draws within each split.
+Across the five post-shift checkpoints, the batch with the greatest **mean per-step** gain is `B=64` or `128` in all five seeds; the batch with the greatest **mean per-example** gain is `B=4` in three seeds and `B=8` in two. The same checkpoints have corrected raw eight-split Muon scale estimates of roughly 43–104. Per-repetition 80%-of-best knees vary widely even at identical parameters, so a single 12-step knee is noisy. The controller's `0.2` multiplier tends to choose `B=8–16`, which improves updates per step but uses some of the limited example budget less efficiently. The shaded region is standard deviation across five independent splits after averaging eight paired draws within each split.
 
 At 3,000 training examples, mean validation cross-entropy across the same five held-out seeds is:
 
