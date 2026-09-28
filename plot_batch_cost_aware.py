@@ -88,37 +88,44 @@ def decision_map(runs, output):
     t1, t0 = np.polyfit(b, [measured[x] for x in b], 1)
     cpu = StepTimeModel({s: t0 + t1 * s for s in sizes})
     accelerator = StepTimeModel({s: max(1., s / 128) for s in sizes})
-    noise = np.geomspace(1, 1e4, 400)
-    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    noise = np.geomspace(1, 1e5, 500)
+    fig, (ax, bars) = plt.subplots(2, 1, figsize=(8, 6.2), sharex=True,
+                                   gridspec_kw=dict(height_ratios=(3, 1.25)))
     style_axes(ax)
+    style_axes(bars)
     curves = [("Price per example only", dict(example_price=1., time_price=0.), BLUE),
-              (f"CPU step time, fitted: {t0 * 1e3:.2f} ms + {t1 * 1e6:.1f} µs × B",
+              (f"CPU step time, fitted to this run: {t0 * 1e3:.2f} ms + {t1 * 1e6:.1f} µs × B",
                dict(step_times=cpu, time_price=1.), ORANGE),
-              ("Accelerator-like step time (illustrative): flat to B=128, then linear",
+              ("Illustrative step time flat to B=128, then linear (target is always the knee)",
                dict(step_times=accelerator, time_price=1.), AQUA)]
     for label, prices, color in curves:
         chosen = [target_batch(n, sizes, **prices) for n in noise]
         ax.step(noise, chosen, where="mid", color=color, lw=2, label=label)
-    scales = defaultdict(list)
-    for (budget, _, optimizer, policy, _), rows in runs.items():
-        if policy.startswith(("example_", "time_")):
-            scales[key_policy(policy)] += [r["noise_scale"] for r in rows
-                                           if r.get("noise_scale") and np.isfinite(r["noise_scale"])]
-    for i, (sensor, values) in enumerate(sorted(scales.items())):
-        lo, hi = np.percentile(values, [10, 90])
-        y = 3.0 + 0.5 * i
-        ax.plot([lo, hi], [y, y], color=STYLE[sensor]["color"], lw=4, solid_capstyle="round")
-        ax.text(hi * 1.15, y, f"{LABEL[sensor].split(', ')[1]} scales measured (10–90%)",
-                va="center", fontsize=7.5, color=MUTED)
-    ax.set_xscale("log")
     ax.set_yscale("log", base=2)
     ax.set_yticks(sizes)
     ax.set_yticklabels([str(s) for s in sizes])
-    ax.set_ylim(2.6, 700)
-    ax.set_xlabel("Gradient noise scale B_noise (per-example units)")
+    ax.set_ylim(3.2, 700)
     ax.set_ylabel("Batch the controller moves toward")
-    ax.set_title("Cost-aware target batch: argmax  [B / (B + B_noise)] / cost(B)", fontsize=10)
+    ax.set_title("Cost-aware target batch: argmax over B of [B / (B + B_noise)] / cost(B)", fontsize=10)
     ax.legend(fontsize=7.5, frameon=False, loc="upper left")
+    scales = defaultdict(list)
+    for (budget, _, optimizer, policy, _), rows in runs.items():
+        if policy.startswith(("example_", "time_")):
+            scales[optimizer, key_policy(policy)] += [
+                r["noise_scale"] for r in rows if r.get("noise_scale") and np.isfinite(r["noise_scale"])]
+    order = [(o, s) for o in ("snr_muon", "adamw") for s in ("euclidean", "aware")]
+    for i, (optimizer, sensor) in enumerate(order):
+        values = scales[optimizer, sensor]
+        lo, mid, hi = np.percentile(values, [10, 50, 90])
+        bars.plot([lo, hi], [i, i], color=STYLE[sensor]["color"], lw=5, solid_capstyle="round")
+        bars.plot([mid], [i], "o", ms=8, color=STYLE[sensor]["color"], mec="white", mew=2)
+    bars.set_yticks(range(len(order)))
+    bars.set_yticklabels([f"{OPT_LABEL[o]}, {'Euclidean' if s == 'euclidean' else 'optimizer-aware'}"
+                          for o, s in order], fontsize=8)
+    bars.set_ylim(len(order) - .5, -.5)
+    bars.set_xscale("log")
+    bars.set_xlabel("Gradient noise scale B_noise (per-example units)")
+    bars.set_title("Smoothed noise scales the controllers measured (10–90%, dot = median)", fontsize=9)
     fig.tight_layout()
     fig.savefig(output, dpi=150)
     plt.close(fig)
@@ -147,10 +154,16 @@ def example_panel(ax, runs, old_summary, include_old, title):
             ax.scatter(diffs, [y] * len(diffs), s=10, color=STYLE[policy]["color"], alpha=.45, lw=0)
             ax.plot([np.mean(diffs)] * 2, [y - .1, y + .1], color=STYLE[policy]["color"], lw=2.5)
     ax.axvline(0, color=MUTED, lw=1)
+    # A few fixed-batch failures reach +2.5; symlog keeps small gaps readable.
+    ax.set_xscale("symlog", linthresh=.05)
+    ax.set_xlim(-.3, 3)
+    ticks = [-.1, 0, .05, .1, .5, 1, 2]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"{t:g}" for t in ticks])
     ax.set_yticks(range(len(pairs)))
     ax.set_yticklabels([f"{TASK_LABEL[t]} / {OPT_LABEL[o]}" for t, o in pairs], fontsize=8)
     ax.invert_yaxis()
-    ax.set_xlabel("Final loss minus fixed B=4 (dots: seeds, bar: mean)")
+    ax.set_xlabel("Final loss minus fixed B=4 (symlog; dots: seeds, bar: mean)")
     ax.set_title(title, fontsize=9.5)
     return policies
 
@@ -179,8 +192,9 @@ def path_panel(ax, runs):
             grid = np.linspace(0, 3000, 100)
             mean = np.exp(np.mean([np.interp(grid, [x["samples"] for x in r],
                                              np.log([x["actual_batch"] for x in r])) for r in paths], axis=0))
+            name = "Euclidean" if sensor == "euclidean" else "Optimizer-aware"
             ax.plot(grid, mean, color=STYLE[sensor]["color"], ls=ls, lw=2,
-                    label=f"{LABEL[sensor].split(', ')[1]}, price per {'example' if budget == 'examples' else 'second'}")
+                    label=f"{name}, price per {'example' if budget == 'examples' else 'CPU second'}")
     ax.set_yscale("log", base=2)
     ax.set_yticks([4, 8, 16, 32, 64])
     ax.set_yticklabels(["4", "8", "16", "32", "64"])

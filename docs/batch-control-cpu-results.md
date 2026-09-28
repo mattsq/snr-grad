@@ -56,6 +56,82 @@ calibration, which is the correct behavior in the setting below.
 that these pieces enable is specified in
 [`proposals/batch-control-gpu-study.md`](proposals/batch-control-gpu-study.md).
 
+## CPU check of the fixes
+
+`benchmark_batch_cost_aware.py` reruns the four on-policy tasks with seeds
+11–15. It uses the free accumulation probe (four microbatches on every fifth
+step) and `CostAwareBatchController`, starting every controller at `B=16` so
+that its decisions are visible. It uses the same example-indexed draws as the
+earlier rollout: fixed `B=4` reproduces that study's losses exactly. Each
+objective is scored at its own endpoint:
+
+- **Example-priced controllers** train to the 3,000-example cap.
+- **CPU-time-priced controllers** train for 0.5 CPU seconds on stationary
+  digits. Their clock includes a timing pass at the start, the probe overhead
+  and the decisions.
+
+The seeds were already inspected in the earlier study, so this is a
+mechanism check, not a new test of the method. To reproduce it:
+
+```bash
+python benchmark_batch_cost_aware.py --lr-rule none
+python benchmark_batch_cost_aware.py --lr-rule sqrt --output benchmarks/benchmark_batch_cost_aware_sqrt.jsonl.gz
+python plot_batch_cost_aware.py
+```
+
+![Cost-aware controller: example-priced and time-priced CPU results](../benchmarks/benchmark_batch_cost_aware.png)
+
+Mean final validation loss (5 seeds) at the example cap, fixed learning rate:
+
+| Task / optimizer | Fixed B=4 | Fixed B=16 | Cost-aware Euclidean | Cost-aware optimizer-aware | Earlier calibrated aware |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Digits / SNRMuon | 0.189 | 0.185 | 0.187 | 0.191 | 0.177 |
+| Label shift / SNRMuon | 0.198 | 0.357 | 0.213 | 0.207 | 0.258 |
+| Rotation / SNRMuon | 0.249 | 0.368 | 0.248 | 0.248 | 0.284 |
+| Matrix shift / SNRMuon | 0.163 | 0.180 | 0.162 | 0.163 | 0.169 |
+| Digits / AdamW | 0.184 | 0.216 | 0.194 | 0.201 | 0.185 |
+| Label shift / AdamW | 0.203 | 0.551 | 0.224 | 0.432 | 0.231 |
+| Rotation / AdamW | 0.258 | 0.499 | 0.280 | 0.379 | 0.264 |
+| Matrix shift / AdamW | 0.177 | 1.003 | 0.175 | 0.175 | 0.177 |
+
+**What this shows:**
+
+- **Under a price per example, the controllers now do what that price
+  requires.** From `B=16` they fall toward the smallest batch, and they spend
+  no examples on probing. The earlier controller spent 1,024–2,368 extra
+  probe examples per run. With SNRMuon, both sensors end within 0.015 CE of
+  fixed `B=4` on every task. Optimizer-aware SNRMuon improves on the earlier
+  calibrated controller after the label shift in all five seeds (0.207 against
+  0.258).
+- **Optimizer-aware AdamW does not.** It is 0.23 CE worse than fixed `B=4`
+  after the label shift. Its frozen-Adam noise scale ranges from about 10 to
+  10⁶ (see the decision map below), because coordinates with tiny second
+  moments dominate that geometry. Under an example price the rule's
+  efficiency is proportional to `1 / (B + B_noise)`. With a scale that large,
+  `B=4`, `8` and `16` look almost equally efficient, and the 5% deadband holds
+  the controller near `B=6`.
+- **The progress law assumes a learning rate matched to the batch.** At a
+  fixed learning rate, a smaller batch also takes more steps of the same size,
+  which the law does not model. This is why fixed `B=4` wins by more than the
+  measured noise scales predict. With square-root coupling (middle panel),
+  fixed `B=4` loses much of that advantage: 0.283 against 0.198 after the
+  label shift with SNRMuon.
+- **Under a price per CPU second, both controllers climb to `B=64`**, the top
+  of the grid. They reach lower loss than fixed `B=4` or `B=16`, but lose to
+  fixed `B=64` in every seed. SNRMuon reaches 0.16 CE against 0.13; AdamW
+  reaches 0.15–0.16 against 0.12. They start at `B=16`, pay for the timing pass
+  and the probes, and move one rung at a time. On this CPU the fitted
+  step-time model sends every measured Euclidean scale to at least `B=64`, so
+  the only correct decision is the largest batch, which a fixed policy gets
+  for free.
+
+![Cost-aware target batch as a function of noise scale, with measured scales](../benchmarks/benchmark_batch_cost_aware_decisions.png)
+
+The decision map also shows why an accelerator run must measure its step
+times. If step time is flat up to a hard throughput limit and then linear,
+the target is always that limit, whatever the noise scale. The sensor matters
+only where cost rises smoothly with the batch, as on the CPU curve here.
+
 ## First synthetic run: `benchmark_batch_control.py`
 
 Run `python benchmark_batch_control.py --steps 120 --seeds 3 --probe-every 5 --probe-size 64 --probe-splits 8 --sizes 8 16 32 64 --reference-batch 16 --output benchmarks/benchmark_batch_control.jsonl.gz`, then `python plot_batch_control.py benchmarks/benchmark_batch_control.jsonl.gz`. The synthetic run compares fixed `B=8`, `16`, and `64`, a preset ramp, Euclidean-sensor control, and optimizer-aware control on stationary regression, an abrupt target change, and a small matrix-heavy model. It includes ungated AdamW controls. The paired local continuations use independent model and optimizer clones so calibration cannot change the main training path. Each policy starts from the same seed and uses the same per-step draw prefix. Loss, controller decisions, sensors, mean SNRAdamW gate, probe cost, and local efficiency are recorded in compressed JSONL.

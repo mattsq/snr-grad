@@ -870,7 +870,13 @@ accelerator whose step time is flat until it saturates.
 they capped training examples, which makes the smallest batch optimal, spent
 extra examples on probes, and ran where step time is mostly fixed overhead.
 The full record and a review of those design errors are in
-[`docs/batch-control-cpu-results.md`](docs/batch-control-cpu-results.md). The
+[`docs/batch-control-cpu-results.md`](docs/batch-control-cpu-results.md). A CPU rerun with the free probe and
+the cost-aware controller behaves as its price requires. Under a price per
+example it moves to the smallest batch without spending probe examples, and
+with SNRMuon it matches fixed `B=4` within 0.015 cross-entropy. Two problems
+remain. The frozen-AdamW noise scale is too large to separate small batches.
+Under a price per CPU second, fixed `B=64` still wins, because the largest
+batch is always right on that CPU. The
 accelerator study that tests the idea in a setting where it could help is
 specified in
 [`docs/proposals/batch-control-gpu-study.md`](docs/proposals/batch-control-gpu-study.md),
