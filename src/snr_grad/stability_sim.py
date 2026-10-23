@@ -37,6 +37,7 @@ from snr_grad.stability import ExcursionReport, StabilityProbe, detect_excursion
 __all__ = [
     "SimulationNoise",
     "GaussianProbeNoise",
+    "ResampledProbeNoise",
     "CovarianceFactorNoise",
     "SimulationDistribution",
     "QuadraticStabilitySimulator",
@@ -151,6 +152,60 @@ class GaussianProbeNoise(_ScaledNoise):
         return self._scale(loss_ratio, generator) * self._coef * (z @ self.deviations)
 
 
+class ResampledProbeNoise(_ScaledNoise):
+    """Non-Gaussian noise that resamples the observed microbatch deviations.
+
+    Gaussian noise with the right covariance can badly understate tail risk when
+    the real gradient noise is heavy-tailed (e.g. products of Gaussians in random
+    feature models). This model keeps the empirical shape: a sample is
+
+        sqrt(K/(K-1)) * sqrt(b / (B m)) * sum_{j=1..m} s_j d_{k_j},   m = max(1, round(B/b))
+
+    with ``k_j`` drawn uniformly with replacement from the ``K`` deviations
+    ``d_k = g_k - g_bar`` and ``s_j = 1`` (or random signs if ``sign_flip``). Its
+    covariance is ``Sigma_hat / B`` like :class:`GaussianProbeNoise`; when ``B == b``
+    it is exactly the (centering-corrected) empirical distribution of microbatch
+    noise. Like any probe-fitted model it only spans the ``K - 1`` sampled
+    directions and is frozen at the checkpoint apart from ``scaling``.
+
+    Args:
+        deviations: ``[K, n]`` flattened raw deviations ``g_k - g_bar``.
+        microbatch_size: ``b``.
+        batch_size: Simulated training batch ``B``.
+        sign_flip: Symmetrize by random signs (removes skew; off by default).
+        scaling: ``"fixed"`` or ``"loss_proportional"``.
+    """
+
+    def __init__(
+        self,
+        deviations: Tensor,
+        microbatch_size: int,
+        batch_size: int,
+        *,
+        sign_flip: bool = False,
+        scaling: str = "fixed",
+    ) -> None:
+        super().__init__(batch_size=batch_size, heavy_tail_dof=None, scaling=scaling)
+        if deviations.ndim != 2 or deviations.shape[0] < 2:
+            raise ValueError("deviations must be [K >= 2, n].")
+        self.deviations = deviations.detach()
+        k = deviations.shape[0]
+        self.m = max(1, round(batch_size / microbatch_size))
+        self.sign_flip = sign_flip
+        self._coef = math.sqrt(k / (k - 1)) * math.sqrt(microbatch_size / (batch_size * self.m))
+
+    def __call__(
+        self, delta: Tensor, loss_ratio: float, step: int, generator: torch.Generator
+    ) -> Tensor:
+        k = self.deviations.shape[0]
+        idx = torch.randint(0, k, (self.m,), generator=generator)
+        picked = self.deviations[idx]
+        if self.sign_flip:
+            signs = torch.randint(0, 2, (self.m, 1), generator=generator).to(picked.dtype) * 2 - 1
+            picked = picked * signs
+        return self._scale(loss_ratio, generator) * self._coef * picked.sum(0)
+
+
 class CovarianceFactorNoise(_ScaledNoise):
     """Noise ``F z / sqrt(B)`` for a known per-example covariance ``Sigma = F F^T``.
 
@@ -263,6 +318,10 @@ class SimulationDistribution:
             if bool(torch.isfinite(final).any()) else float("nan"),
             "deterministic_final_loss": float(self.deterministic[-1]),
             "expected_progress": float(self.losses[0, 0] - self.deterministic[-1]),
+            "deterministic_min_loss": float(self.deterministic.min()),
+            # A non-negative loss whose noiseless surrogate path goes below zero means
+            # the quadratic model is unreliable here (e.g. truncated curvature).
+            "surrogate_below_zero": bool(self.losses[0, 0] >= 0 and float(self.deterministic.min()) < 0),
             "note": "rank configurations; not a calibrated spike probability",
         }
 
@@ -286,6 +345,13 @@ class QuadraticStabilitySimulator:
         noise: A :class:`SimulationNoise` (``None`` = deterministic).
         loss0: Surrogate loss at the checkpoint (only shifts the curve; must be
             positive for relative excursions to be meaningful).
+        subspace: ``[n, r]`` orthonormal basis onto which ``g0`` and the noise are
+            projected, or ``"auto"`` (default: the eigenvectors of a
+            :class:`~snr_grad.curvature.LowRankCurvature`, otherwise no projection).
+            Without it a truncated curvature leaves ``g0`` components with almost no
+            restoring curvature and the surrogate loss falls without bound (on an
+            MLP it went from 0.06 to -1.08), which makes relative excursions
+            meaningless. ``None`` disables projection.
     """
 
     def __init__(
@@ -298,6 +364,7 @@ class QuadraticStabilitySimulator:
         *,
         loss0: float = 1.0,
         activation_snapshot: Optional[Mapping[str, ActivationCovarianceSnapshot]] = None,
+        subspace: Optional[Tensor] | str = "auto",
     ) -> None:
         self.params = list(params)
         self.optimizer = optimizer
@@ -309,6 +376,15 @@ class QuadraticStabilitySimulator:
             self.grad0 = flatten_params(grad0, self.params).detach().clone()
         if self.grad0.numel() != self.theta0.numel():
             raise ValueError("grad0 does not match params.")
+        if isinstance(subspace, str):
+            if subspace != "auto":
+                raise ValueError(f"subspace must be a tensor, None or 'auto', got {subspace!r}.")
+            subspace = getattr(curvature, "eigenvectors", None)
+        self.subspace = None if subspace is None else subspace.detach().to(self.grad0.dtype)
+        if self.subspace is not None:
+            if self.subspace.shape[0] != self.grad0.numel():
+                raise ValueError("subspace must be [n, r] with n matching params.")
+            self.grad0 = self._project(self.grad0)
         self.noise = noise
         self.loss0 = float(loss0)
         self._ap = None
@@ -333,11 +409,14 @@ class QuadraticStabilitySimulator:
         grad0: Optional[Mapping[Tensor, Tensor]] = None,
         heavy_tail_dof: Optional[float] = None,
         noise_scaling: str = "fixed",
+        noise_model: str = "gaussian",
         **kwargs: Any,
     ) -> "QuadraticStabilitySimulator":
         """Fit the noise model from ``probe`` (``g0`` defaults to the probe mean).
 
         ``batch_size`` is the simulated training batch ``B`` (default ``K*b``).
+        ``noise_model`` is ``"gaussian"`` (:class:`GaussianProbeNoise`) or
+        ``"resample"`` (:class:`ResampledProbeNoise`, keeps non-Gaussian tails).
         """
         if params is None:
             params = probe.params
@@ -350,10 +429,17 @@ class QuadraticStabilitySimulator:
             flatten_params(d, params).to(torch.float64) for d in probe.deviations()
         ]).to(params[0].dtype)
         big_b = batch_size if batch_size is not None else probe.num_microbatches * probe.microbatch_size
-        noise = GaussianProbeNoise(
-            devs, probe.microbatch_size, big_b,
-            heavy_tail_dof=heavy_tail_dof, scaling=noise_scaling,
-        )
+        if noise_model == "gaussian":
+            noise: SimulationNoise = GaussianProbeNoise(
+                devs, probe.microbatch_size, big_b,
+                heavy_tail_dof=heavy_tail_dof, scaling=noise_scaling,
+            )
+        elif noise_model == "resample":
+            if heavy_tail_dof is not None:
+                raise ValueError("heavy_tail_dof applies to the Gaussian model only.")
+            noise = ResampledProbeNoise(devs, probe.microbatch_size, big_b, scaling=noise_scaling)
+        else:
+            raise ValueError(f"noise_model must be 'gaussian' or 'resample', got {noise_model!r}.")
         return cls(
             params, optimizer, curvature,
             grad0 if grad0 is not None else probe.mean_gradient(),
@@ -361,6 +447,12 @@ class QuadraticStabilitySimulator:
         )
 
     # -- surrogate ------------------------------------------------------------
+
+    def _project(self, v: Tensor) -> Tensor:
+        if self.subspace is None:
+            return v
+        basis = self.subspace.to(v.dtype)
+        return basis @ (basis.t() @ v)
 
     def _hvp(self, delta: Tensor) -> Tensor:
         hv = self.curvature.matvec(unflatten_like(delta, self.params))
@@ -424,7 +516,7 @@ class QuadraticStabilitySimulator:
             g = self.grad0 + hdelta
             if self.noise is not None and generator is not None:
                 ratio = losses[-1] / self.loss0 if self.loss0 > 0 else 1.0
-                g = g + self.noise(delta, ratio, t, generator).to(g.dtype)
+                g = g + self._project(self.noise(delta, ratio, t, generator).to(g.dtype))
             for c, (a, b) in zip(clones, offsets):
                 c.grad = g[a:b].reshape(c.shape).clone() if c.requires_grad else None
             self._apply_ap(clones)
@@ -540,6 +632,7 @@ class QuadraticStabilitySimulator:
                 "loss0": self.loss0,
                 "noise": type(self.noise).__name__ if self.noise is not None else None,
                 "curvature": self.curvature.metadata.name,
+                "subspace_rank": None if self.subspace is None else int(self.subspace.shape[1]),
                 "optimizer": type(self.optimizer).__name__,
             },
         )

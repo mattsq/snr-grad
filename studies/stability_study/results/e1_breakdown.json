@@ -1,0 +1,34 @@
+{
+ "sgd_0.5": {
+  "lr_sharpness": NaN,
+  "gns_optimizer": -0.8938428421456573,
+  "noise_penalty": 0.9595036870091577,
+  "noise_to_loss": 0.521764721252489,
+  "sim_probe_lossprop_severity": 0.9578947368421052,
+  "sim_exact_lossprop_severity": 0.9634085213032582
+ },
+ "sgd_0.9": {
+  "lr_sharpness": NaN,
+  "gns_optimizer": -0.6413533834586466,
+  "noise_penalty": 0.9511278195488723,
+  "noise_to_loss": 0.9601503759398495,
+  "sim_probe_lossprop_severity": 0.943859649122807,
+  "sim_exact_lossprop_severity": 0.962155388471178
+ },
+ "adamw_0.5": {
+  "lr_sharpness": -0.406516290726817,
+  "gns_optimizer": -0.3954887218045113,
+  "noise_penalty": 0.4378446115288221,
+  "noise_to_loss": -0.41127819548872185,
+  "sim_probe_lossprop_severity": 0.44937343358395987,
+  "sim_exact_lossprop_severity": 0.6568922305764411
+ },
+ "adamw_0.9": {
+  "lr_sharpness": 0.5132832080200501,
+  "gns_optimizer": -0.0857142857142857,
+  "noise_penalty": -0.29448621553884713,
+  "noise_to_loss": 0.5957393483709273,
+  "sim_probe_lossprop_severity": 0.5333333333333333,
+  "sim_exact_lossprop_severity": 0.7243107769423559
+ }
+}

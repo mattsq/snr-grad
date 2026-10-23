@@ -52,6 +52,7 @@ __all__ = [
     "ActivationCurvature",
     "GGNCurvature",
     "HessianCurvature",
+    "LowRankCurvature",
     "collect_activation_snapshot",
     "flatten_params",
     "preserved_rng",
@@ -636,6 +637,138 @@ class HessianCurvature(_FunctionalCurvature):
         with torch.enable_grad():
             _, hv = jvp(g, self._primals, self._tangents(update))
         return {p: h.detach() for p, h in zip(self.params, hv)}
+
+    def matvec(self, update: ParamDict) -> dict[Tensor, Tensor]:
+        t0 = time.perf_counter()
+        out = self._matvec_uncounted(update)
+        self._count("matvec_calls", t0)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Low-rank compression of any proxy
+# ---------------------------------------------------------------------------
+
+class LowRankCurvature(CurvatureProxy):
+    """Top-``rank`` eigendecomposition of another proxy: ``H ~= V diag(l) V^T (+ c I)``.
+
+    Built once by randomized subspace iteration on the source proxy's ``matvec``
+    (``(power_iters + 1) * (rank + oversample)`` matvecs, plus ``trace_probes`` for
+    the optional remainder), after which ``matvec`` costs two thin matrix products.
+    Intended for the stability simulator, which needs one ``matvec`` per simulated
+    step: with a GGN source that is a forward+backward pass per step, which can
+    exceed the cost of a real training step.
+
+    Args:
+        params: Parameters spanned (flattened in this order).
+        eigenvalues: ``[r]`` eigenvalues.
+        eigenvectors: ``[n, r]`` orthonormal eigenvectors.
+        residual: Isotropic remainder ``c`` added on the orthogonal complement.
+        psd: Whether the result is PSD (eigenvalues clamped at 0 if so).
+        source: Name of the source proxy (for metadata).
+    """
+
+    def __init__(
+        self,
+        params: Sequence[Tensor],
+        eigenvalues: Tensor,
+        eigenvectors: Tensor,
+        *,
+        residual: float = 0.0,
+        psd: bool = True,
+        source: str = "explicit",
+        build_matvecs: int = 0,
+        build_seconds: float = 0.0,
+    ) -> None:
+        self.params = list(params)
+        n = sum(p.numel() for p in self.params)
+        if eigenvectors.shape[0] != n or eigenvectors.shape[1] != eigenvalues.numel():
+            raise ValueError("eigenvectors must be [n, r] matching params and eigenvalues.")
+        if residual < 0 and psd:
+            raise ValueError("a PSD low-rank proxy needs residual >= 0.")
+        self.eigenvalues = eigenvalues.detach().clamp_min(0.0) if psd else eigenvalues.detach()
+        self.eigenvectors = eigenvectors.detach()
+        self.residual = float(residual)
+        self.metadata = CurvatureMetadata(
+            name=f"low_rank[{source}]",
+            psd=psd,
+            assumptions=[
+                f"top-{eigenvalues.numel()} eigenpairs of {source}"
+                + (f" plus isotropic remainder {residual:.3g}" if residual else "; rest set to 0"),
+            ],
+            covered=len(self.params),
+            rank=int(eigenvalues.numel()),
+        )
+        self.metadata.cost["build_matvecs"] = float(build_matvecs)
+        self.metadata.cost["build_seconds"] = float(build_seconds)
+
+    @classmethod
+    def from_proxy(
+        cls,
+        proxy: CurvatureProxy,
+        params: Sequence[Tensor],
+        rank: int,
+        *,
+        oversample: int = 8,
+        power_iters: int = 2,
+        trace_probes: int = 0,
+        seed: int = 0,
+    ) -> "LowRankCurvature":
+        """Randomized subspace iteration on ``proxy.matvec`` (does not touch the RNG).
+
+        ``trace_probes > 0`` estimates the trace left unexplained by the top ``rank``
+        eigenpairs (Hutchinson on the deflated operator) and spreads it isotropically
+        over the orthogonal complement.
+        """
+        params = list(params)
+        n = sum(p.numel() for p in params)
+        k = min(n, rank + oversample)
+        gen = torch.Generator().manual_seed(seed)
+        dtype = params[0].dtype
+        t0 = time.perf_counter()
+        calls = 0
+
+        def apply(mat: Tensor) -> Tensor:
+            nonlocal calls
+            cols = []
+            for j in range(mat.shape[1]):
+                hv = proxy.matvec(unflatten_like(mat[:, j].to(dtype), params))
+                cols.append(flatten_params(hv, params).to(torch.float64))
+                calls += 1
+            return torch.stack(cols, 1)
+
+        q, _ = torch.linalg.qr(torch.randn(n, k, generator=gen, dtype=torch.float64))
+        for _ in range(power_iters):
+            q, _ = torch.linalg.qr(apply(q))
+        hq = apply(q)
+        t = q.t() @ hq
+        evals, evecs = torch.linalg.eigh(0.5 * (t + t.t()))
+        order = torch.argsort(evals, descending=True)[:rank]
+        lam = evals[order]
+        vec = q @ evecs[:, order]
+        residual = 0.0
+        if trace_probes > 0 and n > rank:
+            # Hutchinson on the deflated operator (I - V V^T) H (I - V V^T), whose
+            # trace is the unexplained mass; projecting first removes the variance
+            # contributed by the dominant eigenvalues (the Hutch++ idea).
+            z = (torch.randint(0, 2, (n, trace_probes), generator=gen) * 2 - 1).to(torch.float64)
+            z = z - vec @ (vec.t() @ z)
+            tr_rest = float((z * apply(z)).sum() / trace_probes)
+            residual = max(0.0, tr_rest / (n - rank))
+        return cls(
+            params, lam.to(dtype), vec.to(dtype),
+            residual=residual, psd=proxy.metadata.psd, source=proxy.metadata.name,
+            build_matvecs=calls, build_seconds=time.perf_counter() - t0,
+        )
+
+    def _matvec_uncounted(self, update: ParamDict) -> dict[Tensor, Tensor]:
+        v = flatten_params(update, self.params)
+        vecs = self.eigenvectors.to(v.dtype)
+        coef = vecs.t() @ v
+        out = vecs @ (self.eigenvalues.to(v.dtype) * coef)
+        if self.residual:
+            out = out + self.residual * (v - vecs @ coef)
+        return unflatten_like(out, self.params)
 
     def matvec(self, update: ParamDict) -> dict[Tensor, Tensor]:
         t0 = time.perf_counter()

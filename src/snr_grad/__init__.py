@@ -45,6 +45,7 @@ from snr_grad.curvature import (
     ExactQuadraticCurvature,
     GGNCurvature,
     HessianCurvature,
+    LowRankCurvature,
     collect_activation_snapshot,
 )
 from snr_grad.stability import (
@@ -64,6 +65,7 @@ from snr_grad.stability_sim import (
     CovarianceFactorNoise,
     GaussianProbeNoise,
     QuadraticStabilitySimulator,
+    ResampledProbeNoise,
     SimulationDistribution,
     clone_optimizer,
 )
@@ -103,6 +105,7 @@ __all__ = [
     "ExactQuadraticCurvature",
     "GGNCurvature",
     "HessianCurvature",
+    "LowRankCurvature",
     "collect_activation_snapshot",
     "ExcursionReport",
     "FrozenUpdateMap",
@@ -118,6 +121,7 @@ __all__ = [
     "CovarianceFactorNoise",
     "GaussianProbeNoise",
     "QuadraticStabilitySimulator",
+    "ResampledProbeNoise",
     "SimulationDistribution",
     "clone_optimizer",
 ]

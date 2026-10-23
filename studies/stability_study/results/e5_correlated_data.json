@@ -1,0 +1,34 @@
+{
+ "rows": [
+  {
+   "r": 1,
+   "true_batch_mean_variance": 2.821337009089977e-05,
+   "grouped_ratio": 1.0037991617951743,
+   "interleaved_ratio": 1.0037991617951743,
+   "grouped_correct_units_ratio": 1.0037991617951743
+  },
+  {
+   "r": 2,
+   "true_batch_mean_variance": 5.642674018179954e-05,
+   "grouped_ratio": 0.9765091340089992,
+   "interleaved_ratio": 0.4281323175501771,
+   "grouped_correct_units_ratio": 0.9765091340089992
+  },
+  {
+   "r": 4,
+   "true_batch_mean_variance": 0.00011285348036359908,
+   "grouped_ratio": 0.9497578392918287,
+   "interleaved_ratio": 0.13477568872723103,
+   "grouped_correct_units_ratio": 0.9497578392918287
+  },
+  {
+   "r": 8,
+   "true_batch_mean_variance": 0.00022570696072719815,
+   "grouped_ratio": 1.0268693932554265,
+   "interleaved_ratio": 0.0,
+   "grouped_correct_units_ratio": 1.0268693932554265
+  }
+ ],
+ "tr_sigma": 0.0018056556858175852,
+ "reps": 300
+}

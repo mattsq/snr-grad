@@ -112,15 +112,22 @@ def collect_microbatch_gradients(
     num_splits: int,
     params: Optional[Sequence[Tensor]] = None,
     preserve_rng: bool = True,
+    group_ids: Optional[Tensor] = None,
 ) -> list[dict[Tensor, Tensor]]:
     """Return ``K`` microbatch mean gradients at the current parameters.
 
     Splits ``batch`` into ``num_splits`` equal contiguous chunks (the batch size
     must be divisible by ``num_splits`` so every chunk mean has the same
-    variance). Shuffle the batch first if adjacent rows are correlated. The
-    existing ``.grad`` of every parameter and (when ``preserve_rng``) the CPU /
-    CUDA RNG state are restored afterwards, so a probe between training steps does
-    not change training.
+    variance). The existing ``.grad`` of every parameter and (when
+    ``preserve_rng``) the CPU / CUDA RNG state are restored afterwards, so a probe
+    between training steps does not change training.
+
+    **Correlated rows must stay in the same microbatch.** If copies of an example,
+    or tokens / windows of one sequence, are spread across microbatches, the
+    microbatch means become positively correlated and the probe *underestimates*
+    the noise (to zero in the limit; see ``studies/stability_study``). Keep
+    correlated rows together (pass ``group_ids``) and count *groups* as the
+    independent units (``microbatch_size`` in :class:`StabilityProbe`).
 
     Args:
         model: Module to differentiate.
@@ -129,6 +136,10 @@ def collect_microbatch_gradients(
         num_splits: ``K >= 2``.
         params: Parameters to record (default: all with ``requires_grad``).
         preserve_rng: Restore RNG state after the probe (dropout etc.).
+        group_ids: Optional ``[N]`` integer ids of correlated rows (sequence /
+            document / duplicate id). Rows are reordered so each group is
+            contiguous, and a ``ValueError`` is raised if any group would straddle
+            two microbatches (choose ``num_splits`` so groups pack evenly).
 
     Returns:
         A list of ``K`` dicts ``{param: chunk_mean_grad}`` (detached clones).
@@ -141,6 +152,8 @@ def collect_microbatch_gradients(
             f"batch size {b} is not divisible by num_splits={num_splits}; unequal "
             f"microbatches have unequal variance."
         )
+    if group_ids is not None:
+        batch = _group_contiguous(batch, group_ids, num_splits)
     if params is None:
         params = [p for p in model.parameters() if p.requires_grad]
     params = list(params)
@@ -163,6 +176,35 @@ def collect_microbatch_gradients(
         for p in all_params:
             p.grad = saved_grads[p]
     return out
+
+
+def _tree_index(batch: Any, idx: Tensor) -> Any:
+    """Index every tensor leaf of a pytree along dim 0; share other leaves."""
+    if isinstance(batch, Tensor):
+        return batch[idx.to(batch.device)]
+    if isinstance(batch, Mapping):
+        return type(batch)({k: _tree_index(v, idx) for k, v in batch.items()})
+    if isinstance(batch, (tuple, list)):
+        return type(batch)(_tree_index(v, idx) for v in batch)
+    return batch
+
+
+def _group_contiguous(batch: Any, group_ids: Tensor, num_splits: int) -> Any:
+    """Reorder rows so groups are contiguous; refuse splits that cut a group."""
+    ids = torch.as_tensor(group_ids).reshape(-1).cpu()
+    n = tree_batch_size(batch)
+    if ids.numel() != n:
+        raise ValueError(f"group_ids has {ids.numel()} entries, batch has {n} rows.")
+    order = torch.sort(ids, stable=True).indices
+    sorted_ids = ids[order]
+    chunk = n // num_splits
+    for k in range(1, num_splits):
+        if bool(sorted_ids[k * chunk - 1] == sorted_ids[k * chunk]):
+            raise ValueError(
+                f"group {int(sorted_ids[k * chunk])} would straddle microbatches {k - 1} "
+                f"and {k}; choose num_splits so that whole groups fill each microbatch."
+            )
+    return _tree_index(batch, order)
 
 
 # ---------------------------------------------------------------------------
@@ -546,7 +588,11 @@ class StabilityMetrics:
         grad_norm_sq_precond: Unbiased ``|P mu|^2``.
         gns_optimizer: ``tr(P Sigma P^T) / |P mu|^2`` (optimizer-aware GNS).
         risk_trace_per_example: ``R_hat`` estimate of ``tr(H P Sigma P^T)``.
-        risk_trace_se: Delete-one jackknife standard error of ``R_hat``.
+        risk_trace_se: Delete-one jackknife standard error of ``R_hat``. Tends to be
+            optimistic for small ``K`` and heavy-tailed noise (``R_hat`` is right-skewed).
+        risk_trace_ci: ``(lower, upper)`` interval at ``ci_level`` from a jackknife on
+            ``log R`` with a Student-t quantile on ``K - 1`` degrees of freedom; better
+            calibrated than ``R_hat +/- 2 SE`` for skewed ``R_hat``.
         directional_progress: Unbiased ``g^T P mu`` (``g`` = validation gradient
             if supplied, else ``mu``).
         mean_curvature_term: Unbiased ``mu^T P^T H P mu``.
@@ -579,6 +625,7 @@ class StabilityMetrics:
     gns_optimizer: Optional[float]
     risk_trace_per_example: Optional[float]
     risk_trace_se: Optional[float]
+    risk_trace_ci: Optional[tuple[float, float]]
     directional_progress: float
     mean_curvature_term: Optional[float]
     concentration: Optional[float]
@@ -647,9 +694,12 @@ class StabilityProbe:
         units: Name of the independent unit (``"examples"``, ``"sequences"``).
         validation_gradient: Optional held-out gradient ``g`` for the linear term.
         min_concentration_dof: Minimum ``K-1`` before a concentration estimate is
-            reported (default 16).
+            reported (default 15, i.e. ``K >= 16``; on PLRF the bias-corrected
+            estimate is unbiased to within 1% at ``K = 16`` but biased by about
+            -24% at ``K = 8``).
         max_rank_fraction: Abstain if the estimated ``D_eff`` exceeds this
             fraction of ``K-1`` (the sample cannot resolve such ranks).
+        ci_level: Coverage level of ``risk_trace_ci``.
     """
 
     def __init__(
@@ -662,8 +712,9 @@ class StabilityProbe:
         independent: bool = True,
         units: str = "examples",
         validation_gradient: Optional[ParamDict] = None,
-        min_concentration_dof: int = 16,
+        min_concentration_dof: int = 15,
         max_rank_fraction: float = 0.25,
+        ci_level: float = 0.95,
     ) -> None:
         if len(gradients) < 2:
             raise ValueError("need at least K=2 microbatch gradients.")
@@ -681,7 +732,10 @@ class StabilityProbe:
         self.independent = independent
         self.units = units
         self.validation_gradient = validation_gradient
+        if not 0.0 < ci_level < 1.0:
+            raise ValueError(f"ci_level must be in (0, 1), got {ci_level}.")
         self.min_concentration_dof = min_concentration_dof
+        self.ci_level = ci_level
         self.max_rank_fraction = max_rank_fraction
         self._cache: Optional[dict[str, Any]] = None
 
@@ -811,6 +865,7 @@ class StabilityProbe:
         mean_curv = None
         r_hat = None
         r_se = None
+        r_ci = None
         conc = conc_se = conc_plugin = None
         conc_status = "unresolved"
         if "precond" in cache:
@@ -837,6 +892,10 @@ class StabilityProbe:
             if k >= 3:
                 loo = [self._trace_cov(curv, [j for j in range(k) if j != i]) for i in range(k)]
                 r_se = _jackknife_se(loo)
+                if r_hat > 0 and all(v > 0 for v in loo):
+                    se_log = _jackknife_se([math.log(v) for v in loo])
+                    tq = _student_t_quantile(0.5 + 0.5 * self.ci_level, k - 1)
+                    r_ci = (r_hat * math.exp(-tq * se_log), r_hat * math.exp(tq * se_log))
             if not meta.psd:
                 conc_status = "indefinite_curvature"
             else:
@@ -887,6 +946,7 @@ class StabilityProbe:
             gns_optimizer=gns_o,
             risk_trace_per_example=r_hat,
             risk_trace_se=r_se,
+            risk_trace_ci=r_ci,
             directional_progress=progress,
             mean_curvature_term=mean_curv,
             concentration=conc,
@@ -910,6 +970,14 @@ class StabilityProbe:
                 "gradient_bytes": cache["gradient_bytes"],
             },
         )
+
+
+def _student_t_quantile(p: float, dof: int) -> float:
+    """Student-t quantile via the Cornish-Fisher expansion (accurate for dof >= 3)."""
+    z = float(torch.special.ndtri(torch.tensor(p, dtype=torch.float64)))
+    v = float(dof)
+    return (z + (z ** 3 + z) / (4 * v) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * v * v)
+            + (3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / (384 * v ** 3))
 
 
 def _jackknife_se(values: Sequence[float]) -> Optional[float]:

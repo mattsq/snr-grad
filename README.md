@@ -466,12 +466,15 @@ optimizer map `P` (update `-lr * P g`) and a PSD curvature proxy `H`, the probe 
 
 ```python
 from snr_grad import (
-    ActivationCurvature, GGNCurvature, StabilityProbe,
+    ActivationCurvature, GGNCurvature, LowRankCurvature, StabilityProbe,
     QuadraticStabilitySimulator, collect_microbatch_gradients,
 )
 
 # K disjoint, equally sized microbatches at the current parameters; .grad and RNG restored.
-grads = collect_microbatch_gradients(model, loss_fn, batch, num_splits=32)
+# Keep correlated rows (same sequence / document / duplicate) in one microbatch:
+# spreading them across microbatches makes the probe underestimate the noise.
+grads = collect_microbatch_gradients(model, loss_fn, batch, num_splits=32,
+                                     group_ids=sequence_ids)
 
 curv = GGNCurvature(model, x_heldout, lambda out: mse(out, y_heldout))
 # or, from DoPr-style activation statistics (cheaper, cruder):
@@ -480,14 +483,17 @@ curv = GGNCurvature(model, x_heldout, lambda out: mse(out, y_heldout))
 probe = StabilityProbe.from_microbatches(grads, microbatch_size=len(batch[0]) // 32,
                                          optimizer=optimizer, curvature=curv)
 m = probe.measure(lr=3e-4, batch_size=256)
-m.risk_trace_per_example, m.risk_trace_se          # R and its jackknife standard error
+m.risk_trace_per_example, m.risk_trace_ci          # R and a log-scale jackknife-t interval
 m.concentration, m.concentration_status            # None plus a reason when it abstains
 m.noise_penalty, m.risk_score, m.flags             # risk_score is an uncalibrated ranking
 
 # Checkpoint-local continuation: clones params and *all* optimizer state, then replays
 # the real optimizer step on synthetic quadratic-surrogate gradients.
-sim = QuadraticStabilitySimulator.from_checkpoint(optimizer, probe, curv, model=model,
-                                                  loss0=val_loss, noise_scaling="loss_proportional")
+# A low-rank GGN keeps each simulated step cheap.
+low = LowRankCurvature.from_proxy(curv, probe.params, rank=16, trace_probes=16)
+sim = QuadraticStabilitySimulator.from_checkpoint(optimizer, probe, low, model=model,
+                                                  loss0=val_loss, noise_model="resample",
+                                                  noise_scaling="loss_proportional")
 sim.run(n_seeds=16, horizon=200).summary()         # excursion frequency and severity
 ```
 
@@ -498,11 +504,16 @@ Pieces:
 | `frozen_update_map(opt)` | One-step linear map `P` for SGD, Adam/AdamW, `SNRAdamW` (gated or ungated) and `DoPr`. With `at_gradient=...`, Adam's map is the exact diagonal Jacobian, including the `g^2` dependence of `v`, which matters early in training. The Muon family, rotated, MARS and schedule-free variants return an explicit *unsupported* map, because a diagonal linearization of those updates would be wrong. |
 | `ExactQuadraticCurvature` | A known dense or diagonal Hessian. Indefinite matrices raise an error unless you choose `psd_projection="clip"`, `"abs"` or `"none"` (the last is flagged `psd=False`). |
 | `ActivationCurvature` | The `I_out kron C_h` per-layer proxy from the uncentered input correlation (`ActivationPreconditioner.covariance_snapshot()` is the new read-only DoPr accessor). Biases and norm parameters are listed as uncovered. |
+| `LowRankCurvature` | The top-r eigenpairs of any proxy, computed by randomized subspace iteration, plus an optional isotropic remainder (deflated Hutchinson). It makes the simulator's per-step curvature cost two thin matrix products. |
 | `GGNCurvature` / `HessianCurvature` | `torch.func` Jacobian-vector and Hessian-vector products on a held-out batch. The Hessian backend may be indefinite and is never used for `D_eff`. |
-| `StabilityProbe` | GNS, `R`, bias-corrected `D_eff`, and the local expected loss change. It **abstains** (`insufficient_samples`, `rank_not_resolved`, `indefinite_curvature`) instead of reporting a rank that `K` samples cannot resolve; the plug-in value is always at most `K-1`. `independent=False` disables every `1/B` extrapolation. |
-| `QuadraticStabilitySimulator` | Seeded replay of the real optimizer on `L0 + g0^T d + d^T H d / 2` with Gaussian (or Student-t, or loss-proportional) noise fitted from the probe. It runs Muon and SNR gates exactly, because it calls their real `step`. |
+| `StabilityProbe` | GNS, `R` with a jackknife SE and a log-scale jackknife-t interval (`risk_trace_ci`), bias-corrected `D_eff`, and the local expected loss change. It **abstains** (`insufficient_samples`, `rank_not_resolved`, `indefinite_curvature`) instead of reporting a rank that `K` samples cannot resolve; the plug-in value is always at most `K-1`. `independent=False` disables every `1/B` extrapolation. |
+| `QuadraticStabilitySimulator` | Seeded replay of the real optimizer on `L0 + g0^T d + d^T H d / 2`. The noise is fitted from the probe: Gaussian (`GaussianProbeNoise`, optionally Student-t), or resampled from the observed deviations (`ResampledProbeNoise`, which keeps heavy tails), with optional loss-proportional scaling. It runs Muon and SNR gates exactly, because it calls their real `step`. |
 | `detect_excursions` | The shared, preregistered spike definition (trailing-median baseline, robust MAD threshold plus a relative floor, sustained divergence tracked separately). |
 | `exact_noise_geometry`, `spectrum_metrics` | Ground truth for quadratic toys, and cheap activation-spectrum proxies, which are labelled as such. |
+
+A follow-up study ([`studies/stability_study`](studies/stability_study/README.md)) tests
+these pieces in depth: decoupling noise from sharpness, estimator calibration,
+simulator noise models, optimizer timescales, correlated data, and network scale.
 
 Caveats: these are local surrogate quantities, not calibrated spike probabilities (so there
 is no `spike_probability` field). Correlated tokens break the `Sigma / B` scaling, and the

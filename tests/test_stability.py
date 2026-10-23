@@ -14,6 +14,7 @@ from snr_grad import (
     ExactQuadraticCurvature,
     GGNCurvature,
     HessianCurvature,
+    LowRankCurvature,
     SNRAdamW,
     SpectralSNRMuon,
     StabilityProbe,
@@ -412,3 +413,50 @@ def test_detect_excursions():
     div[400:] = float("inf")
     r = detect_excursions(div)
     assert r.diverged and r.divergence_step == 400
+
+
+# ---------------------------------------------------------------------------
+# Low-rank curvature
+# ---------------------------------------------------------------------------
+
+def test_low_rank_recovers_top_eigenpairs_and_remainder():
+    gen = torch.Generator().manual_seed(0)
+    n = 40
+    q, _ = torch.linalg.qr(torch.randn(n, n, generator=gen, dtype=torch.float64))
+    evals = torch.cat([torch.tensor([50.0, 20.0, 10.0, 5.0], dtype=torch.float64),
+                       torch.full((n - 4,), 0.1, dtype=torch.float64)])
+    h = (q * evals) @ q.t()
+    a = nn.Parameter(torch.zeros(10, 3, dtype=torch.float64))
+    b = nn.Parameter(torch.zeros(10, dtype=torch.float64))
+    full = ExactQuadraticCurvature([a, b], h)
+    low = LowRankCurvature.from_proxy(full, [a, b], rank=4, trace_probes=200, seed=1)
+    assert torch.allclose(low.eigenvalues, evals[:4], rtol=1e-6)
+    assert low.residual == pytest.approx(0.1, rel=0.2)
+    assert low.metadata.cost["build_matvecs"] == (2 + 1) * 12 + 200
+    u = {a: torch.randn(10, 3, generator=gen, dtype=torch.float64),
+         b: torch.randn(10, generator=gen, dtype=torch.float64)}
+    exact = full.quad(u)
+    no_rem = LowRankCurvature(low.params, low.eigenvalues, low.eigenvectors)
+    assert no_rem.quad(u) <= exact + 1e-9          # drops only PSD mass
+    assert abs(low.quad(u) - exact) < abs(no_rem.quad(u) - exact)
+    with pytest.raises(ValueError):
+        LowRankCurvature([a, b], low.eigenvalues, low.eigenvectors[:5])
+
+
+def test_group_ids_keep_correlated_rows_together():
+    torch.manual_seed(0)
+    model = nn.Linear(3, 1, bias=False)
+    x = torch.randn(4, 3).repeat(2, 1)        # rows i and i+4 are duplicates
+    y = torch.randn(4, 1).repeat(2, 1)
+    ids = torch.arange(4).repeat(2)
+    grads = collect_microbatch_gradients(model, _mse, (x, y), num_splits=2, group_ids=ids)
+    # Each microbatch holds whole duplicate pairs, i.e. two distinct examples.
+    xs = torch.sort(ids, stable=True).indices
+    for k, g in enumerate(grads):
+        rows = xs[4 * k: 4 * k + 4]
+        model.zero_grad()
+        _mse(model, (x[rows], y[rows])).backward()
+        assert torch.allclose(g[model.weight], model.weight.grad)
+    with pytest.raises(ValueError, match="straddle"):
+        collect_microbatch_gradients(model, _mse, (x, y), num_splits=4,
+                                     group_ids=torch.tensor([0, 0, 0, 1, 1, 1, 2, 2]))

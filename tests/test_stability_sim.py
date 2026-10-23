@@ -14,6 +14,7 @@ from snr_grad import (
     ExactQuadraticCurvature,
     GaussianProbeNoise,
     QuadraticStabilitySimulator,
+    ResampledProbeNoise,
     SNRAdamW,
     SpectralSNRMuon,
     StabilityProbe,
@@ -219,3 +220,33 @@ def test_check_validity():
     assert sim.check_validity(real_loss_fn=quad_loss, fd_direction=d) == []
     cubic = lambda th: quad_loss(th) + 50.0 * float(((th - theta0) ** 3).sum())  # noqa: E731
     assert any("surrogate_fd_error" in r for r in sim.check_validity(real_loss_fn=cubic, fd_direction=d))
+
+
+def test_resampled_probe_noise_covariance_and_support():
+    gen = torch.Generator().manual_seed(0)
+    devs = torch.randn(6, 3, generator=gen, dtype=torch.float64) ** 3  # heavy-ish tails
+    devs = devs - devs.mean(0)
+    target = 6.0 / 5.0 * 4.0 / 16.0 * devs.t() @ devs / 6.0  # Sigma_hat / B, b=4, B=16
+    noise = ResampledProbeNoise(devs, microbatch_size=4, batch_size=16)
+    assert noise.m == 4
+    samples = torch.stack([noise(None, 1.0, 0, gen) for _ in range(40000)])
+    emp = samples.t() @ samples / samples.shape[0]
+    assert torch.allclose(emp, target, rtol=0.1, atol=0.05 * float(target.abs().max()))
+    # B == b: every sample is one rescaled observed deviation.
+    single = ResampledProbeNoise(devs, microbatch_size=4, batch_size=4)
+    x = single(None, 1.0, 0, gen)
+    scaled = devs * (6 / 5) ** 0.5
+    assert min(float((x - d).abs().max()) for d in scaled) < 1e-12
+
+
+def test_from_checkpoint_noise_models():
+    p = nn.Parameter(torch.zeros(3, dtype=torch.float64))
+    opt = torch.optim.SGD([p], lr=0.1)
+    gen = torch.Generator().manual_seed(0)
+    probe = StabilityProbe([{p: torch.randn(3, generator=gen, dtype=torch.float64)} for _ in range(5)], 2)
+    curv = ExactQuadraticCurvature([p], torch.eye(3, dtype=torch.float64))
+    sim = QuadraticStabilitySimulator.from_checkpoint(opt, probe, curv, noise_model="resample")
+    assert isinstance(sim.noise, ResampledProbeNoise)
+    sim.run(2, 5)
+    with pytest.raises(ValueError):
+        QuadraticStabilitySimulator.from_checkpoint(opt, probe, curv, noise_model="bogus")
