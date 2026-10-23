@@ -203,3 +203,27 @@ def test_low_rank_simulation_projects_onto_subspace():
     assert s_ok["deterministic_min_loss"] > 0
     with pytest.raises(ValueError):
         QuadraticStabilitySimulator([p], opt, low, g0, None, subspace="bogus")
+
+
+def test_fused_low_rank_path_matches_generic():
+    gen = torch.Generator().manual_seed(3)
+    n = 24
+    q, _ = torch.linalg.qr(torch.randn(n, n, generator=gen, dtype=torch.float64))
+    h = (q * torch.logspace(1, -3, n, dtype=torch.float64)) @ q.t()
+    p = nn.Parameter(torch.randn(n, generator=gen, dtype=torch.float64))
+    opt = torch.optim.AdamW([p], lr=0.05, weight_decay=0.01)
+    p.grad = torch.randn(n, generator=gen, dtype=torch.float64)
+    opt.step()
+    low = LowRankCurvature.from_proxy(ExactQuadraticCurvature([p], h), [p], rank=5, trace_probes=50)
+    assert low.residual > 0
+    g0 = torch.randn(n, generator=gen, dtype=torch.float64)
+    devs = torch.randn(6, n, generator=gen, dtype=torch.float64)
+    noise = GaussianProbeNoise(devs - devs.mean(0), 2, 4, scaling="loss_proportional")
+    fused = QuadraticStabilitySimulator([p], opt, low, g0, noise, loss0=3.0)
+    assert fused._fused_low_rank(torch.Generator())
+    generic = QuadraticStabilitySimulator([p], opt, low, g0, noise, loss0=3.0)
+    generic._fused_low_rank = lambda generator: False
+    a = fused.run(3, 40, seed=11)
+    b = generic.run(3, 40, seed=11)
+    assert torch.allclose(a.losses, b.losses, rtol=1e-9, atol=1e-12)
+    assert torch.allclose(a.deterministic, b.deterministic, rtol=1e-9, atol=1e-12)

@@ -761,14 +761,17 @@ class LowRankCurvature(CurvatureProxy):
             build_matvecs=calls, build_seconds=time.perf_counter() - t0,
         )
 
-    def _matvec_uncounted(self, update: ParamDict) -> dict[Tensor, Tensor]:
-        v = flatten_params(update, self.params)
-        vecs = self.eigenvectors.to(v.dtype)
+    def matvec_flat(self, v: Tensor) -> Tensor:
+        """``H v`` for a flat vector (no dict round trip; used by the simulator)."""
+        vecs = self.eigenvectors if self.eigenvectors.dtype == v.dtype else self.eigenvectors.to(v.dtype)
         coef = vecs.t() @ v
         out = vecs @ (self.eigenvalues.to(v.dtype) * coef)
         if self.residual:
             out = out + self.residual * (v - vecs @ coef)
-        return unflatten_like(out, self.params)
+        return out
+
+    def _matvec_uncounted(self, update: ParamDict) -> dict[Tensor, Tensor]:
+        return unflatten_like(self.matvec_flat(flatten_params(update, self.params)), self.params)
 
     def matvec(self, update: ParamDict) -> dict[Tensor, Tensor]:
         t0 = time.perf_counter()

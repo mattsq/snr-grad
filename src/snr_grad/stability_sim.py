@@ -32,7 +32,7 @@ import torch
 from torch import Tensor, nn
 
 from snr_grad.activation import ActivationCovarianceSnapshot, DoPr
-from snr_grad.curvature import CurvatureProxy, flatten_params, unflatten_like
+from snr_grad.curvature import CurvatureProxy, LowRankCurvature, flatten_params, unflatten_like
 from snr_grad.stability import ExcursionReport, StabilityProbe, detect_excursions
 
 __all__ = [
@@ -232,6 +232,38 @@ class CovarianceFactorNoise(_ScaledNoise):
         return self._scale(loss_ratio, generator) * (self.factor @ z) / math.sqrt(self.batch_size)
 
 
+class _SubspaceNoise:
+    """Run a delta-independent noise model in ``r`` subspace coordinates.
+
+    ``inner`` produces coefficients on the basis ``V`` (its deviations / factor were
+    pre-multiplied by ``V^T``); a sample is ``V @ inner(...)``. Sampling and
+    projection then cost ``O(K r + n r)`` per step instead of ``O(K n + 2 n r)``.
+    """
+
+    def __init__(self, inner: Any, basis: Tensor) -> None:
+        self.inner = inner
+        self.basis = basis
+
+    def __call__(
+        self, delta: Tensor, loss_ratio: float, step: int, generator: torch.Generator
+    ) -> Tensor:
+        coef = self.inner(None, loss_ratio, step, generator)
+        return self.basis @ coef.to(self.basis.dtype)
+
+
+def _subspace_noise(noise: Any, basis: Tensor) -> Optional[_SubspaceNoise]:
+    """Projected copy of a known, delta-independent noise model (else ``None``)."""
+    if isinstance(noise, (GaussianProbeNoise, ResampledProbeNoise)):
+        inner = copy.copy(noise)
+        inner.deviations = noise.deviations.to(basis.dtype) @ basis
+        return _SubspaceNoise(inner, basis)
+    if isinstance(noise, CovarianceFactorNoise):
+        inner = copy.copy(noise)
+        inner.factor = basis.t() @ noise.factor.to(basis.dtype)
+        return _SubspaceNoise(inner, basis)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Optimizer cloning
 # ---------------------------------------------------------------------------
@@ -260,6 +292,55 @@ def clone_optimizer(optimizer: Any, params: Sequence[Tensor]) -> tuple[Any, list
             raise ValueError("every simulated parameter must belong to the optimizer.")
     clone = copy.deepcopy(optimizer, memo)
     return clone, [memo[id(p)] for p in params]
+
+
+class _FlatClone:
+    """Optimizer clone whose simulated parameters / grads are views of flat buffers.
+
+    Avoids a concatenate and a gradient clone per simulated step. ``aliased()``
+    checks (by data pointer, O(#params)) that the optimizer still updates the
+    views in place; callers fall back to concatenation otherwise.
+    """
+
+    def __init__(self, optimizer: Any, params: Sequence[Tensor]) -> None:
+        params = list(params)
+        dtypes = {p.dtype for p in params}
+        devices = {p.device for p in params}
+        if len(dtypes) != 1 or len(devices) != 1:
+            raise ValueError("flat cloning needs a single dtype and device.")
+        self.flat = torch.cat([p.detach().reshape(-1) for p in params]).clone()
+        self.grad = torch.zeros_like(self.flat)
+        memo: dict[int, Any] = {}
+        self.clones: list[Tensor] = []
+        self.grad_views: list[Optional[Tensor]] = []
+        o = 0
+        for p in params:
+            n = p.numel()
+            c = nn.Parameter(self.flat[o:o + n].view(p.shape), requires_grad=p.requires_grad)
+            gv = self.grad[o:o + n].view(p.shape) if p.requires_grad else None
+            memo[id(p)] = c
+            self.clones.append(c)
+            self.grad_views.append(gv)
+            o += n
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if id(p) not in memo:
+                    memo[id(p)] = p.detach().clone().requires_grad_(p.requires_grad)
+        self.optimizer = copy.deepcopy(optimizer, memo)
+        self._ptrs = [c.data_ptr() for c in self.clones]
+
+    def attach_grads(self) -> None:
+        for c, gv in zip(self.clones, self.grad_views):
+            if c.grad is not gv:
+                c.grad = gv
+
+    def aliased(self) -> bool:
+        return all(c.data_ptr() == ptr for c, ptr in zip(self.clones, self._ptrs))
+
+    def params_flat(self) -> Tensor:
+        if self.aliased():
+            return self.flat
+        return torch.cat([c.detach().reshape(-1) for c in self.clones])
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +468,13 @@ class QuadraticStabilitySimulator:
                 raise ValueError("subspace must be [n, r] with n matching params.")
             self.grad0 = self._project(self.grad0)
         self.noise = noise
+        # Delta-independent probe noise is pre-projected onto the subspace once.
+        self._step_noise = noise
+        self._noise_projected = False
+        if noise is not None and self.subspace is not None:
+            sub = _subspace_noise(noise, self.subspace)
+            if sub is not None:
+                self._step_noise, self._noise_projected = sub, True
         self.loss0 = float(loss0)
         self._ap = None
         self._ap_sigma: dict[Tensor, ActivationCovarianceSnapshot] = {}
@@ -456,23 +544,25 @@ class QuadraticStabilitySimulator:
         return basis @ (basis.t() @ v)
 
     def _hvp(self, delta: Tensor) -> Tensor:
+        flat_mv = getattr(self.curvature, "matvec_flat", None)
+        if flat_mv is not None:
+            return flat_mv(delta).to(delta.dtype)
         hv = self.curvature.matvec(unflatten_like(delta, self.params))
         return flatten_params(hv, self.params).to(delta.dtype)
 
     def surrogate_loss(self, delta: Tensor, hdelta: Optional[Tensor] = None) -> float:
-        """``L_hat(theta0 + delta)``."""
+        """``L_hat(theta0 + delta)`` (accumulated in the parameters' dtype)."""
         if hdelta is None:
             hdelta = self._hvp(delta)
-        d64 = delta.to(torch.float64)
-        return self.loss0 + float(self.grad0.to(torch.float64) @ d64) + 0.5 * float(
-            d64 @ hdelta.to(torch.float64)
+        return self.loss0 + float(torch.dot(self.grad0, delta)) + 0.5 * float(
+            torch.dot(delta, hdelta)
         )
 
     # -- execution ------------------------------------------------------------
 
-    def _clone(self) -> tuple[Any, list[Tensor]]:
+    def _clone(self) -> _FlatClone:
         base = self.optimizer.base if isinstance(self.optimizer, DoPr) else self.optimizer
-        return clone_optimizer(base, self.params)
+        return _FlatClone(base, self.params)
 
     def _apply_ap(self, clones: list[Tensor]) -> None:
         if self._ap is None or not self._ap_active:
@@ -502,33 +592,32 @@ class QuadraticStabilitySimulator:
         modes: Optional[Tensor],
         divergence_factor: float,
     ) -> tuple[list[float], list[float], Optional[Tensor]]:
-        opt, clones = self._clone()
-        offsets = []
-        o = 0
-        for c in clones:
-            offsets.append((o, o + c.numel()))
-            o += c.numel()
+        if self._fused_low_rank(generator):
+            return self._trajectory_low_rank(horizon, generator, lr, lr_schedule, modes,
+                                             divergence_factor)
+        fc = self._clone()
+        opt, clones, gbuf = fc.optimizer, fc.clones, fc.grad
         delta = torch.zeros_like(self.theta0)
         hdelta = torch.zeros_like(self.theta0)
         losses = [self.surrogate_loss(delta, hdelta)]
         gates: list[float] = []
         projs = [delta @ modes] if modes is not None else None
         for t in range(horizon):
-            g = self.grad0 + hdelta
+            torch.add(self.grad0, hdelta, out=gbuf)
             if self.noise is not None and generator is not None:
                 ratio = losses[-1] / self.loss0 if self.loss0 > 0 else 1.0
-                g = g + self._project(self.noise(delta, ratio, t, generator).to(g.dtype))
-            for c, (a, b) in zip(clones, offsets):
-                c.grad = g[a:b].reshape(c.shape).clone() if c.requires_grad else None
+                eps = self._step_noise(delta, ratio, t, generator).to(gbuf.dtype)
+                gbuf.add_(eps if self._noise_projected else self._project(eps))
+            fc.attach_grads()
             self._apply_ap(clones)
             self._set_lr(opt, lr, lr_schedule(t) if lr_schedule is not None else 1.0)
             opt.step()
-            delta = torch.cat([c.detach().reshape(-1) for c in clones]) - self.theta0
-            if not bool(torch.isfinite(delta).all()):
-                losses.extend([float("inf")] * (horizon - t))
-                break
+            torch.sub(fc.params_flat(), self.theta0, out=delta)
             hdelta = self._hvp(delta)
             loss = self.surrogate_loss(delta, hdelta)
+            if not math.isfinite(loss):
+                losses.extend([float("inf")] * (horizon - t))
+                break
             losses.append(loss)
             stats = getattr(opt, "last_stats", None)
             if stats is not None and hasattr(stats, "mean_gate"):
@@ -545,25 +634,95 @@ class QuadraticStabilitySimulator:
             proj_t = torch.stack(projs)
         return losses, gates, proj_t
 
+    def _fused_low_rank(self, generator: Optional[torch.Generator]) -> bool:
+        """Whether the r-dimensional fused path applies (same results, fewer passes)."""
+        return (
+            isinstance(self.curvature, LowRankCurvature)
+            and self.subspace is not None
+            and self.subspace.shape == self.curvature.eigenvectors.shape
+            and torch.equal(self.subspace, self.curvature.eigenvectors.to(self.subspace.dtype))
+            and self._ap is None
+            and (self.noise is None or generator is None or self._noise_projected)
+        )
+
+    def _trajectory_low_rank(
+        self,
+        horizon: int,
+        generator: Optional[torch.Generator],
+        lr: Optional[float],
+        lr_schedule: Optional[Callable[[int], float]],
+        modes: Optional[Tensor],
+        divergence_factor: float,
+    ) -> tuple[list[float], list[float], Optional[Tensor]]:
+        """Low-rank fast path: two passes over ``V`` per step instead of three or four.
+
+        With ``H = V diag(lam) V^T + rho (I - V V^T)`` and ``g0 = V a0`` (projected),
+        ``c = V^T delta`` gives ``grad = g0 + rho delta + V (lam c - rho c + z)`` (``z``
+        the noise coefficients) and ``L = L0 + a0.c + (c.lam c + rho (|d|^2 - |c|^2))/2``.
+        """
+        basis = self.subspace
+        lam = self.curvature.eigenvalues.to(basis.dtype)
+        rho = self.curvature.residual
+        a0 = basis.t() @ self.grad0
+        inner = self._step_noise.inner if self._noise_projected else None
+        fc = self._clone()
+        opt, gbuf = fc.optimizer, fc.grad
+        delta = torch.zeros_like(self.theta0)
+        c = torch.zeros_like(a0)
+        losses = [self.loss0]
+        gates: list[float] = []
+        projs = [delta @ modes] if modes is not None else None
+        for t in range(horizon):
+            coef = a0 + (lam - rho) * c
+            if inner is not None and generator is not None:
+                ratio = losses[-1] / self.loss0 if self.loss0 > 0 else 1.0
+                coef = coef + inner(None, ratio, t, generator).to(coef.dtype)
+            torch.mv(basis, coef, out=gbuf)
+            if rho:
+                gbuf.add_(delta, alpha=rho)
+            fc.attach_grads()
+            self._set_lr(opt, lr, lr_schedule(t) if lr_schedule is not None else 1.0)
+            opt.step()
+            torch.sub(fc.params_flat(), self.theta0, out=delta)
+            c = basis.t() @ delta
+            loss = self.loss0 + float(a0 @ c) + 0.5 * float(c @ (lam * c))
+            if rho:
+                loss += 0.5 * rho * (float(torch.dot(delta, delta)) - float(c @ c))
+            if not math.isfinite(loss):
+                losses.extend([float("inf")] * (horizon - t))
+                break
+            losses.append(loss)
+            stats = getattr(opt, "last_stats", None)
+            if stats is not None and hasattr(stats, "mean_gate"):
+                gates.append(float(stats.mean_gate))
+            if projs is not None:
+                projs.append(delta @ modes)
+            if abs(loss) > divergence_factor * max(abs(self.loss0), 1e-30):
+                losses.extend([float("inf")] * (horizon - t - 1))
+                break
+        proj_t = None
+        if projs is not None:
+            while len(projs) < horizon + 1:
+                projs.append(torch.full_like(projs[0], float("nan")))
+            proj_t = torch.stack(projs)
+        return losses, gates, proj_t
+
     def replay(self, gradients: Sequence[Tensor], *, lr: Optional[float] = None) -> list[Tensor]:
         """Apply a fixed sequence of flat gradients to a cloned optimizer.
 
         Returns the flat parameter vector after each step. Used to check
         state-replay parity against the real optimizer.
         """
-        opt, clones = self._clone()
+        fc = self._clone()
         out = []
         for g in gradients:
-            o = 0
-            for c in clones:
-                n = c.numel()
-                c.grad = g[o:o + n].reshape(c.shape).clone().to(c.dtype) if c.requires_grad else None
-                o += n
-            self._apply_ap(clones)
+            fc.grad.copy_(g.reshape(-1).to(fc.grad.dtype))
+            fc.attach_grads()
+            self._apply_ap(fc.clones)
             if lr is not None:
-                self._set_lr(opt, lr, 1.0)
-            opt.step()
-            out.append(torch.cat([c.detach().reshape(-1).clone() for c in clones]))
+                self._set_lr(fc.optimizer, lr, 1.0)
+            fc.optimizer.step()
+            out.append(fc.params_flat().clone())
         return out
 
     def run(

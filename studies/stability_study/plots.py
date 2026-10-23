@@ -126,7 +126,55 @@ def e6():
     plt.close(fig)
 
 
+def e7():
+    d = load("e7_crossover_timing.json")
+    if d:
+        rows = d["rows"]
+        fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+        for width in sorted({r["d"] for r in rows}):
+            rs = [r for r in rows if r["d"] == width and r["layers"] == 2]
+            axes[0].scatter([r["tokens_per_step"] for r in rs], [r["speedup_per_step"] for r in rs],
+                            s=14, label=f"d={width}")
+            axes[1].scatter([r["tokens_per_step"] for r in rs], [r["speedup_1_query"] for r in rs],
+                            s=14, label=f"d={width}")
+        for ax, t in zip(axes, ("per-step speedup (real step + eval) / sim step",
+                                "single-query speedup incl. build (S=8, T=100)")):
+            ax.set_xscale("log", base=2)
+            ax.set_yscale("log")
+            ax.axhline(1.0, color="k", lw=0.8)
+            ax.set_xlabel("tokens per training step (B x L)")
+            ax.set_title(t, fontsize=9)
+            ax.legend(fontsize=7)
+        fig.tight_layout()
+        fig.savefig(os.path.join(R, "e7_crossover.png"), dpi=120)
+        plt.close(fig)
+    paths = sorted((p for p in os.listdir(R) if p.startswith("e7_whatif_") and p.endswith(".json")),
+                   key=lambda p: int(p.split("_d")[1].split("_")[0]))
+    if paths:
+        fig, axes = plt.subplots(1, len(paths), figsize=(5 * len(paths), 3.8), squeeze=False)
+        for ax, name in zip(axes[0], paths):
+            w = load(name)
+            for (seed, step) in sorted({(r["seed"], r["step"]) for r in w["rows"]}):
+                rs = sorted([r for r in w["rows"] if r["seed"] == seed and r["step"] == step],
+                            key=lambda r: r["lr"])
+                line, = ax.plot([r["lr"] for r in rs], [r["real_loss_change"] for r in rs], "-o", ms=3,
+                                label=f"real s{seed} t{step}")
+                ax.plot([r["lr"] for r in rs], [r["sim_loss_change"] for r in rs], "--x", ms=4,
+                        color=line.get_color(), label=f"sim s{seed} t{step}")
+            ax.axhline(w["config"]["unsafe"], color="k", lw=0.8)
+            ax.set_xscale("log")
+            ax.set_yscale("symlog", linthresh=0.05)
+            ax.set_xlabel("what-if learning rate")
+            ax.set_ylabel("median held-out loss change over horizon")
+            c = w["config"]
+            ax.set_title(f"d={c['d']} L={c['L']} B={c['B']}", fontsize=9)
+            ax.legend(fontsize=6, ncol=2)
+        fig.tight_layout()
+        fig.savefig(os.path.join(R, "e7_whatif.png"), dpi=120)
+        plt.close(fig)
+
+
 if __name__ == "__main__":
-    for f in (e1, e2, e3, e4, e6):
+    for f in (e1, e2, e3, e4, e6, e7):
         f()
     print("figures written to", R)

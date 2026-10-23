@@ -1,0 +1,22 @@
+{
+ "results/e7_whatif_d128_l2_L128_B8.json": [
+  {
+   "seed": 0,
+   "step": 300,
+   "real": 0.07,
+   "sim": 0.05,
+   "sharpness": 0.07,
+   "sim_ratio": 0.7142857142857143,
+   "sharp_ratio": 1.0
+  },
+  {
+   "seed": 0,
+   "step": 800,
+   "real": 0.05,
+   "sim": 0.07,
+   "sharpness": 0.1,
+   "sim_ratio": 1.4000000000000001,
+   "sharp_ratio": 2.0
+  }
+ ]
+}

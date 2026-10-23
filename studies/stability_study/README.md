@@ -57,6 +57,17 @@ and gradient covariance are exact. Stability edges come from the first-round run
   0.85-0.98 up to 284k parameters. The activation proxy fails at every width. A cost
   advantage over real continuations is still not demonstrated at these model sizes.
 
+- **Scaling up (E7): cost stops being the issue at a few hundred tokens per step.** On a
+  small Transformer LM, after optimising the simulator loop, the per-step speedup is
+  about tokens-per-step / 200 at any width. A single what-if query pays off from about
+  1k tokens per step (3.8-6.4x at 31k-430k parameters; 4.6-9.6x for 8 queries).
+  - The simulator places the learning-rate instability onset within about 2x of reality
+    (rank 64: geometric mean 0.85x, slightly conservative). The edge-of-stability rule is
+    2-10x too permissive in the 31k-112k models, though well calibrated at 430k.
+  - It cannot predict how large a blow-up will be.
+  - The noise-driven intermittent spikes the method targets barely occur at these sizes,
+    so that part of the question needs larger models than this CPU budget allows.
+
 ## E0 - incremental information beyond sharpness (`e0_incremental.py`)
 
 Uses the first-round held-out checkpoints. It reports the partial Spearman correlation
@@ -240,7 +251,117 @@ Takeaways:
 
 ![E6](results/e6_network_scale.png)
 
+## E7 - scaling up: where does the simulator pay off? (`e7_*.py`, `tinylm.py`)
+
+The question: what is the smallest scale at which the checkpoint simulator is
+cheaper than simply running real continuations, while still telling which
+configurations are unsafe? The test model is a small decoder-only Transformer
+(`tinylm.py`: explicit causal attention, so `torch.func` JVPs work) trained with AdamW
+on a synthetic language (an order-1 Zipf-like Markov chain plus a copy-8-back rule).
+Each row is one sequence, so microbatches never split correlated tokens (E5).
+
+**Simulator speed (library change).** The per-step loop was rewritten: flat parameter
+and gradient buffers, noise pre-projected into subspace coordinates, and a fused
+rank-r path for `LowRankCurvature` that makes two passes over `V` per step. A simulated
+step went from 15x a bare AdamW step to 2.6x (n = 1M, r = 16). A test checks that the
+fused path reproduces the generic one to 1e-9.
+
+**Cost crossover (`e7_crossover_timing.py`, 96 configurations, 4 CPU threads).** Width
+is 32-256, depth 2-4, sequence length 8-256, batch 2-32. A query is 8 continuations x
+100 steps, including a held-out loss evaluation per real step. The simulator build is
+the probe (32 microbatches) plus a rank-16 GGN on 16 held-out sequences.
+
+- Fitted cost model (R^2 0.95): real step = 11 ms + 36 ps x params x tokens; simulated
+  step = 1.8 ms + 6.9 ns x params. **The per-step speedup is about tokens-per-step / 200**:
+  the simulator wins per step once a training step processes more than about 200
+  tokens, at any width.
+- Single-query speedup including the build: median 2.0x, range 0.5-10x. It is below 1
+  only for tiny batches with comparatively large models (B=2, or L=8 at width >= 128),
+  where the GGN build dominates. With 5 queries from one build, nearly all
+  configurations win.
+- So **cost is not the binding constraint**. The crossover is at a few hundred tokens
+  per step. Real LM training (1e5-1e6 tokens per step) is about three orders of
+  magnitude past it, with a predicted per-step speedup in the thousands.
+
+![E7 crossover](results/e7_crossover.png)
+
+**Is the targeted effect present at this scale? (`e7_lr_scan.py`).** Mostly not.
+- Across learning rates 0.005-0.6, `beta2` 0.95 and 0.999, batches 2-32 and widths
+  32-64, raising the learning rate makes training *stall* smoothly at a higher loss.
+  Intermittent excursions appear only weakly: 0.3-0.7 events per 1500-step run, of
+  25-37% size, at lr about 0.05 with B = 4-8.
+- An earlier attempt with an order-2 Markov language never learned (loss stayed at
+  ln 64), and its results were discarded.
+
+The question that remains testable, and is the one a controller would ask, is **"which
+learning rates are unsafe from this checkpoint?"**
+
+**What-if queries (`e7_whatif.py`).** Setup: AdamW at lr = 0.01, checkpoints at steps
+300 and 800. From each checkpoint, 8 candidate learning rates (0.005-0.2) are each run
+with 8 real continuations of 300 steps, and also answered by **one** simulator build per
+checkpoint (rank-16 GGN, resampled loss-proportional noise). "Unsafe" means the held-out
+loss rises by more than 0.05 nats over the horizon. Sharpness is `lr * lambda_max(P H)`
+on the same low-rank GGN; the edge-of-stability rule calls a learning rate unsafe when
+sharpness > 2.
+
+| model | params | severity rho (sim / sharpness) | unsafe accuracy (sim / sharpness > 2) | speedup (8 queries / 1 query) |
+| --- | --- | --- | --- | --- |
+| d=32, L=32, B=8 | 31k | 0.93 / 0.97 | **0.81** / 0.72 | 4.6x / 3.8x |
+| d=64, L=64, B=8 | 112k | 0.98 / 0.97 | **0.81** / 0.63 | 6.7x / 5.2x |
+| d=128, L=128, B=8 | 430k | 0.97 / 0.97 | 0.88 / 0.88 | 9.6x / 6.4x |
+
+Onset ratio (predicted / real smallest unsafe learning rate) per checkpoint:
+
+| model | simulator, rank 16 | sharpness > 2 |
+| --- | --- | --- |
+| d=32 | 0.7, 2.3, 0.5, 1.4 | 2.0, 6.7, 2.0, 4.0 |
+| d=64 | 1.0, 3.5, 0.7, 2.3 | 2.9, 10, 1.4, 6.7 |
+| d=128 | 0.7, 1.4 | 1.0, 2.0 |
+
+![E7 what-if](results/e7_whatif.png)
+
+- Within one checkpoint, sharpness is just proportional to the learning rate, so any
+  monotone score ranks the queries. The ranking columns therefore do not discriminate;
+  the absolute decision does.
+- **The simulator places the instability onset within about 2x of reality, and is
+  usually closer than the edge-of-stability rule.** That rule is 2-10x too permissive
+  in the two smaller models. At width 128 it becomes well calibrated: sharpness crosses
+  2 exactly at the real blow-up.
+- **The simulator cannot predict magnitudes.** Real blow-ups raise the loss by 2 to 80
+  nats; the quadratic surrogate tops out at about 0.3. It also misses continued learning
+  at small learning rates (real loss falls by up to 0.2; simulated stays about flat),
+  because the rank-16 projection discards most descent directions. It is an onset
+  detector, not a forecaster.
+
+**Rank ablation (`e7_rank_ablation.py`, d=64, same checkpoints).** The simulator was
+optimistic late in training. Higher curvature rank fixes most of that:
+
+| GGN rank | onset ratios (4 checkpoints) | geometric mean | build + 8 queries |
+| --- | --- | --- | --- |
+| 4 | 1.4, 10, 2.9, 6.7 | 3.6 (optimistic) | about 67 s |
+| 16 | 1.0, 3.5, 0.7, 2.3 | 1.6 | about 52 s |
+| 64 | 0.43, 1.5, 0.43, 1.7 | 0.85 (slightly conservative) | about 72 s |
+
+For comparison, the 8 real queries take about 340 s per checkpoint. **Rank 64 gives the
+best safety profile** (worst case 2.3x either way) and stays 4-5x cheaper here.
+
+**Where the critical point is.**
+- **Cost:** about 200 tokens per step for per-step parity. A single query pays off from
+  roughly 1k tokens per step (or 5 queries per build), at every width tested.
+- **Usefulness:** in this model family, the simulator's advantage over the
+  edge-of-stability rule is largest at the *smallest* models (31-112k parameters), where
+  that rule is badly miscalibrated. At 430k parameters the two agree.
+- **Not reached:** the regime the proposal targets, with noise-driven intermittent spikes
+  at a fixed learning rate, does not appear clearly in models this small. Testing it
+  needs larger models or longer training than this CPU budget allows. The prediction from
+  E1 (Adam spike severity *rising* with batch size on concentrated spectra) has not been
+  checked on a Transformer.
+
 ## Library changes made during the study
+
+- Faster simulator: flat parameter and gradient buffers, noise pre-projected into
+  subspace coordinates, and a fused low-rank path (`LowRankCurvature.matvec_flat`). A step
+  went from 15x a bare AdamW step to 2.6x.
 
 - `ResampledProbeNoise` and `noise_model="resample"`: non-Gaussian probe noise.
 - `LowRankCurvature`: randomized subspace iteration with a deflated Hutchinson remainder.

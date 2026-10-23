@@ -373,3 +373,17 @@ conclusions more deeply. The findings that change the picture:
 M4 (a controller) remains unstarted. The evidence now favours a simulator-based risk
 check over one-step sensors, but the cost case needs a model where real steps are
 expensive.
+
+### 12.1 Scaling up (study E7)
+
+On a small Transformer LM (31k-430k parameters):
+- With an optimised simulator loop, the simulator's per-step cost advantage is about
+  tokens-per-step / 200. A single checkpoint query pays off from about 1k tokens per
+  step, so for realistic LM training the cost case for M4 is settled in principle.
+- Answering "which learning rates are unsafe from here?", one simulator build places the
+  instability onset within about 2x of real continuations. With rank-64 curvature it is
+  slightly conservative on average. It beats the edge-of-stability rule where that rule
+  is miscalibrated (the smaller models).
+- It does not forecast blow-up magnitudes.
+- Noise-driven intermittent spikes at a fixed learning rate are rare at these sizes, so a
+  controller trial (M4) on the targeted phenomenon still needs a larger model.
