@@ -246,7 +246,51 @@ larger models, but the estimate is noisier (especially at `K=2`). The thin wrapp
 `MicrobatchVarianceEstimator(num_splits=...)` exposes the same `.estimate(model, loss_fn,
 batch)` interface and stores the loss on `.last_loss`.
 
-### Diagnostics
+#### `benchmark_stability_plrf.py` / `benchmark_stability_layers.py` -- Curvature-aware stability sensing
+
+Stages 0-3 of the [stability proposal](docs/proposals/curvature-aware-stability-control.md).
+The PLRF benchmark samples power-law random features exactly in feature space (D=256,
+V=4096, B=8; `--paper` gives D=1024, V=20000). This makes the population loss, the
+Hessian and the per-example gradient covariance exact ground truth. Held-out results from
+the default run (`benchmarks/stability_plrf_results.json`: 480 checkpoints, 240 of them
+held out, 16 real continuations each):
+
+- **Stage 0 replicates.** With the diffuse spectrum (`alpha_spectrum=0.3`, participation
+  ratio of H = 203), SGD and AdamW are smooth at every learning rate up to 0.95x the
+  measured edge. With concentrated spectra (`alpha >= 0.5`; participation ratio 41 down
+  to 3), runs show intermittent excursions without sustained divergence, even at 0.3x the
+  edge for `alpha >= 0.7`.
+- **Plain GNS points the wrong way.** Euclidean and optimizer-aware GNS are *negatively*
+  rank-correlated with excursion severity (Spearman -0.78 / -0.81, pooled).
+- **The single-step curvature-weighted sensors do not beat a sharpness baseline.**
+  `noise_penalty / excess_loss` reaches Spearman 0.87 (SGD) and 0.98 (AdamW), but
+  `lr * lambda_max(P H)` is as good or better (0.995 / 0.993; mean within-stratum 0.83
+  vs 0.77). Optimizer awareness helps for AdamW: the noise penalty with `P` scores 0.70,
+  against 0.30 with raw gradients.
+- **The multi-step simulator ranks best overall.** It scores 0.975 pooled with exact
+  noise and 0.935 with probe-fitted noise, and 0.97 for `SNRAdamW`, where sharpness
+  scores 0.82. On matched-GNS pairs with different spectra, it orders 92% of pairs
+  correctly, against 85% for sharpness and 58% for GNS.
+- **Probe quality.** `R` from K=32 microbatches has a median relative error of 13%. Its
+  jackknife +/-2 SE interval covers the truth in only 84% of checkpoints, so the SE is
+  somewhat optimistic. The concentration estimate abstained (`rank_not_resolved`) at 25%
+  of checkpoints.
+
+In the MLP benchmark (`benchmarks/stability_layers_results.json`), the GGN matches the
+finite-difference held-out curvature along probe update directions (Spearman 0.996,
+median log10 ratio -0.002). The activation proxy is noticeably cruder (0.86, -0.18). The
+GGN simulator ranks real continuation severity well (Spearman 0.96, n=46), but here it
+costs about 4x a *real* continuation, because the network is tiny. The activation-proxy
+simulator does not rank severity at all (-0.26).
+
+Caveats: checkpoints from the same configuration are not independent, and each
+configuration has only two held-out seeds. Per the proposal's go/no-go rules, no
+controller is built: the cheap one-step sensors add no value over sharpness, and the
+simulator's advantage has not yet been shown at a cost below that of real continuations.
+
+**Output:** `benchmarks/stability_plrf_{curves,regimes,sensors}.png`, `benchmarks/stability_layers.png`, `*_results.json`
+
+## Diagnostics
 
 `compare_gate_with_external_variance(optimizer, grad_variances)` answers "would this
 variance estimate actually change the gate?" without mutating optimizer state. It returns
@@ -808,6 +852,8 @@ python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
 python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
 python benchmark_adaptive_threshold.py  # Adaptive vs static gate under regime shifts
+python benchmark_stability_plrf.py      # Stability sensors on PLRF spikes (~50 min; --quick)
+python benchmark_stability_layers.py    # Curvature-proxy fidelity + simulator on an MLP
 ```
 
 ### `benchmark.py` -- Core SNR gating evaluation

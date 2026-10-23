@@ -1,6 +1,6 @@
 # Proposal: curvature-aware stochastic stability sensing and control
 
-**Status:** Proposed, unimplemented  
+**Status:** Diagnostics implemented (M0, M1, M3 done; M2 partial; M4 not started; see section 11)  
 **Target repository:** `mattsq/snr-grad`  
 **Companion proposal:** [Optimizer-aware batch control](optimizer-aware-batch-control.md)  
 **Primary reference:** Ran Tian and Courtney Paquette, [*Simulating Training Spikes of Deep Neural Networks by Layer-wise Random Feature Models*](https://arxiv.org/abs/2610.13524) (2026)
@@ -314,3 +314,32 @@ The likely worthwhile initial deliverable is **a stability benchmark and a trust
 - [Activation preconditioner](../../src/snr_grad/activation.py): damped activation covariance and DoPr.
 - [Naganuma et al., *Adaptive Batch Sizes Using Non-Euclidean Gradient Noise Scales*](https://arxiv.org/abs/2602.03001): optimizer-specific gradient noise geometries.
 - [Merrill et al., *Critical Batch Size Revisited*](https://arxiv.org/abs/2505.23971): empirical batch-efficiency validation beyond simple noise-scale proxies.
+
+## 11. Implementation status and results
+
+Implemented: `src/snr_grad/stability.py`, `curvature.py`, `stability_sim.py`, the read-only
+`ActivationPreconditioner.covariance_snapshot()`, `benchmark_stability_plrf.py`,
+`benchmark_stability_layers.py`, `tests/test_stability.py` and `tests/test_stability_sim.py`.
+There are two deviations from the sketch above. First, `frozen_update_map(..., at_gradient=g)` gives Adam's *exact* diagonal
+one-step Jacobian: holding `v` fixed was measurably wrong early in training, when
+`(1-beta2)/(1-beta2**t)` is large. Second, PLRF minibatches are sampled exactly in the
+D-dimensional feature space, because `(W^T x, <x, b>)` is jointly Gaussian.
+
+Default-run outcomes (D=256, V=4096, B=8; `alpha_spectrum` in {0.3, 0.5, 0.7, 0.9}; SGD,
+AdamW, SNRAdamW; 240 held-out checkpoints):
+
+- **M0 passed.** The diffuse spectrum (0.3) stays smooth up to 0.95x the measured edge,
+  and concentrated spectra show intermittent excursions without sustained divergence.
+- **M1 passed with caveats.** `R` has a median relative error of 13% at K=32, but the
+  jackknife 2-SE coverage is only 84%, so reported SEs are optimistic. Concentration is
+  bias-corrected and abstains at 25% of checkpoints.
+- **M2 is partial.** Curvature-weighted noise-to-loss beats GNS: GNS is anti-correlated
+  with severity, and pairs at matched GNS are ordered correctly 75% of the time. But it
+  does not beat `lr * lambda_max(P H)`, which reaches Spearman 0.99 within SGD and AdamW.
+  H2 holds for AdamW (optimizer-aware penalty 0.70 vs raw 0.30).
+- **M3: the simulator ranks well.** Spearman is 0.975 pooled, matched-GNS concordance is
+  0.92 (sharpness: 0.85), and SNRAdamW scores 0.97 (sharpness: 0.82). The probe-fitted
+  noise variant reaches 0.935. On a small MLP the GGN simulator ranks real continuations
+  well (0.96), but it costs more than running them; the activation-proxy simulator fails.
+- **M4 was not attempted**, per the go/no-go rule. The useful deliverable so far is the
+  diagnostic and the benchmark, as section 10 anticipated.
