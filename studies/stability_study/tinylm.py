@@ -58,17 +58,21 @@ class MarkovLanguage:
 
     Each next token follows a Zipf-like, temperature-sharpened transition from the
     previous token; with probability ``copy_prob`` it instead repeats the token
-    ``copy_lag`` positions back (learnable only through attention).
+    ``copy_lag`` positions back (learnable only through attention). ``global_zipf``
+    adds a heavy-tailed unigram frequency (token ``t`` weighted by ``rank^-s``).
     """
 
     def __init__(self, vocab: int = 64, temperature: float = 0.5, copy_prob: float = 0.3,
-                 copy_lag: int = 8, seed: int = 0):
+                 copy_lag: int = 8, seed: int = 0, global_zipf: float = 0.0):
         g = torch.Generator().manual_seed(seed)
         ranks = torch.arange(1, vocab + 1, dtype=torch.float32)
         base = -torch.log(ranks)
         perm = torch.argsort(torch.rand(vocab, vocab, generator=g), dim=-1)
         logits = base[perm] + 0.3 * torch.randn(vocab, vocab, generator=g)
-        self.probs = torch.softmax(logits / temperature, dim=-1)  # [prev, next]
+        # Optional global Zipf bias: token t is frequent everywhere with weight rank^-global_zipf
+        # (natural text has heavy-tailed unigram frequencies on top of local structure).
+        logits = logits / temperature + global_zipf * base[None, :]
+        self.probs = torch.softmax(logits, dim=-1)  # [prev, next]
         self.vocab = vocab
         self.copy_prob = copy_prob
         self.copy_lag = copy_lag

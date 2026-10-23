@@ -382,8 +382,25 @@ On a small Transformer LM (31k-430k parameters):
   step, so for realistic LM training the cost case for M4 is settled in principle.
 - Answering "which learning rates are unsafe from here?", one simulator build places the
   instability onset within about 2x of real continuations. With rank-64 curvature it is
-  slightly conservative on average. It beats the edge-of-stability rule where that rule
-  is miscalibrated (the smaller models).
+  slightly conservative on average. It beats Adam's edge-of-stability rule (threshold
+  3.8), which misses most of these instabilities.
 - It does not forecast blow-up magnitudes.
 - Noise-driven intermittent spikes at a fixed learning rate are rare at these sizes, so a
   controller trial (M4) on the targeted phenomenon still needs a larger model.
+
+### 12.2 When to expect large noise-driven spikes (study E8)
+
+Closed-form indices (`snr_grad.stability_theory`, derivations in
+`docs/stability-theory.md`) predict PLRF spike severity well:
+- **SGD:** `Phi = kappa sqrt(2/D)` explains log severity with R^2 0.95; together with the
+  Kesten tail, R^2 0.99. The exact stochastic edge `kappa` separates divergence from
+  the bursty `D ~ 1` regime.
+- **Adam:** `Phi` predicts severe excursions with AUROC 0.97 in Adam-preconditioned
+  coordinates.
+
+Large spikes additionally require the gradient noise to be aligned with the sharpest
+direction (`w >~ 0.1`). Tiny Adam-trained LMs miss this badly: `Phi` is 30-300x too
+small, and Adam's whitening drops `w` to about 1e-3. Their scaling trends do not close
+the gap. So the controller trial (M4) should target settings that pass a `w` / `Phi` /
+`kappa` screen, most likely SGD-trained models with aligned noise, rather than simply
+larger Adam LMs.

@@ -62,11 +62,24 @@ and gradient covariance are exact. Stability edges come from the first-round run
   about tokens-per-step / 200 at any width. A single what-if query pays off from about
   1k tokens per step (3.8-6.4x at 31k-430k parameters; 4.6-9.6x for 8 queries).
   - The simulator places the learning-rate instability onset within about 2x of reality
-    (rank 64: geometric mean 0.85x, slightly conservative). The edge-of-stability rule is
-    2-10x too permissive in the 31k-112k models, though well calibrated at 430k.
+    (rank 64: geometric mean 0.85x, slightly conservative). Adam's edge-of-stability rule
+    (threshold 3.8) never flags the unsafe rates in half the checkpoints and is otherwise
+    about 3-4x too permissive.
   - It cannot predict how large a blow-up will be.
   - The noise-driven intermittent spikes the method targets barely occur at these sizes,
     so that part of the question needs larger models than this CPU budget allows.
+
+- **When to expect a large spike effect (E8).** Closed-form indices predict PLRF spike
+  severity almost perfectly: `Phi = kappa sqrt(2/D)` gives R^2 0.95 for SGD and AUROC
+  0.97 for Adam. A spike window needs gradient noise aligned with the sharpest direction
+  (`w >~ 0.1`).
+  - Tiny Adam-trained LMs sit 30-300x below the spike band, and their noise is
+    misaligned: Adam's whitening drops `w` by up to 270x (1.3-270x) below its SGD-geometry
+    value.
+  - Scaling trends do not close the gap, so look in SGD-trained, aligned settings rather
+    than larger Adam LMs, and screen with `w` and `Phi` first.
+  - Along the way: the E7 sharpness rule used the SGD threshold (2) instead of Adam's
+    (3.8); corrected.
 
 ## E0 - incremental information beyond sharpness (`e0_incremental.py`)
 
@@ -301,32 +314,36 @@ learning rates are unsafe from this checkpoint?"**
 with 8 real continuations of 300 steps, and also answered by **one** simulator build per
 checkpoint (rank-16 GGN, resampled loss-proportional noise). "Unsafe" means the held-out
 loss rises by more than 0.05 nats over the horizon. Sharpness is `lr * lambda_max(P H)`
-on the same low-rank GGN; the edge-of-stability rule calls a learning rate unsafe when
-sharpness > 2.
+on the same low-rank GGN, including the `(1 - beta1)` one-step factor. In those units
+Adam's edge-of-stability threshold is `2 (1 + beta1) = 3.8` (Cohen et al. 2022; see
+`docs/stability-theory.md`). **Correction:** the first version of this section used
+threshold 2, which is the SGD value. Both are shown below.
 
-| model | params | severity rho (sim / sharpness) | unsafe accuracy (sim / sharpness > 2) | speedup (8 queries / 1 query) |
+| model | params | severity rho (sim / sharpness) | unsafe accuracy (sim / sharpness > 3.8 / > 2) | speedup (8 queries / 1 query) |
 | --- | --- | --- | --- | --- |
-| d=32, L=32, B=8 | 31k | 0.93 / 0.97 | **0.81** / 0.72 | 4.6x / 3.8x |
-| d=64, L=64, B=8 | 112k | 0.98 / 0.97 | **0.81** / 0.63 | 6.7x / 5.2x |
-| d=128, L=128, B=8 | 430k | 0.97 / 0.97 | 0.88 / 0.88 | 9.6x / 6.4x |
+| d=32, L=32, B=8 | 31k | 0.93 / 0.97 | **0.81** / 0.59 / 0.72 | 4.6x / 3.8x |
+| d=64, L=64, B=8 | 112k | 0.98 / 0.97 | **0.81** / 0.53 / 0.63 | 6.7x / 5.2x |
+| d=128, L=128, B=8 | 430k | 0.97 / 0.97 | **0.88** / 0.69 / 0.88 | 9.6x / 6.4x |
 
-Onset ratio (predicted / real smallest unsafe learning rate) per checkpoint:
+Onset ratio (predicted / real smallest unsafe learning rate) per checkpoint. "never"
+means no tested learning rate (up to 0.2) was flagged:
 
-| model | simulator, rank 16 | sharpness > 2 |
-| --- | --- | --- |
-| d=32 | 0.7, 2.3, 0.5, 1.4 | 2.0, 6.7, 2.0, 4.0 |
-| d=64 | 1.0, 3.5, 0.7, 2.3 | 2.9, 10, 1.4, 6.7 |
-| d=128 | 0.7, 1.4 | 1.0, 2.0 |
+| model | simulator, rank 16 | sharpness > 3.8 (correct) | sharpness > 2 |
+| --- | --- | --- | --- |
+| d=32 | 0.7, 2.3, 0.5, 1.4 | never (x4) | 2.0, 6.7, 2.0, 4.0 |
+| d=64 | 1.0, 3.5, 0.7, 2.3 | 2.9, never, 2.9, never | 2.9, 10, 1.4, 6.7 |
+| d=128 | 0.7, 1.4 | 2.9, 4.0 | 1.0, 2.0 |
 
 ![E7 what-if](results/e7_whatif.png)
 
 - Within one checkpoint, sharpness is just proportional to the learning rate, so any
   monotone score ranks the queries. The ranking columns therefore do not discriminate;
   the absolute decision does.
-- **The simulator places the instability onset within about 2x of reality, and is
-  usually closer than the edge-of-stability rule.** That rule is 2-10x too permissive
-  in the two smaller models. At width 128 it becomes well calibrated: sharpness crosses
-  2 exactly at the real blow-up.
+- **The simulator places the instability onset within about 2x of reality; the
+  edge-of-stability rule does not.** With the correct threshold the rule never flags
+  any tested learning rate in 5 of the 10 checkpoints, and is otherwise 2.9-4x too
+  permissive. The real instabilities here happen far below the deterministic adaptive
+  edge, which is the gap that noise-aware simulation fills.
 - **The simulator cannot predict magnitudes.** Real blow-ups raise the loss by 2 to 80
   nats; the quadratic surrogate tops out at about 0.3. It also misses continued learning
   at small learning rates (real loss falls by up to 0.2; simulated stays about flat),
@@ -348,16 +365,118 @@ best safety profile** (worst case 2.3x either way) and stays 4-5x cheaper here.
 **Where the critical point is.**
 - **Cost:** about 200 tokens per step for per-step parity. A single query pays off from
   roughly 1k tokens per step (or 5 queries per build), at every width tested.
-- **Usefulness:** in this model family, the simulator's advantage over the
-  edge-of-stability rule is largest at the *smallest* models (31-112k parameters), where
-  that rule is badly miscalibrated. At 430k parameters the two agree.
+- **Usefulness:** in this model family the simulator beats the (correctly thresholded)
+  edge-of-stability rule at every size tested (31k-430k parameters).
 - **Not reached:** the regime the proposal targets, with noise-driven intermittent spikes
   at a fixed learning rate, does not appear clearly in models this small. Testing it
   needs larger models or longer training than this CPU budget allows. The prediction from
   E1 (Adam spike severity *rising* with batch size on concentrated spectra) has not been
   checked on a Transformer.
 
+## E8 - when should a large spike effect appear? Theory plus small runs (`e8_*.py`)
+
+Derivations are in [`docs/stability-theory.md`](../../docs/stability-theory.md); the code
+is in `snr_grad.stability_theory`. Four closed-form quantities, each checked here:
+
+| quantity | meaning |
+| --- | --- |
+| `kappa` | SGD feedback gain: the noise-driven fraction of the stationary loss (exact for Gaussian design); the mean loss diverges at 1 |
+| `D_K` / `D_hat` | number of curvature modes carrying that noise-driven loss |
+| `Phi = kappa sqrt(2/D)` | predicted relative fluctuation of the loss |
+| `w` | share of gradient noise along the sharpest (preconditioned) direction: the relative width of the learning-rate window in which large noise-driven spikes are possible |
+
+Adam enters through its preconditioner `P = 1/sqrt(v)` and its momentum edge
+`2(1+beta1)/(1-beta1) = 38`.
+
+**E8a - PLRF validation (exact H and Sigma; `e8_plrf_theory.py`, `e8_sgd_indices.py`,
+`e8_adam_indices.py`).**
+- **SGD (60 configurations).** The closed-form expected loss matches the seed-averaged
+  runs to about three digits wherever `kappa < 1` (for example 0.3187 vs 0.3185).
+  - Log severity is explained by `Phi` (R^2 0.95) and by the Kesten tail exponent `xi`
+    (R^2 0.97); jointly R^2 = 0.99.
+  - Phase diagram: `kappa >= 1` diverges unless the feedback is single-mode
+    (`D_K <= 1.4`). In that case it gives infinite-mean bursts instead: severity
+    3000-4000 with no divergence.
+- **Adam (288 checkpoints).** In Adam-preconditioned coordinates, `Phi` predicts whether
+  the next 1000 steps contain a severe excursion with AUROC 0.97 (log-severity R^2 0.86),
+  against 0.81 (R^2 0.43) for the adaptive edge ratio.
+  - Calibration: `severity ~ 15 * Phi^1.38`, so a 100% excursion corresponds to
+    `Phi ~ 0.14` and a 10x one to `Phi ~ 0.7`.
+  - The edge ratio rises with batch size (`v` shrinks), which explains E1's
+    "bigger batch, worse Adam spikes".
+
+**E8b - the tiny LM is far from that band (`e8_lm_indices.py`, `e8_lm_trend.py`,
+`e8_lm_data.py`, `e8_lm_favorable.py`, `e8_lm_scaling.py`).** The same indices were
+measured at about 130 LM checkpoints: width 32-256, batch 8-128, sequence 16-256, lr 0.003-0.03,
+up to 4000 steps, and vocabularies of 64-4096 tokens with or without Zipf frequencies.
+
+- **Standard settings:** `Phi = 0.0005-0.005`, 30-300x below the band. Two factors keep
+  it small:
+  - only 1-10% of the loss is noise-driven (`kappa_hat`);
+  - that part is spread over `D_hat` = 100-6000 modes.
+- **Fit** (R^2 0.91): `Phi ~ d^0.36 B^-0.39 L^-0.44 lr^0.52`. At lr 0.01, `Phi` reaches 0.15
+  only at widths of order 1e7-1e8, so width alone will not get there.
+- **Raising the learning rate does not help.** Above Adam's edge (ratio 2-950 here), runs
+  *stall* rather than spike.
+- **Longer training does not help.** `D_hat` falls 3-7x over 4000 steps, but
+  `kappa_hat` falls in step, so `Phi` stays flat.
+- **Data:** heavy Zipf frequencies at a small vocabulary halve `D_hat` (`Phi` x2), but
+  larger vocabularies spread the noise over more embedding rows (`Phi` falls).
+- **Most favourable corner** (width 256, B = 2-4, L = 16, Zipf): `D_hat` = 8-43 and
+  `Phi` = 0.004-0.02, within about 2x of the fit. Observed severity was 0.03-0.07,
+  matching the PLRF calibration (0.026-0.07). That corner also stalls easily.
+
+**E8c - why: the noise is not aligned with the sharpest direction (`e8_window.py`,
+`e8_alignment.py`).**
+- **PLRF:** `w = lambda_1 / tr(H)` correctly separates the spike-capable spectra (w >= 0.12)
+  from the diffuse one (w = 0.02, which diverges without spiking). It does not locate
+  the onset precisely; batch size shifts it.
+- **LM, Adam geometry:** `w = 1e-4 to 7e-3`, below even the non-spiking PLRF case.
+- **LM, SGD geometry, same Adam-trained checkpoints:** `w` is up to 270x higher, reaching
+  0.10-0.16 for the favourable configuration. So **Adam's per-coordinate whitening
+  removes the alignment** that noise-driven spikes need.
+
+**E8d - targeted test with SGD (`e8_sgd_lm_test.py`, `e8_sgd_lm_phi.py`).** The theory
+predicted that the favourable configuration should show spikes under plain SGD near its
+edge, while the control (w ~ 0.01) should not.
+- **Result:** the aligned configuration's excursions are 2-4x larger than the control's
+  (median severity 0.07-0.09, maximum 0.23, against 0.02-0.04). No event crosses the
+  25% threshold, and there is no growth toward the edge.
+- **Explanation:** when *trained* with SGD, the configuration's `w` is only 0.036. The
+  geometry differs from the Adam-trained checkpoint, and 0.036 is below the
+  spike-capable range, so no spikes is consistent with the theory.
+- `Phi` predicted the observed severity within about 1-8x. The Kesten heavy-tail term
+  over-predicted by orders of magnitude: it needs noise proportional to the error along
+  the sharp mode, which does not hold here.
+
+**Estimate: when is a big spike effect worth testing?**
+
+A configuration qualifies only if, in the optimizer's own geometry and below its edge,
+`w >~ 0.1`, `Phi >~ 0.15`, and either `kappa < 1` or `D ~ 1`. The tiny LMs miss on every
+count:
+- **Adam:** `w` is 15-1000x too small and `Phi` 7-300x too small.
+- **Trends with scale:** `w` falls with width and vocabulary; `Phi` grows only as
+  `d^0.36`.
+- **Conclusion:** **scaling up a standard Adam-trained LM is not a path to the noise-driven
+  spikes the proposal targets.** Spikes seen in large Adam LMs are more likely other
+  mechanisms (in this study, crossing the adaptive edge produced stalls); the current
+  theory does not cover those.
+
+Where to look instead:
+- **SGD or momentum training** of models whose sharpest direction is also their noisiest:
+  PLRF-like random-feature or linear-head models, or tasks with a dominant output
+  direction.
+- **Screen first:** measure `w`, `Phi` and `kappa` at a few checkpoints before
+  committing to an expensive run. That costs seconds to minutes per checkpoint on these
+  models.
+
 ## Library changes made during the study
+
+- `snr_grad.stability_theory`: `sgd_stochastic_edge`, `dominant_mode_tail`,
+  `noise_fluctuation_index`, `adam_edge_threshold`, `adam_edge_ratio`,
+  `adam_stationary_preconditioner`, `preconditioned_top_eigenvalue`; plus
+  `PreconditionedCurvature` in `snr_grad.curvature` (tests in
+  `tests/test_stability_theory.py`).
 
 - Faster simulator: flat parameter and gradient buffers, noise pre-projected into
   subspace coordinates, and a fused low-rank path (`LowRankCurvature.matvec_flat`). A step

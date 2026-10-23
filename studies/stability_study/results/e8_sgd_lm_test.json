@@ -1,0 +1,98 @@
+{
+ "aligned (w_sgd~0.1-0.16)": {
+  "config": {
+   "vocab": 64,
+   "zipf": 1.5,
+   "d": 128,
+   "L": 16,
+   "B": 4
+  },
+  "edge": 0.7979223722218458,
+  "rows": [
+   {
+    "m": 0.5,
+    "lr": 0.3989611861109229,
+    "events_per_run": 0.0,
+    "severity_median": 0.08562493225418934,
+    "severity_max": 0.1954880623294427,
+    "diverged": 0.0,
+    "final_median": 1.725935697555542
+   },
+   {
+    "m": 0.7,
+    "lr": 0.558545660555292,
+    "events_per_run": 0.0,
+    "severity_median": 0.06627648614464268,
+    "severity_max": 0.1794423512841803,
+    "diverged": 0.0,
+    "final_median": 1.7232177257537842
+   },
+   {
+    "m": 0.85,
+    "lr": 0.678234016388569,
+    "events_per_run": 0.0,
+    "severity_median": 0.07837996492072381,
+    "severity_max": 0.17477504320641493,
+    "diverged": 0.0,
+    "final_median": 1.7289531230926514
+   },
+   {
+    "m": 0.95,
+    "lr": 0.7580262536107535,
+    "events_per_run": 0.0,
+    "severity_median": 0.08964960556103144,
+    "severity_max": 0.23301294605332676,
+    "diverged": 0.0,
+    "final_median": 1.7370984554290771
+   }
+  ]
+ },
+ "control (w_sgd~0.01)": {
+  "config": {
+   "vocab": 64,
+   "zipf": 0.0,
+   "d": 64,
+   "L": 64,
+   "B": 8
+  },
+  "edge": 3.318209223797203,
+  "rows": [
+   {
+    "m": 0.5,
+    "lr": 1.6591046118986015,
+    "events_per_run": 0.0,
+    "severity_median": 0.020839109351407422,
+    "severity_max": 0.02442555538748498,
+    "diverged": 0.0,
+    "final_median": 1.8106812238693237
+   },
+   {
+    "m": 0.7,
+    "lr": 2.322746456658042,
+    "events_per_run": 0.0,
+    "severity_median": 0.026993427485332955,
+    "severity_max": 0.03274947797679096,
+    "diverged": 0.0,
+    "final_median": 1.8187729120254517
+   },
+   {
+    "m": 0.85,
+    "lr": 2.8204778402276225,
+    "events_per_run": 0.0,
+    "severity_median": 0.03629057000330806,
+    "severity_max": 0.04227315472295936,
+    "diverged": 0.0,
+    "final_median": 1.8249481916427612
+   },
+   {
+    "m": 0.95,
+    "lr": 3.1522987626073427,
+    "events_per_run": 0.0,
+    "severity_median": 0.03932129131858675,
+    "severity_max": 0.04127246592307029,
+    "diverged": 0.0,
+    "final_median": 1.835312843322754
+   }
+  ]
+ }
+}

@@ -46,6 +46,7 @@ from snr_grad.curvature import (
     GGNCurvature,
     HessianCurvature,
     LowRankCurvature,
+    PreconditionedCurvature,
     collect_activation_snapshot,
 )
 from snr_grad.stability import (
@@ -60,6 +61,15 @@ from snr_grad.stability import (
     frozen_update_map,
     per_example_variance_from_batch_mean,
     spectrum_metrics,
+)
+from snr_grad.stability_theory import (
+    adam_edge_ratio,
+    adam_edge_threshold,
+    adam_stationary_preconditioner,
+    dominant_mode_tail,
+    noise_fluctuation_index,
+    preconditioned_top_eigenvalue,
+    sgd_stochastic_edge,
 )
 from snr_grad.stability_sim import (
     CovarianceFactorNoise,
@@ -106,6 +116,7 @@ __all__ = [
     "GGNCurvature",
     "HessianCurvature",
     "LowRankCurvature",
+    "PreconditionedCurvature",
     "collect_activation_snapshot",
     "ExcursionReport",
     "FrozenUpdateMap",
@@ -124,4 +135,11 @@ __all__ = [
     "ResampledProbeNoise",
     "SimulationDistribution",
     "clone_optimizer",
+    "adam_edge_ratio",
+    "adam_edge_threshold",
+    "adam_stationary_preconditioner",
+    "dominant_mode_tail",
+    "noise_fluctuation_index",
+    "preconditioned_top_eigenvalue",
+    "sgd_stochastic_edge",
 ]

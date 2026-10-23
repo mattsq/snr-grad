@@ -53,6 +53,7 @@ __all__ = [
     "GGNCurvature",
     "HessianCurvature",
     "LowRankCurvature",
+    "PreconditionedCurvature",
     "collect_activation_snapshot",
     "flatten_params",
     "preserved_rng",
@@ -772,6 +773,39 @@ class LowRankCurvature(CurvatureProxy):
 
     def _matvec_uncounted(self, update: ParamDict) -> dict[Tensor, Tensor]:
         return unflatten_like(self.matvec_flat(flatten_params(update, self.params)), self.params)
+
+    def matvec(self, update: ParamDict) -> dict[Tensor, Tensor]:
+        t0 = time.perf_counter()
+        out = self._matvec_uncounted(update)
+        self._count("matvec_calls", t0)
+        return out
+
+
+class PreconditionedCurvature(CurvatureProxy):
+    """``P^1/2 H P^1/2`` for a positive diagonal ``P`` (e.g. Adam's ``1/sqrt(v)``).
+
+    Its eigenvalues are the curvatures that set the stability of a preconditioned
+    step; wrap it in :class:`LowRankCurvature` to get its top eigenpairs. Parameters
+    missing from ``precond`` are treated as frozen (``P = 0``).
+    """
+
+    def __init__(self, base: CurvatureProxy, precond: ParamDict) -> None:
+        self.base = base
+        self.root = {p: d.clamp_min(0.0).sqrt() for p, d in precond.items()}
+        self.metadata = CurvatureMetadata(
+            name=f"preconditioned[{base.metadata.name}]",
+            psd=base.metadata.psd,
+            assumptions=list(base.metadata.assumptions) + ["diagonal preconditioner P^1/2 H P^1/2"],
+            covered=len(self.root),
+            uncovered=list(base.metadata.uncovered),
+        )
+
+    def _scale(self, update: ParamDict) -> dict[Tensor, Tensor]:
+        return {p: (u * self.root[p].to(u.dtype)) if p in self.root else torch.zeros_like(u)
+                for p, u in update.items()}
+
+    def _matvec_uncounted(self, update: ParamDict) -> dict[Tensor, Tensor]:
+        return self._scale(self.base.matvec(self._scale(update)))
 
     def matvec(self, update: ParamDict) -> dict[Tensor, Tensor]:
         t0 = time.perf_counter()
