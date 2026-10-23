@@ -246,7 +246,51 @@ larger models, but the estimate is noisier (especially at `K=2`). The thin wrapp
 `MicrobatchVarianceEstimator(num_splits=...)` exposes the same `.estimate(model, loss_fn,
 batch)` interface and stores the loss on `.last_loss`.
 
-### Diagnostics
+#### `benchmark_stability_plrf.py` / `benchmark_stability_layers.py` -- Curvature-aware stability sensing
+
+Stages 0-3 of the [stability proposal](docs/proposals/curvature-aware-stability-control.md).
+The PLRF benchmark samples power-law random features exactly in feature space (D=256,
+V=4096, B=8; `--paper` gives D=1024, V=20000). This makes the population loss, the
+Hessian and the per-example gradient covariance exact ground truth. Held-out results from
+the default run (`benchmarks/stability_plrf_results.json`: 480 checkpoints, 240 of them
+held out, 16 real continuations each):
+
+- **Stage 0 replicates.** With the diffuse spectrum (`alpha_spectrum=0.3`, participation
+  ratio of H = 203), SGD and AdamW are smooth at every learning rate up to 0.95x the
+  measured edge. With concentrated spectra (`alpha >= 0.5`; participation ratio 41 down
+  to 3), runs show intermittent excursions without sustained divergence, even at 0.3x the
+  edge for `alpha >= 0.7`.
+- **Plain GNS points the wrong way.** Euclidean and optimizer-aware GNS are *negatively*
+  rank-correlated with excursion severity (Spearman -0.78 / -0.81, pooled).
+- **The single-step curvature-weighted sensors do not beat a sharpness baseline.**
+  `noise_penalty / excess_loss` reaches Spearman 0.87 (SGD) and 0.98 (AdamW), but
+  `lr * lambda_max(P H)` is as good or better (0.995 / 0.993; mean within-stratum 0.83
+  vs 0.77). Optimizer awareness helps for AdamW: the noise penalty with `P` scores 0.70,
+  against 0.30 with raw gradients.
+- **The multi-step simulator ranks best overall.** It scores 0.975 pooled with exact
+  noise and 0.935 with probe-fitted noise, and 0.97 for `SNRAdamW`, where sharpness
+  scores 0.82. On matched-GNS pairs with different spectra, it orders 92% of pairs
+  correctly, against 85% for sharpness and 58% for GNS.
+- **Probe quality.** `R` from K=32 microbatches has a median relative error of 13%. Its
+  jackknife +/-2 SE interval covers the truth in only 84% of checkpoints, so the SE is
+  somewhat optimistic. The concentration estimate abstained (`rank_not_resolved`) at 25%
+  of checkpoints.
+
+In the MLP benchmark (`benchmarks/stability_layers_results.json`), the GGN matches the
+finite-difference held-out curvature along probe update directions (Spearman 0.996,
+median log10 ratio -0.002). The activation proxy is noticeably cruder (0.86, -0.18). The
+GGN simulator ranks real continuation severity well (Spearman 0.96, n=46), but here it
+costs about 4x a *real* continuation, because the network is tiny. The activation-proxy
+simulator does not rank severity at all (-0.26).
+
+Caveats: checkpoints from the same configuration are not independent, and each
+configuration has only two held-out seeds. Per the proposal's go/no-go rules, no
+controller is built: the cheap one-step sensors add no value over sharpness, and the
+simulator's advantage has not yet been shown at a cost below that of real continuations.
+
+**Output:** `benchmarks/stability_plrf_{curves,regimes,sensors}.png`, `benchmarks/stability_layers.png`, `*_results.json`
+
+## Diagnostics
 
 `compare_gate_with_external_variance(optimizer, grad_variances)` answers "would this
 variance estimate actually change the gate?" without mutating optimizer state. It returns
@@ -398,6 +442,158 @@ uv run python benchmark_dopr_existing.py    # or --quick
   mis-precondition; for a process group that is *not* the DDP grad-averaging group, pass
   `distributed=False`.
 
+
+## Curvature-aware stability sensing (diagnostics only)
+
+`snr_grad.stability`, `snr_grad.curvature` and `snr_grad.stability_sim` implement the
+diagnostics side of
+[the curvature-aware stability proposal](docs/proposals/curvature-aware-stability-control.md).
+They are **read-only**: nothing here steps an optimizer, writes `.grad`, changes
+parameters, `requires_grad` or optimizer state, or shifts the training RNG (tests check
+all of this). Their forwards also skip the activation cache of a live `DoPr`
+(`isolated_activation_capture`), so probing between `backward()` and `step()` does not
+change the next activation-preconditioned update. No batch-size or learning-rate controller is shipped; the proposal makes
+that conditional on the sensors proving useful.
+
+At a checkpoint, with per-example gradient covariance `Sigma`, a frozen linearized
+optimizer map `P` (update `-lr * P g`) and a PSD curvature proxy `H`, the probe estimates
+
+- `R = tr(H P Sigma P^T)`: the curvature-weighted noise trace. The expected noise-only
+  loss penalty of one step is `lr^2 R / (2B)`.
+- `D_eff = R^2 / tr(A^2)` with `A = H^1/2 P Sigma P^T H^1/2`: the concentration. A small
+  value means that a few sharp, noisy modes dominate, and the relative standard deviation
+  of the noise-only penalty is `sqrt(2 / D_eff)` for Gaussian noise.
+- Euclidean and optimizer-aware gradient noise scales, the unbiased first-order progress
+  `g^T P mu`, and the mean-curvature term, all on the **per-example** scale.
+
+```python
+from snr_grad import (
+    ActivationCurvature, GGNCurvature, LowRankCurvature, StabilityProbe,
+    QuadraticStabilitySimulator, collect_microbatch_gradients,
+)
+
+# K disjoint, equally sized microbatches at the current parameters; .grad and RNG restored.
+# Keep correlated rows (same sequence / document / duplicate) in one microbatch:
+# spreading them across microbatches makes the probe underestimate the noise.
+grads = collect_microbatch_gradients(model, loss_fn, batch, num_splits=32,
+                                     group_ids=sequence_ids)
+
+curv = GGNCurvature(model, x_heldout, lambda out: mse(out, y_heldout))
+# or, from DoPr-style activation statistics (cheaper, cruder):
+# curv = ActivationCurvature.from_model(model, lambda m: m(x_heldout))
+
+probe = StabilityProbe.from_microbatches(grads, microbatch_size=len(batch[0]) // 32,
+                                         optimizer=optimizer, curvature=curv)
+m = probe.measure(lr=3e-4, batch_size=256)
+m.risk_trace_per_example, m.risk_trace_ci          # R and a log-scale jackknife-t interval
+m.concentration, m.concentration_status            # None plus a reason when it abstains
+m.noise_penalty, m.risk_score, m.flags             # risk_score is an uncalibrated ranking
+
+# Checkpoint-local continuation: clones params and *all* optimizer state, then replays
+# the real optimizer step on synthetic quadratic-surrogate gradients.
+# A low-rank GGN keeps each simulated step cheap.
+low = LowRankCurvature.from_proxy(curv, probe.params, rank=16, trace_probes=16)
+sim = QuadraticStabilitySimulator.from_checkpoint(optimizer, probe, low, model=model,
+                                                  loss0=val_loss, noise_model="resample",
+                                                  noise_scaling="loss_proportional")
+sim.run(n_seeds=16, horizon=200).summary()         # excursion frequency and severity
+```
+
+Pieces:
+
+| Component | What it does |
+| --- | --- |
+| `frozen_update_map(opt)` | One-step linear map `P` for SGD, Adam/AdamW, `SNRAdamW` (gated or ungated) and `DoPr`. With `at_gradient=...`, Adam's map is the exact diagonal Jacobian, including the `g^2` dependence of `v`, which matters early in training. The Muon family, rotated, MARS and schedule-free variants return an explicit *unsupported* map, because a diagonal linearization of those updates would be wrong. |
+| `ExactQuadraticCurvature` | A known dense or diagonal Hessian. Indefinite matrices raise an error unless you choose `psd_projection="clip"`, `"abs"` or `"none"` (the last is flagged `psd=False`). |
+| `ActivationCurvature` | The `I_out kron C_h` per-layer proxy from the uncentered input correlation (`ActivationPreconditioner.covariance_snapshot()` is the new read-only DoPr accessor). Biases and norm parameters are listed as uncovered. |
+| `LowRankCurvature` | The top-r eigenpairs of any proxy, computed by randomized subspace iteration, plus an optional isotropic remainder (deflated Hutchinson). It makes the simulator's per-step curvature cost two thin matrix products. |
+| `GGNCurvature` / `HessianCurvature` | `torch.func` Jacobian-vector and Hessian-vector products on a held-out batch. The Hessian backend may be indefinite and is never used for `D_eff`. |
+| `StabilityProbe` | GNS, `R` with a jackknife SE and a log-scale jackknife-t interval (`risk_trace_ci`), bias-corrected `D_eff`, and the local expected loss change. It **abstains** (`insufficient_samples`, `rank_not_resolved`, `indefinite_curvature`) instead of reporting a rank that `K` samples cannot resolve; the plug-in value is always at most `K-1`. `independent=False` disables every `1/B` extrapolation. |
+| `QuadraticStabilitySimulator` | Seeded replay of the real optimizer on `L0 + g0^T d + d^T H d / 2`. The noise is fitted from the probe: Gaussian (`GaussianProbeNoise`, optionally Student-t), or resampled from the observed deviations (`ResampledProbeNoise`, which keeps heavy tails), with optional loss-proportional scaling. It runs Muon and SNR gates exactly, because it calls their real `step`. |
+| `detect_excursions` | The shared, preregistered spike definition (trailing-median baseline, robust MAD threshold plus a relative floor, sustained divergence tracked separately). |
+| `exact_noise_geometry`, `spectrum_metrics` | Ground truth for quadratic toys, and cheap activation-spectrum proxies, which are labelled as such. |
+
+A follow-up study ([`studies/stability_study`](studies/stability_study/README.md)) tests
+these pieces in depth: decoupling noise from sharpness, estimator calibration,
+simulator noise models, optimizer timescales, correlated data, and network scale.
+
+Caveats: these are local surrogate quantities, not calibrated spike probabilities (so there
+is no `spike_probability` field). Correlated tokens break the `Sigma / B` scaling, and the
+activation proxy assumes identity output curvature. See the benchmarks below for how well
+each piece held up.
+
+## Adam memory guard -- preventing preconditioner-memory spikes
+
+Adam steps each coordinate by `lr * m_hat / (sqrt(v_hat) + eps)`. When a coordinate's
+gradient goes quiet, its second moment `v_hat` decays at rate `beta2`. When the gradient
+returns, the step can reach `A(beta1, beta2) = max_k (1-beta1^k)/sqrt(1-beta2^k)` times
+`lr`: 6.6 for `beta2 = 0.999`, against at most about 1 in steady training. In
+[study E9](studies/stability_study/README.md), such overshoots in a few converged
+coordinates caused large, isolated loss spikes in small Transformer LMs trained on
+confident targets. The curvature sensors above did not see them.
+
+`GuardedOptimizer` wraps any Adam-family optimizer and bounds each coordinate's update
+ratio at `limit` (default 1). By default (`mode="refill"`) it also raises the stale
+second moment to the value at which the ratio equals `limit`, so the following steps are
+damped too. Steady coordinates are untouched.
+
+```python
+from snr_grad import DoPr, GuardedOptimizer, MemoryGuardConfig, SNRAdamW, adam_update_overshoot
+
+base = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.999))
+opt = GuardedOptimizer(base)                     # limit=1.0, mode="refill"
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(base, T_max=1000)   # attach to base
+loss.backward(); opt.step(); opt.zero_grad(); sched.step()
+
+# Composes with the other wrappers and with the SNR optimizers:
+opt = GuardedOptimizer(DoPr(SNRAdamW(model.parameters(), lr=3e-4), model),
+                       MemoryGuardConfig(limit=1.0, mode="cap", track_stats=True))
+opt.guard_stats                                  # {"max_ratio", "clipped", "refilled"}
+
+# External form, around an optimizer you step yourself:
+from snr_grad import MemoryGuard
+guard = MemoryGuard(optimizer)
+loss.backward(); guard.snapshot_(); optimizer.step(); guard.guard_()
+
+# Monitoring only (free): per-parameter max |m_hat| / (sqrt(v_hat) + eps)
+adam_update_overshoot(optimizer)
+```
+
+How it works:
+- The guard snapshots the parameters, lets the base optimizer step, and then clips each
+  coordinate's displacement to `limit * lr`.
+- Decoupled weight decay is subtracted before clipping and left unchanged.
+  `torch.optim.Adam`'s coupled decay is treated as part of the update.
+- Because it acts on the actual step, it is exact whatever the base does to the
+  gradient internally (gating, Grokfast, maximize, a `DoPr` stage).
+- The refill needs Adam-style state (`exp_avg`, `exp_avg_sq`, `step`); parameters
+  without it are only clipped. AMSGrad's `max_exp_avg_sq` is raised too.
+- With `limit=math.inf` the wrapper reproduces the base optimizer to machine precision
+  (tested).
+
+Evidence (study E10; small LMs, 6 seeds each):
+- On a configuration where AdamW spiked in 6 of 6 runs (severity up to 24.5), the
+  wrapper with default settings left 1 run with an event, of severity 0.43.
+- It did not change the loss on that task or on a standard, non-spiking language
+  (late loss 1.680 for both).
+- For comparison, AMSGrad still produced a spike of 19.4, and a larger `eps` on the
+  biases did not help.
+- These are small models, so treat the result as promising rather than established at
+  scale.
+
+Cost:
+- One extra copy of the parameters, plus a few elementwise passes per step.
+- On CPU, a full training step of a 110k- and a 1.6M-parameter Transformer took 28%
+  and 12% longer. The share falls as forward and backward dominate.
+- `track_stats=True` adds one device sync per step.
+
+Scope: per-coordinate optimizers whose parameters hold the iterate (`Adam`, `AdamW`,
+including `amsgrad`, `foreach` and `fused`; `SNRAdamW`; `MARSSNRAdamW`; `DoPr` around one
+of these). It is not meaningful for the Muon family, whose orthogonalized
+per-coordinate step is not on the `lr` scale, or for the schedule-free optimizers,
+whose parameters hold an interpolation. Like `DoPr`, `GuardedOptimizer` is not a
+`torch.optim.Optimizer` subclass, so attach schedulers to the base. The wrapper calls
+a `closure` once itself, so LBFGS-style optimizers are not supported.
 
 ## Experimental extensions
 
@@ -742,6 +938,8 @@ python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
 python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
 python benchmark_adaptive_threshold.py  # Adaptive vs static gate under regime shifts
+python benchmark_stability_plrf.py      # Stability sensors on PLRF spikes (~50 min; --quick)
+python benchmark_stability_layers.py    # Curvature-proxy fidelity + simulator on an MLP
 ```
 
 ### `benchmark.py` -- Core SNR gating evaluation
@@ -909,6 +1107,16 @@ Inherits all other parameters from `SNRAdamW`.
 - **`resolve_alpha(alpha, *, batch_size, dataset_size)`** -- Resolve an alpha spec to a float.
 - **`compute_gate(m_hat, s_hat, *, gate, alpha, lambda_pop, gate_eps)`** -- Compute the gate tensor from bias-corrected moments.
 - **`per_sample_variance_term(per_sample_grads)`** -- Compute exact diagonal variance from per-example gradients.
+
+### Adam memory guard (`snr_grad.guard`)
+
+See [Adam memory guard](#adam-memory-guard----preventing-preconditioner-memory-spikes) for usage.
+
+- **`GuardedOptimizer(base_optimizer, config=None)`** -- Delegating wrapper: snapshot, `base.step()`, then clip (and refill). Exposes `guard_stats`; other attributes forward to the base.
+- **`MemoryGuard(optimizer, config=None)`** -- External form: `.snapshot_()` before and `.guard_()` after the base step; `.last_stats`.
+- **`MemoryGuardConfig(limit=1.0, mode="refill", decoupled_weight_decay=None, track_stats=False)`** -- `mode` is `"refill"` or `"cap"`; `decoupled_weight_decay=None` auto-detects (`torch.optim.Adam` is coupled, everything else decoupled unless the group says otherwise).
+- **`adam_update_overshoot(optimizer)`** -- Per-parameter `max |m_hat| / (sqrt(v_hat) + eps)` from Adam-style state; a free spike monitor.
+- **`adam_reactivation_gain(beta1, beta2, silence=inf, return_ratio=1.0)`** -- The bound `A` on a reactivated coordinate's step, in units of `lr`.
 
 ### Variance estimation (`snr_grad.variance`)
 

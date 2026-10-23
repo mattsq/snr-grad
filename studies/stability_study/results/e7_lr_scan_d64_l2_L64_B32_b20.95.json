@@ -1,0 +1,62 @@
+{
+ "config": {
+  "d": 64,
+  "layers": 2,
+  "L": 64,
+  "B": 32,
+  "steps": 1500,
+  "lrs": "0.02,0.03,0.05,0.07,0.1,0.15",
+  "beta2": 0.95,
+  "threads": 1
+ },
+ "rows": [
+  {
+   "lr": 0.02,
+   "events": 0.0,
+   "spiked": 0.0,
+   "diverged": 0.0,
+   "max_excursion_median": 0.019584440253852062,
+   "final_median": 1.6963709592819214
+  },
+  {
+   "lr": 0.03,
+   "events": 0.0,
+   "spiked": 0.0,
+   "diverged": 0.0,
+   "max_excursion_median": 0.022671063262232193,
+   "final_median": 1.7157460451126099
+  },
+  {
+   "lr": 0.05,
+   "events": 0.0,
+   "spiked": 0.0,
+   "diverged": 0.0,
+   "max_excursion_median": 0.027551431510983614,
+   "final_median": 1.7607293128967285
+  },
+  {
+   "lr": 0.07,
+   "events": 0.0,
+   "spiked": 0.0,
+   "diverged": 0.0,
+   "max_excursion_median": 0.04640346714902349,
+   "final_median": 2.717424154281616
+  },
+  {
+   "lr": 0.1,
+   "events": 0.0,
+   "spiked": 0.0,
+   "diverged": 0.0,
+   "max_excursion_median": 0.02670388893056302,
+   "final_median": 3.53767728805542
+  },
+  {
+   "lr": 0.15,
+   "events": 0.0,
+   "spiked": 0.0,
+   "diverged": 0.0,
+   "max_excursion_median": 0.02996313669039467,
+   "final_median": 3.7016189098358154
+  }
+ ]
+}

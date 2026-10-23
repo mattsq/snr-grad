@@ -1,0 +1,262 @@
+{
+ "pooled": {
+  "noise_to_loss": {
+   "n": 240,
+   "partial_spearman_given_sharpness": -0.6660209125094757,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.717195288122281,
+   "r2_sensor_only": 0.32814790904654245
+  },
+  "upper_tail_ratio": {
+   "n": 240,
+   "partial_spearman_given_sharpness": -0.6464361812122338,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.7085520377024315,
+   "r2_sensor_only": 0.3730142638637277
+  },
+  "rel_sd": {
+   "n": 240,
+   "partial_spearman_given_sharpness": 0.5726382748240328,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.6940216927970599,
+   "r2_sensor_only": 0.5590940771073322
+  },
+  "noise_penalty": {
+   "n": 240,
+   "partial_spearman_given_sharpness": -0.34218488008164144,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.6298982445274282,
+   "r2_sensor_only": 0.030904038906744646
+  },
+  "gns_optimizer": {
+   "n": 240,
+   "partial_spearman_given_sharpness": -0.6846390538577082,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.7280361489938609,
+   "r2_sensor_only": 0.6272653562586652
+  },
+  "probe_noise_to_loss": {
+   "n": 240,
+   "partial_spearman_given_sharpness": -0.6479184319833693,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.7152938716710531,
+   "r2_sensor_only": 0.3179842207808822
+  },
+  "sim_probe_lossprop_severity": {
+   "n": 240,
+   "partial_spearman_given_sharpness": 0.8777124042469866,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.8629084776921445,
+   "r2_sensor_only": 0.8383268016012639
+  },
+  "sim_exact_lossprop_severity": {
+   "n": 239,
+   "partial_spearman_given_sharpness": 0.9512845504459069,
+   "r2_sharpness_only": 0.5429464095466658,
+   "r2_sharpness_plus_sensor": 0.9527035047508084,
+   "r2_sensor_only": 0.9527525303870753
+  },
+  "activation_participation_ratio": {
+   "n": 240,
+   "partial_spearman_given_sharpness": -0.5768369692599699,
+   "r2_sharpness_only": 0.5433552163213244,
+   "r2_sharpness_plus_sensor": 0.726722306371023,
+   "r2_sensor_only": 0.5694992713835901
+  }
+ },
+ "sgd": {
+  "noise_to_loss": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.07006218377784117,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.8662934324320409,
+   "r2_sensor_only": 0.7768424996897453
+  },
+  "upper_tail_ratio": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.05335819859879267,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.8633349739190863,
+   "r2_sensor_only": 0.7898313848430737
+  },
+  "rel_sd": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.13672300501197546,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.903328798278826,
+   "r2_sensor_only": 0.5788128807615669
+  },
+  "noise_penalty": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.0838198029246695,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.8770645301994938,
+   "r2_sensor_only": 0.016870785065214222
+  },
+  "gns_optimizer": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.031180220548797592,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.8806220959950039,
+   "r2_sensor_only": 0.7009587797475894
+  },
+  "probe_noise_to_loss": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.1975305340432067,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.8684927497045255,
+   "r2_sensor_only": 0.7364629428143697
+  },
+  "sim_probe_lossprop_severity": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.20146375856468954,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.9501898517064379,
+   "r2_sensor_only": 0.8203175282175182
+  },
+  "sim_exact_lossprop_severity": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.2014080371541375,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.9644436059042762,
+   "r2_sensor_only": 0.9528657468581625
+  },
+  "activation_participation_ratio": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.11791368449867175,
+   "r2_sharpness_only": 0.8672126620241444,
+   "r2_sharpness_plus_sensor": 0.8691310797314802,
+   "r2_sensor_only": 0.5201004780514282
+  }
+ },
+ "adamw": {
+  "noise_to_loss": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.16341722120775426,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9856900933338432,
+   "r2_sensor_only": 0.9827827865232936
+  },
+  "upper_tail_ratio": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.13481221344760194,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9833570877028541,
+   "r2_sensor_only": 0.9823771323313816
+  },
+  "rel_sd": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.09805940342018306,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9877156366025703,
+   "r2_sensor_only": 0.8615151318420025
+  },
+  "noise_penalty": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.21913628773174823,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9693310387433728,
+   "r2_sensor_only": 0.4599636033022724
+  },
+  "gns_optimizer": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.0576793469036661,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9690200907062805,
+   "r2_sensor_only": 0.8837137972230994
+  },
+  "probe_noise_to_loss": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.02134909015905894,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9791417552702577,
+   "r2_sensor_only": 0.9672179854478388
+  },
+  "sim_probe_lossprop_severity": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.12290902980875147,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9773476459427798,
+   "r2_sensor_only": 0.9011864086894906
+  },
+  "sim_exact_lossprop_severity": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.04718545922678527,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9792753280983181,
+   "r2_sensor_only": 0.9745723499851324
+  },
+  "activation_participation_ratio": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.08446531480298838,
+   "r2_sharpness_only": 0.9694925475705285,
+   "r2_sharpness_plus_sensor": 0.9737842191413528,
+   "r2_sensor_only": 0.9257170218041493
+  }
+ },
+ "snr_adamw": {
+  "noise_to_loss": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.055761397094149075,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.612701653529033,
+   "r2_sensor_only": 0.4913817149857169
+  },
+  "upper_tail_ratio": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.0006773168421486169,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.6110179853956388,
+   "r2_sensor_only": 0.5368944372343769
+  },
+  "rel_sd": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.26609113356505404,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.6214371836152067,
+   "r2_sensor_only": 0.40601148286811684
+  },
+  "noise_penalty": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.5878261723520727,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.7694008712017077,
+   "r2_sensor_only": 0.006579001471788026
+  },
+  "gns_optimizer": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.2189673865359661,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.6125603720402684,
+   "r2_sensor_only": 0.43182779842244134
+  },
+  "probe_noise_to_loss": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.0046112673207062355,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.6105297360539669,
+   "r2_sensor_only": 0.48945238393341606
+  },
+  "sim_probe_lossprop_severity": {
+   "n": 80,
+   "partial_spearman_given_sharpness": 0.7922223034900364,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.8605036304081508,
+   "r2_sensor_only": 0.814766642482533
+  },
+  "sim_exact_lossprop_severity": {
+   "n": 79,
+   "partial_spearman_given_sharpness": 0.9151653931414864,
+   "r2_sharpness_only": 0.6412424847701328,
+   "r2_sharpness_plus_sensor": 0.9239359824137681,
+   "r2_sensor_only": 0.9339023088178185
+  },
+  "activation_participation_ratio": {
+   "n": 80,
+   "partial_spearman_given_sharpness": -0.537997688513253,
+   "r2_sharpness_only": 0.6114278427357118,
+   "r2_sharpness_plus_sensor": 0.6789981161069513,
+   "r2_sensor_only": 0.48973821209201773
+  }
+ }
+}

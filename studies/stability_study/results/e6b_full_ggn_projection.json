@@ -1,0 +1,70 @@
+{
+ "rows": [
+  {
+   "optimizer": "sgd",
+   "lr": 0.1,
+   "real_severity": 0.04577964697718213,
+   "full_unprojected_severity": 0.03504255251704123,
+   "full_unprojected_det_min_over_L0": 0.9115237239291447,
+   "full_unprojected_below_zero": false,
+   "full_projected64_severity": 0.03969826522029142,
+   "full_projected64_det_min_over_L0": 0.9627332422074603,
+   "full_projected64_below_zero": false
+  },
+  {
+   "optimizer": "sgd",
+   "lr": 1.0,
+   "real_severity": 0.0,
+   "full_unprojected_severity": 0.0,
+   "full_unprojected_det_min_over_L0": NaN,
+   "full_unprojected_below_zero": false,
+   "full_projected64_severity": 0.0,
+   "full_projected64_det_min_over_L0": NaN,
+   "full_projected64_below_zero": false
+  },
+  {
+   "optimizer": "adamw",
+   "lr": 0.003,
+   "real_severity": 0.14746997684652072,
+   "full_unprojected_severity": 0.11943902025719128,
+   "full_unprojected_det_min_over_L0": 0.7190709309868428,
+   "full_unprojected_below_zero": false,
+   "full_projected64_severity": 0.13109740362186495,
+   "full_projected64_det_min_over_L0": 0.8527394505630057,
+   "full_projected64_below_zero": false
+  },
+  {
+   "optimizer": "adamw",
+   "lr": 0.03,
+   "real_severity": 2.2949907444991515,
+   "full_unprojected_severity": 0.2287594013842859,
+   "full_unprojected_det_min_over_L0": -2.1874053648659744,
+   "full_unprojected_below_zero": true,
+   "full_projected64_severity": 2.1713659721916416,
+   "full_projected64_det_min_over_L0": 0.18826319763521343,
+   "full_projected64_below_zero": false
+  },
+  {
+   "optimizer": "adamw",
+   "lr": 0.1,
+   "real_severity": 1.5294760446663838,
+   "full_unprojected_severity": 0.0,
+   "full_unprojected_det_min_over_L0": -16.268399064781654,
+   "full_unprojected_below_zero": true,
+   "full_projected64_severity": 1.4800727101179192,
+   "full_projected64_det_min_over_L0": 0.17743023348314768,
+   "full_projected64_below_zero": false
+  },
+  {
+   "optimizer": "snr_adamw",
+   "lr": 0.1,
+   "real_severity": 0.08666467140554102,
+   "full_unprojected_severity": 0.04519865357398967,
+   "full_unprojected_det_min_over_L0": 0.7376074282203627,
+   "full_unprojected_below_zero": false,
+   "full_projected64_severity": 0.12724259544242034,
+   "full_projected64_det_min_over_L0": 0.9568132894522298,
+   "full_projected64_below_zero": false
+  }
+ ]
+}

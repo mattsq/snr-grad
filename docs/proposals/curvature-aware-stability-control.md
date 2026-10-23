@@ -1,6 +1,6 @@
 # Proposal: curvature-aware stochastic stability sensing and control
 
-**Status:** Proposed, unimplemented  
+**Status:** Diagnostics implemented (M0, M1, M3 done; M2 partial; M4 not started; see section 11)  
 **Target repository:** `mattsq/snr-grad`  
 **Companion proposal:** [Optimizer-aware batch control](optimizer-aware-batch-control.md)  
 **Primary reference:** Ran Tian and Courtney Paquette, [*Simulating Training Spikes of Deep Neural Networks by Layer-wise Random Feature Models*](https://arxiv.org/abs/2610.13524) (2026)
@@ -314,3 +314,128 @@ The likely worthwhile initial deliverable is **a stability benchmark and a trust
 - [Activation preconditioner](../../src/snr_grad/activation.py): damped activation covariance and DoPr.
 - [Naganuma et al., *Adaptive Batch Sizes Using Non-Euclidean Gradient Noise Scales*](https://arxiv.org/abs/2602.03001): optimizer-specific gradient noise geometries.
 - [Merrill et al., *Critical Batch Size Revisited*](https://arxiv.org/abs/2505.23971): empirical batch-efficiency validation beyond simple noise-scale proxies.
+
+## 11. Implementation status and results
+
+Implemented: `src/snr_grad/stability.py`, `curvature.py`, `stability_sim.py`, the read-only
+`ActivationPreconditioner.covariance_snapshot()`, `benchmark_stability_plrf.py`,
+`benchmark_stability_layers.py`, `tests/test_stability.py` and `tests/test_stability_sim.py`.
+There are two deviations from the sketch above. First, `frozen_update_map(..., at_gradient=g)` gives Adam's *exact* diagonal
+one-step Jacobian: holding `v` fixed was measurably wrong early in training, when
+`(1-beta2)/(1-beta2**t)` is large. Second, PLRF minibatches are sampled exactly in the
+D-dimensional feature space, because `(W^T x, <x, b>)` is jointly Gaussian.
+
+Default-run outcomes (D=256, V=4096, B=8; `alpha_spectrum` in {0.3, 0.5, 0.7, 0.9}; SGD,
+AdamW, SNRAdamW; 240 held-out checkpoints):
+
+- **M0 passed.** The diffuse spectrum (0.3) stays smooth up to 0.95x the measured edge,
+  and concentrated spectra show intermittent excursions without sustained divergence.
+- **M1 passed with caveats.** `R` has a median relative error of 13% at K=32, but the
+  jackknife 2-SE coverage is only 84%, so reported SEs are optimistic. Concentration is
+  bias-corrected and abstains at 25% of checkpoints.
+- **M2 is partial.** Curvature-weighted noise-to-loss beats GNS: GNS is anti-correlated
+  with severity, and pairs at matched GNS are ordered correctly 75% of the time. But it
+  does not beat `lr * lambda_max(P H)`, which reaches Spearman 0.99 within SGD and AdamW.
+  H2 holds for AdamW (optimizer-aware penalty 0.70 vs raw 0.30).
+- **M3: the simulator ranks well.** Spearman is 0.975 pooled, matched-GNS concordance is
+  0.92 (sharpness: 0.85), and SNRAdamW scores 0.97 (sharpness: 0.82). The probe-fitted
+  noise variant reaches 0.935. On a small MLP the GGN simulator ranks real continuations
+  well (0.96), but it costs more than running them; the activation-proxy simulator fails.
+- **M4 was not attempted**, per the go/no-go rule. The useful deliverable so far is the
+  diagnostic and the benchmark, as section 10 anticipated.
+
+## 12. Follow-up study
+
+[`studies/stability_study`](../../studies/stability_study/README.md) tests the first-round
+conclusions more deeply. The findings that change the picture:
+
+- **H1 holds once noise varies independently of sharpness.** At a fixed learning rate,
+  varying only the batch size leaves SGD's sharpness constant (it cannot rank), while
+  the noise penalty and the simulator rank severity at about 0.95.
+- **One-step sensors are not enough for Adam.** On a concentrated spectrum, AdamW spike
+  severity *increases* with batch size (B=2: 5.0, B=64: 8.4). Only the multi-step
+  simulator ranks every (optimizer, spectrum) cell correctly. This supports H3, and it
+  argues against any controller that responds to spike risk by simply raising the batch
+  size.
+- **The simulator is calibrated on PLRF.** Resampled noise from 128 microbatches with
+  loss-proportional scaling gives an event-fraction error of 0.07-0.09 and no bias; the
+  oracle noise gives 0.045 (M3 is strengthened).
+- **SNR gating (Stage 2):** it suppresses spikes and improves progress at a moderately
+  concentrated spectrum. At the most concentrated spectrum the default gate does not
+  suppress them, and a slow variance EMA (`rho=0.999`) produces rare but very large
+  excursions. The soft gate suppresses spikes at a modest cost in progress.
+- **Networks:** truncated curvature (low-rank, or a GGN on fewer samples x outputs than
+  parameters) makes the surrogate unbounded below unless the dynamics are projected
+  onto the curvature subspace. With projection, a rank 4-16 GGN ranks MLP severity at
+  0.85-0.98 up to 284k parameters. A cost advantage over real continuations is not yet
+  shown.
+
+M4 (a controller) remains unstarted. The evidence now favours a simulator-based risk
+check over one-step sensors, but the cost case needs a model where real steps are
+expensive.
+
+### 12.1 Scaling up (study E7)
+
+On a small Transformer LM (31k-430k parameters):
+- With an optimised simulator loop, the simulator's per-step cost advantage is about
+  tokens-per-step / 200. A single checkpoint query pays off from about 1k tokens per
+  step, so for realistic LM training the cost case for M4 is settled in principle.
+- Answering "which learning rates are unsafe from here?", one simulator build places the
+  instability onset within about 2x of real continuations. With rank-64 curvature it is
+  slightly conservative on average. It beats Adam's edge-of-stability rule (threshold
+  3.8), which misses most of these instabilities.
+- It does not forecast blow-up magnitudes.
+- Noise-driven intermittent spikes at a fixed learning rate are rare at these sizes, so a
+  controller trial (M4) on the targeted phenomenon still needs a larger model.
+
+### 12.2 When to expect large noise-driven spikes (study E8)
+
+Closed-form indices (`snr_grad.stability_theory`, derivations in
+`docs/stability-theory.md`) predict PLRF spike severity well:
+- **SGD:** `Phi = kappa sqrt(2/D)` explains log severity with R^2 0.95; together with the
+  Kesten tail, R^2 0.99. The exact stochastic edge `kappa` separates divergence from
+  the bursty `D ~ 1` regime.
+- **Adam:** `Phi` predicts severe excursions with AUROC 0.97 in Adam-preconditioned
+  coordinates.
+
+Large spikes additionally require the gradient noise to be aligned with the sharpest
+direction (`w >~ 0.1`). Tiny Adam-trained LMs miss this badly: `Phi` is 30-300x too
+small, and Adam's whitening drops `w` to about 1e-3. Their scaling trends do not close
+the gap. So the controller trial (M4) should target settings that pass a `w` / `Phi` /
+`kappa` screen, most likely SGD-trained models with aligned noise, rather than simply
+larger Adam LMs.
+
+### 12.3 Adam's memory spikes (study E9)
+
+A literature survey pointed to a different mechanism for Adam: the second-moment
+memory `v_hat` decays, the effective step grows, and the run overshoots. Study E9 found:
+- **Noise protects Adam on a quadratic, but not in a network.** The protection index
+  `R_floor` works on quadratics. In a tiny LM on a confident language, `beta2 = 0.999`
+  spikes in 5 of 5 seeds (severity up to 24.5) with `R_floor < 1`. The spikes are
+  carried by a few converged bias vectors.
+- **The curvature sensors of this proposal are blind to these spikes.** The edge
+  ratio was 0.05-0.13, and `Phi` and the simulator build on the same frozen-`P`
+  linearization.
+- **A cheap alternative signal exists.** The per-tensor overshoot `max |m|/sqrt(v_hat)`,
+  bounded by `A(beta1, beta2) = max_k (1-beta1^k)/sqrt(1-beta2^k)`, separated spiking
+  from quiet runs with AUROC 0.97 at no cost.
+
+For M4 with Adam, the controller should therefore watch the optimizer's memory as well
+as curvature and noise. The simulator could capture this mechanism only if it replayed
+`v_hat` over a horizon long enough for the memory to decay (hundreds to thousands of
+steps at `beta2 = 0.999`) on the coordinates that carry it.
+
+### 12.4 Mitigation (study E10)
+
+On the spiking configuration of E9, bounding Adam's per-coordinate update ratio
+`|m_hat|/(sqrt(v_hat)+eps)` at 1 removes the large spikes (6 of 6 runs spiking, up to
+24.5, becomes 2 of 6, at most 1.3) without changing the loss on either language tested.
+Refilling `v_hat` instead of clipping the step is slightly stronger. `beta1 = 0.98` and
+`beta2 = 0.95` also work but change the optimizer everywhere; AMSGrad only partly helps
+and `eps` on biases does not. For M4 with Adam, this suggests a simple default: a
+memory guard inside the optimizer, plus the overshoot signal as a monitor, with the
+curvature and noise machinery reserved for the noise-driven instabilities it was built
+for.
+
+The guard ships as `snr_grad.GuardedOptimizer` / `MemoryGuard` (default: limit 1, refill),
+with `adam_update_overshoot` as the monitor; see the main README.
