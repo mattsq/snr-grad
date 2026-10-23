@@ -436,3 +436,6 @@ and `eps` on biases does not. For M4 with Adam, this suggests a simple default: 
 memory guard inside the optimizer, plus the overshoot signal as a monitor, with the
 curvature and noise machinery reserved for the noise-driven instabilities it was built
 for.
+
+The guard ships as `snr_grad.GuardedOptimizer` / `MemoryGuard` (default: limit 1, refill),
+with `adam_update_overshoot` as the monitor; see the main README.

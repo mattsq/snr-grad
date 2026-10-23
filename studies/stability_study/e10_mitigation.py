@@ -18,6 +18,8 @@ Variants (all without weight decay):
   eps1d_1e-5   the same with eps = 1e-5
   beta1_0.98   (beta1, beta2) = (0.98, 0.999)
   beta2_0.95   (beta1, beta2) = (0.9, 0.95)
+  library      the library form: snr_grad.GuardedOptimizer(torch AdamW), default config
+               (limit 1, refill); should reproduce "refill"
 
 Run: uv run python studies/stability_study/e10_mitigation.py [--part spiking|progress]
 """
@@ -30,9 +32,9 @@ import torch
 
 from common import save
 from tinylm import MarkovLanguage, TinyLM, lm_loss
-from snr_grad import detect_excursions
+from snr_grad import GuardedOptimizer, detect_excursions
 
-VARIANTS = ("adamw", "cap", "refill", "amsgrad", "eps1d_1e-4", "eps1d_1e-5", "beta1_0.98", "beta2_0.95")
+VARIANTS = ("adamw", "cap", "refill", "amsgrad", "eps1d_1e-4", "eps1d_1e-5", "beta1_0.98", "beta2_0.95", "library")
 
 
 class GuardedAdam(torch.optim.Optimizer):
@@ -77,6 +79,8 @@ class GuardedAdam(torch.optim.Optimizer):
 
 
 def make_optimizer(variant, model, lr):
+    if variant == "library":
+        return GuardedOptimizer(torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0))
     if variant in ("cap", "refill"):
         return GuardedAdam(model.parameters(), lr, limit=1.0, mode=variant)
     if variant.startswith("eps1d_"):

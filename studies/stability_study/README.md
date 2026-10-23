@@ -703,6 +703,17 @@ this mechanism; the overshoot `max |m|/sqrt(v_hat)` per tensor, bounded by
     severity 3 had an overshoot of at least 3.7 lr.
   - Smaller events can come from another mechanism.
 
+**Library form.** The refill guard is now `snr_grad.GuardedOptimizer` (with `MemoryGuard`
+for the external form and `adam_update_overshoot` as the monitor). It wraps any
+Adam-family optimizer, clips each coordinate's step after the base step, and refills
+`v_hat` from the post-step state. Run as the `library` variant of `e10_mitigation.py`
+around torch AdamW with default settings:
+- **Spiking setting:** 1 of 6 runs with an event (largest severity 0.43); the late loss
+  was unchanged.
+- **Standard language:** late loss 1.680, the same as AdamW.
+- The study's own refill gave 2 of 6 (at most 0.9). The two agree to the stored
+  precision for the first 1200 steps; float32 rounding then separates the trajectories.
+
 **Verdict.** On this setting, a one-line change to Adam removes the memory spikes with
 no measurable cost: bound the per-coordinate update ratio, preferably by refilling
 `v_hat`. Changing `beta1` or `beta2` does nearly as well, but it changes the optimizer

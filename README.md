@@ -520,6 +520,79 @@ is no `spike_probability` field). Correlated tokens break the `Sigma / B` scalin
 activation proxy assumes identity output curvature. See the benchmarks below for how well
 each piece held up.
 
+## Adam memory guard -- preventing preconditioner-memory spikes
+
+Adam steps each coordinate by `lr * m_hat / (sqrt(v_hat) + eps)`. When a coordinate's
+gradient goes quiet, its second moment `v_hat` decays at rate `beta2`. When the gradient
+returns, the step can reach `A(beta1, beta2) = max_k (1-beta1^k)/sqrt(1-beta2^k)` times
+`lr`: 6.6 for `beta2 = 0.999`, against at most about 1 in steady training. In
+[study E9](studies/stability_study/README.md), such overshoots in a few converged
+coordinates caused large, isolated loss spikes in small Transformer LMs trained on
+confident targets. The curvature sensors above did not see them.
+
+`GuardedOptimizer` wraps any Adam-family optimizer and bounds each coordinate's update
+ratio at `limit` (default 1). By default (`mode="refill"`) it also raises the stale
+second moment to the value at which the ratio equals `limit`, so the following steps are
+damped too. Steady coordinates are untouched.
+
+```python
+from snr_grad import DoPr, GuardedOptimizer, MemoryGuardConfig, SNRAdamW, adam_update_overshoot
+
+base = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.999))
+opt = GuardedOptimizer(base)                     # limit=1.0, mode="refill"
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(base, T_max=1000)   # attach to base
+loss.backward(); opt.step(); opt.zero_grad(); sched.step()
+
+# Composes with the other wrappers and with the SNR optimizers:
+opt = GuardedOptimizer(DoPr(SNRAdamW(model.parameters(), lr=3e-4), model),
+                       MemoryGuardConfig(limit=1.0, mode="cap", track_stats=True))
+opt.guard_stats                                  # {"max_ratio", "clipped", "refilled"}
+
+# External form, around an optimizer you step yourself:
+from snr_grad import MemoryGuard
+guard = MemoryGuard(optimizer)
+loss.backward(); guard.snapshot_(); optimizer.step(); guard.guard_()
+
+# Monitoring only (free): per-parameter max |m_hat| / (sqrt(v_hat) + eps)
+adam_update_overshoot(optimizer)
+```
+
+How it works:
+- The guard snapshots the parameters, lets the base optimizer step, and then clips each
+  coordinate's displacement to `limit * lr`.
+- Decoupled weight decay is subtracted before clipping and left unchanged.
+  `torch.optim.Adam`'s coupled decay is treated as part of the update.
+- Because it acts on the actual step, it is exact whatever the base does to the
+  gradient internally (gating, Grokfast, maximize, a `DoPr` stage).
+- The refill needs Adam-style state (`exp_avg`, `exp_avg_sq`, `step`); parameters
+  without it are only clipped. AMSGrad's `max_exp_avg_sq` is raised too.
+- With `limit=math.inf` the wrapper reproduces the base optimizer to machine precision
+  (tested).
+
+Evidence (study E10; small LMs, 6 seeds each):
+- On a configuration where AdamW spiked in 6 of 6 runs (severity up to 24.5), the
+  wrapper with default settings left 1 run with an event, of severity 0.43.
+- It did not change the loss on that task or on a standard, non-spiking language
+  (late loss 1.680 for both).
+- For comparison, AMSGrad still produced a spike of 19.4, and a larger `eps` on the
+  biases did not help.
+- These are small models, so treat the result as promising rather than established at
+  scale.
+
+Cost:
+- One extra copy of the parameters, plus a few elementwise passes per step.
+- On CPU, a full training step of a 110k- and a 1.6M-parameter Transformer took 28%
+  and 12% longer. The share falls as forward and backward dominate.
+- `track_stats=True` adds one device sync per step.
+
+Scope: per-coordinate optimizers whose parameters hold the iterate (`Adam`, `AdamW`,
+including `amsgrad`, `foreach` and `fused`; `SNRAdamW`; `MARSSNRAdamW`; `DoPr` around one
+of these). It is not meaningful for the Muon family, whose orthogonalized
+per-coordinate step is not on the `lr` scale, or for the schedule-free optimizers,
+whose parameters hold an interpolation. Like `DoPr`, `GuardedOptimizer` is not a
+`torch.optim.Optimizer` subclass, so attach schedulers to the base. The wrapper calls
+a `closure` once itself, so LBFGS-style optimizers are not supported.
+
 ## Experimental extensions
 
 This repo includes several experimental optimizers that extend SNR gating to matrix-aware update strategies for 2D weight parameters. Non-2D parameters (biases, norms, vectors) fall back to standard SNR-gated AdamW-style updates in all variants.
@@ -1032,6 +1105,16 @@ Inherits all other parameters from `SNRAdamW`.
 - **`resolve_alpha(alpha, *, batch_size, dataset_size)`** -- Resolve an alpha spec to a float.
 - **`compute_gate(m_hat, s_hat, *, gate, alpha, lambda_pop, gate_eps)`** -- Compute the gate tensor from bias-corrected moments.
 - **`per_sample_variance_term(per_sample_grads)`** -- Compute exact diagonal variance from per-example gradients.
+
+### Adam memory guard (`snr_grad.guard`)
+
+See [Adam memory guard](#adam-memory-guard----preventing-preconditioner-memory-spikes) for usage.
+
+- **`GuardedOptimizer(base_optimizer, config=None)`** -- Delegating wrapper: snapshot, `base.step()`, then clip (and refill). Exposes `guard_stats`; other attributes forward to the base.
+- **`MemoryGuard(optimizer, config=None)`** -- External form: `.snapshot_()` before and `.guard_()` after the base step; `.last_stats`.
+- **`MemoryGuardConfig(limit=1.0, mode="refill", decoupled_weight_decay=None, track_stats=False)`** -- `mode` is `"refill"` or `"cap"`; `decoupled_weight_decay=None` auto-detects (`torch.optim.Adam` is coupled, everything else decoupled unless the group says otherwise).
+- **`adam_update_overshoot(optimizer)`** -- Per-parameter `max |m_hat| / (sqrt(v_hat) + eps)` from Adam-style state; a free spike monitor.
+- **`adam_reactivation_gain(beta1, beta2, silence=inf, return_ratio=1.0)`** -- The bound `A` on a reactivated coordinate's step, in units of `lr`.
 
 ### Variance estimation (`snr_grad.variance`)
 

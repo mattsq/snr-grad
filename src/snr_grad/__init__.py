@@ -74,6 +74,12 @@ from snr_grad.stability_theory import (
     preconditioned_top_eigenvalue,
     sgd_stochastic_edge,
 )
+from snr_grad.guard import (
+    GuardedOptimizer,
+    MemoryGuard,
+    MemoryGuardConfig,
+    adam_update_overshoot,
+)
 from snr_grad.stability_sim import (
     CovarianceFactorNoise,
     GaussianProbeNoise,
@@ -132,6 +138,10 @@ __all__ = [
     "frozen_update_map",
     "per_example_variance_from_batch_mean",
     "spectrum_metrics",
+    "GuardedOptimizer",
+    "MemoryGuard",
+    "MemoryGuardConfig",
+    "adam_update_overshoot",
     "CovarianceFactorNoise",
     "GaussianProbeNoise",
     "QuadraticStabilitySimulator",
