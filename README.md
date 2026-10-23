@@ -742,7 +742,11 @@ python benchmark_spectral.py  # RotatedSNRAdamW & SpectralSNRMuon vs baselines
 python benchmark_hard.py      # Low-rank matrix recovery stress test
 python benchmark_mars_snr.py  # MARSSNRAdamW & MARS+Caution vs baselines
 python benchmark_adaptive_threshold.py  # Adaptive vs static gate under regime shifts
+python benchmark_batch_gpu.py --help  # Accelerator batch-control study (see docs/proposals)
 ```
+
+The CPU batch-control scripts (`benchmark_batch_*.py`, `plot_batch_*.py`) are
+documented in [`docs/batch-control-cpu-results.md`](docs/batch-control-cpu-results.md).
 
 ### `benchmark.py` -- Core SNR gating evaluation
 
@@ -828,6 +832,56 @@ The takeaway: tie the target to expected signal density, prefer a **cap + SNR fl
 
 **Output:** `benchmarks/benchmark_adaptive_threshold.png`, `benchmarks/benchmark_adaptive_threshold_rdist.png`, `benchmarks/benchmark_adaptive_threshold_sweep.png`
 
+### Optimizer-aware batch control
+
+`snr_grad.batch_control` measures per-example gradient noise scales in three
+geometries (Euclidean, frozen-AdamW, and the nuclear-norm dual geometry for
+Muon matrices) and chooses the next batch size from an explicit cost:
+
+```python
+from snr_grad import (CostAwareBatchController, GradientNoiseAccumulator,
+                      StepTimeModel, coupled_lr, tree_split)
+
+sizes = (32, 64, 128, 256, 512)
+times = StepTimeModel({32: .031, 64: .033, 128: .041, 256: .074, 512: .142})
+controller = CostAwareBatchController(sizes, initial=32, sensor="adamw",
+                                      step_times=times, time_price=1.0)
+batch = controller.current
+# In the training loop, with micro-batches of 16 sequences:
+k = batch // 16
+noise = GradientNoiseAccumulator(model.parameters(), k, optimizer=optimizer)
+for chunk in tree_split(next_batch(batch), k):
+    (loss_fn(model, chunk) / k).backward()
+    noise.record()
+for group in optimizer.param_groups:
+    group["lr"] = coupled_lr(base_lr, batch, reference_batch=64, rule="sqrt")
+optimizer.step()
+controller.observe(noise.finish(batch))
+batch = controller.recommend().batch_size
+```
+
+The controller maximizes expected progress per unit cost,
+`[B / (B + B_noise)] / (time_price * seconds(B) + example_price * B + step_price)`.
+Under a pure example price it always picks the smallest batch; an interior
+optimum needs a cost with both a per-step and a per-example part, as on an
+accelerator whose step time is flat until it saturates.
+
+**Status.** The CPU experiments did not find a benefit, and could not have:
+they capped training examples, which makes the smallest batch optimal, spent
+extra examples on probes, and ran where step time is mostly fixed overhead.
+The full record and a review of those design errors are in
+[`docs/batch-control-cpu-results.md`](docs/batch-control-cpu-results.md). A CPU rerun with the free probe and
+the cost-aware controller behaves as its price requires. Under a price per
+example it moves to the smallest batch without spending probe examples, and
+with SNRMuon it matches fixed `B=4` within 0.015 cross-entropy. Two problems
+remain. The frozen-AdamW noise scale is too large to separate small batches.
+Under a price per CPU second, fixed `B=64` still wins, because the largest
+batch is always right on that CPU. The
+accelerator study that tests the idea in a setting where it could help is
+specified in
+[`docs/proposals/batch-control-gpu-study.md`](docs/proposals/batch-control-gpu-study.md),
+and runs with `benchmark_batch_gpu.py` and `analyze_batch_gpu.py`.
+
 ## Diagnostics
 
 Enable `track_stats=True` to inspect gate behaviour after each step (disabled by default to avoid potential device-sync overhead):
@@ -909,6 +963,15 @@ Inherits all other parameters from `SNRAdamW`.
 - **`resolve_alpha(alpha, *, batch_size, dataset_size)`** -- Resolve an alpha spec to a float.
 - **`compute_gate(m_hat, s_hat, *, gate, alpha, lambda_pop, gate_eps)`** -- Compute the gate tensor from bias-corrected moments.
 - **`per_sample_variance_term(per_sample_grads)`** -- Compute exact diagonal variance from per-example gradients.
+
+### Batch control (`snr_grad.batch_control`)
+
+- **`GradientNoiseAccumulator(params, microbatches, *, optimizer, matrix_sensor)`** -- Call `.record(grad_scale=1.0)` after each accumulation backward (loss divided by `microbatches`) and `.finish(batch_size)` to get a `BatchProbe`. No extra passes.
+- **`probe_batch(model, loss_fn, batch, *, splits, optimizer, matrix_sensor)`** -- The same statistics from separate backward passes on a probe batch; does not touch `.grad`.
+- **`CostAwareBatchController(sizes, *, initial, sensor, step_times, time_price, example_price, step_price, ema, warmup, dwell, deadband)`** -- `.observe(probe)`, then `.recommend()` returns a `BatchDecision`; moves one rung at a time toward the most cost-efficient batch.
+- **`StepTimeModel(initial, *, ema)`** -- Seconds per step by batch size, updated with `.record(batch, seconds)`; interpolates unmeasured sizes.
+- **`coupled_lr(base_lr, batch_size, reference_batch, rule)`** -- `"sqrt"`, `"linear"`, or `"none"` learning-rate scaling.
+- **`BatchController`** -- The earlier multiplier-based controller, kept for reproducing the CPU study.
 
 ### Variance estimation (`snr_grad.variance`)
 

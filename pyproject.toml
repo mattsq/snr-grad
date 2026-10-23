@@ -21,4 +21,5 @@ dev = [
     "matplotlib>=3.7.5",
     "psutil>=5.9",
     "pytest>=8.3.5",
+    "scikit-learn>=1.3",
 ]
