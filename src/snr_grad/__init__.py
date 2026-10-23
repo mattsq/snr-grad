@@ -23,6 +23,7 @@ from snr_grad.adaptive import (
     AdaptiveThresholdConfig,
 )
 from snr_grad.activation import (
+    ActivationCovarianceSnapshot,
     ActivationPrecondConfig,
     ActivationPreconditioner,
     DoPr,
@@ -36,6 +37,35 @@ from snr_grad.variance import (
     compare_gate_with_external_variance,
     tree_batch_size,
     tree_split,
+)
+from snr_grad.curvature import (
+    ActivationCurvature,
+    CurvatureMetadata,
+    CurvatureProxy,
+    ExactQuadraticCurvature,
+    GGNCurvature,
+    HessianCurvature,
+    collect_activation_snapshot,
+)
+from snr_grad.stability import (
+    ExcursionReport,
+    FrozenUpdateMap,
+    StabilityMetrics,
+    StabilityProbe,
+    aggregate_probe_groups,
+    collect_microbatch_gradients,
+    detect_excursions,
+    exact_noise_geometry,
+    frozen_update_map,
+    per_example_variance_from_batch_mean,
+    spectrum_metrics,
+)
+from snr_grad.stability_sim import (
+    CovarianceFactorNoise,
+    GaussianProbeNoise,
+    QuadraticStabilitySimulator,
+    SimulationDistribution,
+    clone_optimizer,
 )
 
 __all__ = [
@@ -55,6 +85,7 @@ __all__ = [
     "per_sample_variance_term",
     "resolve_alpha",
     "AdaptiveThresholdConfig",
+    "ActivationCovarianceSnapshot",
     "ActivationPrecondConfig",
     "ActivationPreconditioner",
     "DoPr",
@@ -66,4 +97,27 @@ __all__ = [
     "compare_gate_with_external_variance",
     "tree_batch_size",
     "tree_split",
+    "ActivationCurvature",
+    "CurvatureMetadata",
+    "CurvatureProxy",
+    "ExactQuadraticCurvature",
+    "GGNCurvature",
+    "HessianCurvature",
+    "collect_activation_snapshot",
+    "ExcursionReport",
+    "FrozenUpdateMap",
+    "StabilityMetrics",
+    "StabilityProbe",
+    "aggregate_probe_groups",
+    "collect_microbatch_gradients",
+    "detect_excursions",
+    "exact_noise_geometry",
+    "frozen_update_map",
+    "per_example_variance_from_batch_mean",
+    "spectrum_metrics",
+    "CovarianceFactorNoise",
+    "GaussianProbeNoise",
+    "QuadraticStabilitySimulator",
+    "SimulationDistribution",
+    "clone_optimizer",
 ]

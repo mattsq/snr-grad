@@ -110,6 +110,7 @@ from torch import Tensor, nn
 
 __all__ = [
     "ActivationPrecondConfig",
+    "ActivationCovarianceSnapshot",
     "ActivationPreconditioner",
     "DoPr",
 ]
@@ -217,6 +218,39 @@ class ActivationPrecondConfig:
             raise ValueError(f"ema_beta must be in [0, 1), got {self.ema_beta}.")
         if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}.")
+
+
+@dataclass
+class ActivationCovarianceSnapshot:
+    """Read-only copy of one registered layer's input-activation statistics.
+
+    Returned by :meth:`ActivationPreconditioner.covariance_snapshot`. ``sigma`` is
+    a detached clone, so modifying it never affects preconditioning.
+
+    Attributes:
+        name: Qualified module name.
+        kind: ``"linear"`` (``sigma`` is ``[in, in]``) or ``"embedding"``
+            (``sigma`` is the ``[vocab]`` diagonal of per-token frequencies).
+        weight: The live weight tensor this covariance preconditions. Use it as a
+            key only; never modify it through the snapshot.
+        sigma: *Uncentered* second moment ``E[z z^T]`` (no damping applied).
+        sample_count: Number of activation rows behind a ``"batch"`` snapshot;
+            ``None`` for ``"ema"`` (the EMA does not track an effective count).
+        source: ``"batch"`` (current-step cache) or ``"ema"`` (persistent EMA).
+        damping_tau: The damping ``tau`` that :meth:`precondition_` would add to
+            ``sigma`` (relative term plus floor), for reproducing the solve.
+        centered: Always ``False``; recorded explicitly so downstream curvature
+            code cannot confuse this with a centered covariance.
+    """
+
+    name: str
+    kind: str
+    weight: Tensor
+    sigma: Tensor
+    sample_count: Optional[int]
+    source: str
+    damping_tau: float
+    centered: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +690,65 @@ class ActivationPreconditioner:
         # grad dtype, so the fp16-overflow guard there also covers embeddings (a
         # fp16 division here would overflow to inf *before* the guard runs).
         return g.to(denom.dtype) / denom
+
+    # -- read-only inspection -----------------------------------------------
+
+    @torch.no_grad()
+    def covariance_snapshot(
+        self, *, source: str = "auto"
+    ) -> dict[str, ActivationCovarianceSnapshot]:
+        """Return detached copies of the activation statistics, keyed by module name.
+
+        This is a pure read: it does not advance the step counter, clear the
+        per-step cache, all-reduce, or change any EMA. It is intended for
+        diagnostics (e.g. :mod:`snr_grad.curvature`), not for preconditioning.
+
+        Args:
+            source:
+                ``"batch"`` reads the current-step cache (populated by
+                grad-enabled forwards and cleared by :meth:`precondition_` /
+                :meth:`zero_grad`), so call it *before* ``precondition_``.
+                ``"ema"`` reads the persistent EMA (only with ``ema_beta`` set).
+                ``"auto"`` (default) prefers the batch cache and falls back to
+                the EMA per module. Modules with neither are omitted.
+
+        Returns:
+            ``{module_name: ActivationCovarianceSnapshot}``. Under DDP the batch
+            statistics are *local to this rank* (no all-reduce is issued here).
+        """
+        if source not in {"auto", "batch", "ema"}:
+            raise ValueError(f"source must be 'auto', 'batch' or 'ema', got {source!r}.")
+        out: dict[str, ActivationCovarianceSnapshot] = {}
+        for module, kind in self._kind.items():
+            name = self._name_of_module[module]
+            sigma: Optional[Tensor] = None
+            count: Optional[int] = None
+            used = ""
+            if source in {"auto", "batch"}:
+                acc = self._accum.get(module)
+                if acc is not None:
+                    batch_sigma = self._batch_sigma(kind, acc)
+                    if batch_sigma is not None:
+                        sigma = batch_sigma.detach().clone()
+                        count = int(acc["count"])
+                        used = "batch"
+            if sigma is None and source in {"auto", "ema"} and module in self._sigma_ema:
+                sigma = self._sigma_ema[module].detach().clone()
+                used = "ema"
+            if sigma is None:
+                continue
+            trace = sigma.diagonal().sum() if kind == _LINEAR else sigma.sum()
+            tau = float(self._damping_tau(trace, sigma.shape[0]))
+            out[name] = ActivationCovarianceSnapshot(
+                name=name,
+                kind=kind,
+                weight=self._weight_of_module[module],
+                sigma=sigma,
+                sample_count=count,
+                source=used,
+                damping_tau=tau,
+            )
+        return out
 
     # -- lifecycle ----------------------------------------------------------
 
