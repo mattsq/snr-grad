@@ -102,6 +102,15 @@ and gradient covariance are exact. Stability edges come from the first-round run
   `beta1 = 0.98` (0 of 6) and `beta2 = 0.95` (1 of 6) also work. AMSGrad only partly
   helps (one spike of 19.4), and a larger `eps` on biases does not help at all.
 
+- **Muon (E11).** On the E10 spiking setting, Muon on the hidden matrices (AdamW on the
+  rest) left 1 of 6 runs with an event (severity 0.36) against 6 of 6 for AdamW, even
+  though the AdamW half still overshot to 3.4-5.3 lr; guarding that half too left 0 of
+  6. Muon's matrices have no second moment: every step sat at 1.20 times its nominal
+  spectral size, the Newton-Schulz bound, while AdamW's steps on the same matrices
+  reached 46-97 times it. Muon's own failure appeared at larger lr as cumulative growth
+  (weight spectral norm 22 to 550-650, attention logits to about 6e5, loss 0.154 to
+  0.19-0.24 at lr 0.3), which a per-step guard does not touch and weight decay bounds.
+
 ## E0 - incremental information beyond sharpness (`e0_incremental.py`)
 
 Uses the first-round held-out checkpoints. It reports the partial Spearman correlation
@@ -721,12 +730,101 @@ everywhere, while the guard acts only on coordinates whose memory is stale. Thes
 small models with 6 seeds per variant, so a test at a larger scale should come before
 treating this as a general recommendation.
 
+## E11 - Muon: no memory spikes, cumulative growth instead (`e11_muon.py`)
+
+Question: does Muon have the memory spikes of E9/E10, and what should
+`GuardedOptimizer` do for it? A literature survey
+([`docs/muon-spikes-literature.md`](../../docs/muon-spikes-literature.md)) reports a
+different failure for Muon: weight-norm and attention-logit growth from its flat
+update spectrum (Musec, Kimi K2), not single-step overshoots.
+
+**Settings.**
+- The E10 spiking setting (confident language, B = 32, 3000 steps, no weight decay,
+  6 seeds, the same data order).
+- Muon (torch `Muon`, momentum 0.95, Nesterov, `adjust_lr_fn="match_rms_adamw"`, so its
+  update RMS matches AdamW's at the same lr) on the blocks' weight matrices (qkv, proj,
+  fc1, fc2). AdamW (0.9, 0.999) on embeddings, head, biases and layer norms.
+- lr 0.01 for both halves unless stated.
+- Columns:
+  - "AdamW-half step": the largest `|Delta theta| / lr` over the AdamW parameters
+    after step 500.
+  - "Matrix step": the largest `||Delta W||_2 / lr_eff` over the hidden matrices, with
+    `lr_eff = 0.2 sqrt(max(rows, cols)) lr`, Muon's nominal step. It is 1.20 for every
+    Muon step, the bound `snr_grad.muon_update_gain()`.
+  - "Logit": the largest attention logit on the held-out batch, checked every 50 steps.
+
+| variant | runs with an event | severity (per seed) | late loss | AdamW-half step | matrix step | final `max ||W||_2` | logit (max) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| AdamW everywhere | 6 of 6 | 13.0, 2.3, 2.3, 2.1, 0.7, 3.4 | 0.1544 | 5.0-5.8 | **46-97** | 12-23 | 66-356 |
+| Muon + AdamW | 1 of 6 | 0.07-0.36 | 0.1542 | 3.4-5.3 | 1.20 | 21-24 | 430-1210 |
+| Muon + AdamW (0.9, 0.95) | 1 of 6 | 0.05-0.33 | 0.1536 | 1.06-1.10 | 1.20 | 19-20 | 125-484 |
+| **both halves in `GuardedOptimizer`** (defaults) | **0 of 6** | 0.06-0.20 | 0.1542 | 1.00 | 1.20 | 21-23 | 373-574 |
+
+- **Muon removes the large spikes on its own.** AdamW spiked in 6 of 6 runs here; the
+  largest severity was 13.0 rather than E10's 24.5, probably because E10 ran on two
+  threads and float reductions diverge.
+  - With Muon on the matrices, 1 of 6 runs had an event, of severity 0.36. This held
+    although the biases and layer norms, where E9d located the spikes, still overshot
+    to 3.4-5.3 lr.
+  - So the spikes need the stale coordinates of the weight matrices too, which agrees
+    with E10's finding that `eps` on the 1-D parameters did not help. Under AdamW those
+    matrices took steps of up to 97 times Muon's spectral step (and 5-6 lr per
+    coordinate). Muon's steps on them never exceeded 1.20.
+- **The guard on the AdamW half holds it at 1 lr and leaves no events** (0 of 6).
+  Lowering that half's `beta2` to 0.95 does nearly as well (1 of 6, severity 0.33). The
+  loss is unchanged.
+- **A per-coordinate guard would be wrong for Muon's matrices.** Their median
+  per-coordinate step is 1.04-1.16 lr (largest 1.6-2.2), so the old per-coordinate cap
+  at 1 would have clipped Muon on nearly every step. The new spectral cap, at its
+  default 1.25 lr_eff, never triggered, as intended.
+- **Attention logits grow about 3x more under Muon** (peak 430-1210 vs 66-356), as Kimi
+  K2 reports at scale. At this lr the growth does not cost loss.
+
+**E11b - learning-rate scan of the Muon half** (`--part lr`). The AdamW half was
+guarded and at lr 0.01; 2 seeds per cell. "+guard" also wraps the Muon half; "+wd" adds
+decoupled weight decay 0.1 to the Muon half.
+
+| Muon lr | final `max ||W||_2` | logit (max) | late loss | +guard: late loss | +wd 0.1: `||W||_2`, logit, late loss |
+| --- | --- | --- | --- | --- | --- |
+| 0.01 | 22-23 | 284-395 | 0.1540 | 0.1541 | - |
+| 0.03 | 65-67 | 4.3k-4.7k | 0.1541 | 0.1540 | - |
+| 0.1 | 229-245 | 65k-84k | 0.1550-0.1573 | 0.1551-0.1586 | 18-19, 1.5k-1.7k, 0.1599-0.1603 |
+| 0.3 | 551-557 | 600k-720k | **0.198-0.243** | 0.186-0.211 | 24-26, 3.5k-3.6k, 0.190-0.192 |
+
+- **Muon's failure here is cumulative, as Musec describes.**
+  - The weight spectral norm grows roughly in proportion to lr, and the attention
+    logits faster (they are bilinear in the QK weights).
+  - At lr 0.3 the loss degrades by 0.04-0.09 nats without isolated spikes (severity
+    0.33-0.39).
+  - Every step still sat at 1.20 lr_eff, so a per-step guard cannot see the problem.
+    The "+guard" column differs only by run-to-run variation.
+- **Weight decay bounds the growth but did not restore the loss.**
+  - At lr 0.3, decoupled weight decay 0.1 kept `||W||_2` at 24-26 and the logits near
+    3.5k, and the loss was 0.19.
+  - At lr 0.1 it cost 0.004 nats. It was not tuned. (Its matrix step reads 1.3-1.6
+    because the column includes the decay.)
+  - So the loss lost at lr 0.3 is not explained by norm growth alone at this scale.
+
+**Verdict.**
+- In a Muon setup the Adam memory mechanism survives only in the AdamW half, and there
+  it is weaker, because the matrices no longer overshoot. The per-coordinate guard
+  still removes what is left.
+- For the orthogonalized matrices the right per-step bound is spectral, and plain Muon
+  meets it by construction (gain 1.20). The library's spectral cap is a safety net for
+  variants whose step can exceed the polar factor.
+- Muon's real risk, weight and logit growth at high lr, accumulates over many bounded
+  steps. Its remedies act on the state: weight decay, QK-Clip, or spectral clipping of
+  the momentum (Musec). A per-step guard is not one of them.
+- Two seeds per cell in E11b and tiny models: the scan shows the direction, not
+  thresholds.
+
 ## Library changes made during the study
 
 - `snr_grad.stability_theory`: `sgd_stochastic_edge`, `dominant_mode_tail`,
   `noise_fluctuation_index`, `adam_edge_threshold`, `adam_edge_ratio`,
   `adam_stationary_preconditioner`, `preconditioned_top_eigenvalue`,
-  `adam_memory_forecast`, `adam_edge_amplitude`, `adam_reactivation_gain`; plus
+  `adam_memory_forecast`, `adam_edge_amplitude`, `adam_reactivation_gain`,
+  `muon_update_gain`; plus
   `PreconditionedCurvature` in `snr_grad.curvature` (tests in
   `tests/test_stability_theory.py`).
 
@@ -743,6 +841,8 @@ treating this as a general recommendation.
 - `min_concentration_dof` default changed from 16 to 15.
 - `collect_microbatch_gradients(group_ids=...)`, with the docstring's shuffling advice
   corrected.
+- `snr_grad.guard` (E10, E11): `GuardedOptimizer`, `MemoryGuard`, `adam_update_overshoot`;
+  E11 added the spectral cap for Muon-style matrices.
 - `tests/test_stability_deep.py`: Monte Carlo unbiasedness of the progress and
   mean-curvature U-statistics, interval coverage, SGD momentum and Nesterov maps against
   finite differences, the stationary momentum factor, group aggregation, edge cases,

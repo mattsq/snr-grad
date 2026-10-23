@@ -12,9 +12,12 @@ from snr_grad import (
     MemoryGuard,
     MemoryGuardConfig,
     SNRAdamW,
+    SNRMuon,
     adam_reactivation_gain,
     adam_update_overshoot,
+    muon_update_gain,
 )
+from snr_grad.guard import _is_orthogonalized
 
 
 def _intermittent_grads(steps, dim, seed=0, silence=(150, 1400)):
@@ -189,7 +192,7 @@ def test_snr_optimizer_and_dopr_composition():
             decay = 1 - 0.01 * base.param_groups[0]["weight_decay"]
             assert float((p.detach() - b * decay).abs().max()) <= 0.01 * 1.0 + 1e-7
     assert opt.last_stats is base.last_stats          # base stats still reachable
-    assert set(opt.guard_stats) == {"max_ratio", "clipped", "refilled"}
+    assert set(opt.guard_stats) == {"max_ratio", "clipped", "refilled", "max_spectral_ratio", "rescaled"}
     assert len(adam_update_overshoot(opt)) == 4       # unwraps both wrappers
 
 
@@ -238,3 +241,199 @@ def test_step_without_gradients_is_a_no_op():
     x.grad = torch.ones(3)
     opt.step()                                  # and the next real step still works
     assert float(x.detach().max()) < 1.0
+
+
+# --- Muon-style optimizers: spectral geometry ---------------------------------------
+
+def _muon_grads(steps, shape, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return [torch.randn(*shape, generator=g, dtype=torch.float64) for _ in range(steps)]
+
+
+def _spec(t):
+    return float(torch.linalg.matrix_norm(t.double(), ord=2))
+
+
+def test_muon_update_gain():
+    assert muon_update_gain() == pytest.approx(1.2024, abs=1e-4)
+    assert muon_update_gain(steps=1) == pytest.approx(1.2024, abs=1e-4)
+    assert muon_update_gain((1.5, -0.5, 0.0), steps=5) == pytest.approx(1.0, abs=1e-9)
+    # torch Muon's steps never exceed it (up to bfloat16 rounding), and reach it.
+    largest = 0.0
+    for seed in range(5):
+        w = nn.Parameter(torch.zeros(48, 80, dtype=torch.float64))
+        opt = torch.optim.Muon([w], lr=1.0, momentum=0.0, nesterov=False)
+        w.grad = torch.randn(48, 80, generator=torch.Generator().manual_seed(seed), dtype=torch.float64)
+        opt.step()
+        largest = max(largest, _spec(w.detach()))
+    assert 1.1 < largest <= muon_update_gain() * 1.02
+
+
+@pytest.mark.parametrize("adjust", [None, "original", "match_rms_adamw"])
+def test_plain_muon_untouched_by_default(adjust):
+    """Default guard leaves torch Muon unchanged; the nominal step uses Muon's lr adjustment."""
+    grads = _muon_grads(60, (24, 40))
+    x0 = torch.randn(24, 40, dtype=torch.float64)
+    runs = {}
+    for name in ("plain", "guarded"):
+        w = nn.Parameter(x0.clone())
+        base = torch.optim.Muon([w], lr=0.02, weight_decay=0.1, adjust_lr_fn=adjust)
+        opt = base if name == "plain" else GuardedOptimizer(base, MemoryGuardConfig(track_stats=True))
+        ratios = []
+        for g in grads:
+            w.grad = g.clone()
+            opt.step()
+            if name == "guarded":
+                ratios.append(opt.guard_stats["max_spectral_ratio"])
+                assert opt.guard_stats["rescaled"] == 0 and opt.guard_stats["clipped"] == 0
+        runs[name] = (w.detach(), ratios)
+    assert torch.allclose(runs["guarded"][0], runs["plain"][0], atol=1e-12, rtol=0)
+    ratios = runs["guarded"][1]
+    assert 1.1 < max(ratios) <= muon_update_gain() * 1.02    # lr_eff matches Muon's own scaling
+
+
+def test_spectral_cap_enforces_nominal_step():
+    """spectral_limit=1 trims Muon's 1.2 overshoot: every step (minus decay) has ||dW||_2 <= lr_eff."""
+    grads = _muon_grads(80, (32, 20), seed=1)
+    w = nn.Parameter(torch.randn(32, 20, dtype=torch.float64))
+    lr, wd = 0.05, 0.1
+    base = torch.optim.Muon([w], lr=lr, weight_decay=wd)
+    opt = GuardedOptimizer(base, MemoryGuardConfig(spectral_limit=1.0, power_iters=None, track_stats=True))
+    nominal = lr * math.sqrt(32 / 20)                    # adjust_lr_fn="original"
+    rescaled = 0
+    for g in grads:
+        before = w.detach().clone()
+        w.grad = g.clone()
+        opt.step()
+        step = _spec(w.detach() - before * (1 - lr * wd)) / nominal
+        assert step <= 1.0 + 1e-9                        # exact norm: a strict cap
+        rescaled += opt.guard_stats["rescaled"]
+    assert rescaled > 40
+
+
+def test_spectral_cap_bounds_an_overshooting_variant():
+    """A Muon-style base whose step can blow up (here: a rank-1 burst) is scaled back exactly."""
+
+    class BurstyMuon(torch.optim.Optimizer):
+        def __init__(self, params, lr):
+            super().__init__(params, dict(lr=lr, ns_steps=5))
+
+        @torch.no_grad()
+        def step(self):
+            for group in self.param_groups:
+                for p in group["params"]:
+                    st = self.state[p]
+                    st["t"] = st.get("t", 0) + 1
+                    u, _, vh = torch.linalg.svd(p.grad, full_matrices=False)
+                    p.sub_(group["lr"] * (u @ vh))
+                    if st["t"] % 10 == 0:                      # occasional 8x burst along the top direction
+                        p.sub_(group["lr"] * 7.0 * torch.outer(u[:, 0], vh[0]))
+
+    w = nn.Parameter(torch.zeros(12, 16, dtype=torch.float64))
+    opt = GuardedOptimizer(BurstyMuon([w], lr=0.1), MemoryGuardConfig(track_stats=True))
+    largest_raw = 0.0
+    for g in _muon_grads(40, (12, 16), seed=2):
+        before = w.detach().clone()
+        w.grad = g
+        opt.step()
+        largest_raw = max(largest_raw, opt.guard_stats["max_spectral_ratio"])
+        assert _spec(w.detach() - before) <= 0.1 * 1.25 * (1 + 1e-6)   # power-iteration shortfall
+    assert largest_raw == pytest.approx(8.0, rel=1e-6)
+
+
+def test_snr_muon_mixed_geometry():
+    """SNRMuon: matrices are capped in spectral norm, vectors per coordinate; both are refilled."""
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(6, 16), nn.Tanh(), nn.Linear(16, 1))
+    base = SNRMuon(model.parameters(), lr=0.01)
+    opt = GuardedOptimizer(base, MemoryGuardConfig(track_stats=True))
+    x, y = torch.randn(64, 6), torch.randn(64, 1)
+    for _ in range(30):
+        opt.zero_grad()
+        nn.functional.mse_loss(model(x), y).backward()
+        before = [p.detach().clone() for p in model.parameters()]
+        opt.step()
+        for p, b in zip(model.parameters(), before):
+            d = p.detach() - b
+            if p.ndim == 2:
+                assert _spec(d) <= 0.01 * 1.25 + 1e-7
+            else:
+                assert float(d.abs().max()) <= 0.01 + 1e-7
+    assert 0.5 < opt.guard_stats["max_spectral_ratio"] <= 1.0 + 1e-3   # cubic Newton-Schulz: gain 1
+    assert opt.guard_stats["max_ratio"] <= 50.0
+    assert max(adam_update_overshoot(opt).values()) <= 1.0 + 1e-6      # refill reached the matrices too
+
+
+def test_geometry_detection():
+    w, b = torch.zeros(4, 3), torch.zeros(4)
+    conv = torch.zeros(8, 3, 3, 3)
+    assert _is_orthogonalized(w, {"ns_steps": 5}, "auto")
+    assert _is_orthogonalized(w, {"muon_ns_steps": 5}, "auto")
+    assert _is_orthogonalized(conv, {"use_muon": True}, "auto")
+    assert not _is_orthogonalized(w, {"use_muon": False, "ns_steps": 5}, "auto")
+    assert not _is_orthogonalized(b, {"ns_steps": 5}, "auto")
+    assert not _is_orthogonalized(w, {"betas": (0.9, 0.999)}, "auto")
+    assert _is_orthogonalized(w, {}, "spectral") and not _is_orthogonalized(w, {"ns_steps": 5}, "coordinate")
+    with pytest.raises(ValueError):
+        MemoryGuardConfig(spectral_limit=0.0)
+    with pytest.raises(ValueError):
+        MemoryGuardConfig(geometry="matrix")
+    with pytest.raises(ValueError):
+        MemoryGuardConfig(power_iters=0)
+
+
+def test_muon_with_aux_adam_style_optimizer():
+    """One optimizer, Keller Jordan style: ``use_muon`` groups orthogonalize, the others run Adam."""
+
+    class MuonWithAuxAdam(torch.optim.Optimizer):
+        def __init__(self, groups):
+            for g in groups:
+                g.setdefault("weight_decay", 0.0)
+            super().__init__(groups, {})
+
+        @torch.no_grad()
+        def step(self):
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    st = self.state[p]
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    if group["use_muon"]:
+                        buf = st.setdefault("momentum_buffer", torch.zeros_like(p))
+                        buf.lerp_(p.grad, 1 - group["momentum"])
+                        mat = p.grad.lerp(buf, group["momentum"]).reshape(p.shape[0], -1)
+                        u, _, vh = torch.linalg.svd(mat, full_matrices=False)
+                        scale = max(1.0, mat.shape[0] / mat.shape[1]) ** 0.5
+                        p.add_((u @ vh).reshape(p.shape), alpha=-group["lr"] * scale)
+                    else:
+                        if not st:
+                            st["step"] = 0
+                            st["exp_avg"] = torch.zeros_like(p)
+                            st["exp_avg_sq"] = torch.zeros_like(p)
+                        st["step"] += 1
+                        b1, b2 = group["betas"]
+                        st["exp_avg"].lerp_(p.grad, 1 - b1)
+                        st["exp_avg_sq"].lerp_(p.grad.square(), 1 - b2)
+                        m_hat = st["exp_avg"] / (1 - b1 ** st["step"])
+                        v_hat = st["exp_avg_sq"] / (1 - b2 ** st["step"])
+                        p.add_(m_hat / (v_hat.sqrt() + group["eps"]), alpha=-group["lr"])
+
+    conv = nn.Parameter(torch.randn(8, 3, 2, 2, dtype=torch.float64))
+    bias = nn.Parameter(torch.zeros(8, dtype=torch.float64))
+    opt = GuardedOptimizer(MuonWithAuxAdam([
+        dict(params=[conv], use_muon=True, lr=0.02, momentum=0.95, weight_decay=0.01),
+        dict(params=[bias], use_muon=False, lr=0.01, betas=(0.9, 0.999), eps=1e-10),
+    ]), MemoryGuardConfig(spectral_limit=1.0, track_stats=True))
+    grads = _intermittent_grads(1600, 8, seed=7)
+    gen = torch.Generator().manual_seed(8)
+    for t, g in enumerate(grads):
+        before_c, before_b = conv.detach().clone(), bias.detach().clone()
+        conv.grad = torch.randn(8, 3, 2, 2, generator=gen, dtype=torch.float64)
+        bias.grad = g
+        opt.step()
+        dc = (conv.detach() - before_c * (1 - 0.02 * 0.01)).reshape(8, -1)
+        assert _spec(dc) <= 0.02 * (1 + 1e-6)          # exact SVD steps: power iteration is exact here
+        assert float((bias.detach() - before_b).abs().max()) <= 0.01 * (1 + 1e-9)
+    assert opt.guard_stats["max_spectral_ratio"] == pytest.approx(1.0, abs=1e-6)   # an exact polar factor
+    assert max(adam_update_overshoot(opt).values()) <= 1.0 + 1e-9
