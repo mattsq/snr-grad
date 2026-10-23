@@ -134,3 +134,37 @@ if, in the *optimizer's own* geometry and at a learning rate below its edge:
 
 All three can be measured at a checkpoint in seconds to minutes (a probe plus a few
 dozen GGN products). Screen with them before scaling up.
+
+## 7. Adam's preconditioner memory (study E9)
+
+The sections above treat `P = 1/sqrt(v_hat)` as frozen. Adam's own spikes come from
+`v_hat` *changing*: it decays at rate `beta2` when the gradients it sees are smaller than
+what it remembers, so the effective step `eta/sqrt(v_hat)` grows.
+
+- **Noise floor.** In steady state `v >= mu^2 + sigma^2/B`. Evaluating the edge ratio
+  with `P_f = 1/(sigma/sqrt(B))` gives `R_floor`; if `R_floor < 1`, even a fully decayed
+  memory cannot reach the adaptive edge. On a noisy one-dimensional quadratic the
+  effective step `eta h/sqrt(v_hat)` follows about `38 R_floor/(R_floor + 2)` (a fit),
+  and any of the noise levels tested removes the memory spikes that appear without
+  noise at `beta2 = 0.999`. `B_crit = B / R_floor^2` and an onset time are in
+  `adam_memory_forecast`.
+- **Edge amplitude.** At the edge the gradient must refill `sqrt(v)` along the top
+  whitened direction `u`, which costs
+  `Delta L_edge = eta^2 h_w / (2 * 38^2 * max_i P_i u_i^2)` (`adam_edge_amplitude`).
+  Observed peaks on quadratics are 20-50 times this.
+- **Reactivation gain.** A coordinate whose memory has decayed and whose gradient then
+  returns steadily steps at most
+  `A(beta1, beta2) = max_k (1-beta1^k)/sqrt(1-beta2^k) ~ 0.8 sqrt((1-beta1)/(1-beta2))`
+  times `eta` (`adam_reactivation_gain`, which also handles a finite silence). A steady
+  coordinate steps at most about `eta`. `A` is 1.1 for `beta2 = 0.95`, 2.1 for 0.99
+  and 6.6 for 0.999 (`beta1 = 0.9`), and it depends on `(1-beta2)/(1-beta1)`, the
+  variable of the empirical (beta1, beta2) spike phase diagram.
+
+**What holds in networks.** In a tiny LM on a confident language, spikes appeared at
+`beta2 = 0.999` with `R_floor` well below 1. They were carried by a few converged bias
+vectors whose gradient *and* gradient noise vanish, so a network-level noise floor does
+not protect them. `A` bounded the observed overshoot, but at equal `A` a high `beta1`
+kept the realized overshoot far below it (the returning gradient is not coherent for
+`1/(1-beta1)` steps). The realized overshoot `max_i |m_i|/sqrt(v_hat_i)`, read from the
+optimizer state, separated spiking from quiet runs with AUROC 0.97. None of the
+curvature-based indices of sections 1-6 respond to this mechanism.

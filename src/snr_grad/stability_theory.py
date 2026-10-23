@@ -58,6 +58,8 @@ __all__ = [
     "adam_stationary_preconditioner",
     "preconditioned_top_eigenvalue",
     "adam_edge_ratio",
+    "adam_memory_forecast",
+    "adam_edge_amplitude",
 ]
 
 
@@ -306,3 +308,113 @@ def adam_edge_ratio(
     """
     lam = preconditioned_top_eigenvalue(curvature, params, precond, **kwargs)
     return lr * lam / adam_edge_threshold(beta1)
+
+
+def adam_memory_forecast(
+    ratio_actual: float,
+    ratio_floor: float,
+    beta2: float,
+    batch_size: Optional[int] = None,
+) -> dict:
+    """Second-moment-decay ("memory") spike forecast for Adam.
+
+    Adam's preconditioner memory ``v_hat`` decays at rate ``beta2`` whenever the
+    gradient energy it sees falls below what it remembers. Gradient noise floors that
+    decay at ``sigma^2 / B`` (see ``docs/adam-spikes-literature.md``).
+
+    Args:
+        ratio_actual: ``adam_edge_ratio`` with the current ``v_hat``.
+        ratio_floor: ``adam_edge_ratio`` with the noise-floor preconditioner
+            (:func:`adam_stationary_preconditioner` without ``mean_grad``).
+        beta2: Adam's second-moment decay.
+        batch_size: Current batch, to report the critical batch.
+
+    Returns:
+        ``protected`` (``ratio_floor < 1``: even a fully decayed ``v`` stays below the
+        edge); ``critical_batch`` ``B / ratio_floor^2`` (protection lost above it, since
+        ``ratio_floor`` grows as ``sqrt(B)``); and ``onset_steps``, the decay time
+        ``2 ln(1/ratio_actual) / ln(1/beta2)`` to reach the edge (0 if already past it,
+        ``inf`` if protected).
+    """
+    if not 0.0 < beta2 < 1.0:
+        raise ValueError(f"beta2 must be in (0, 1), got {beta2}.")
+    protected = ratio_floor < 1.0
+    if ratio_actual >= 1.0:
+        onset = 0.0
+    elif protected or ratio_actual <= 0.0:
+        onset = float("inf")
+    else:
+        onset = 2.0 * math.log(1.0 / ratio_actual) / math.log(1.0 / beta2)
+    out = {"protected": protected, "onset_steps": onset}
+    if batch_size is not None and ratio_floor > 0:
+        out["critical_batch"] = batch_size / ratio_floor ** 2
+    return out
+
+
+def adam_edge_amplitude(
+    whitened_eig: float,
+    whitened_vec: Tensor,
+    precond: Tensor,
+    lr: float,
+    beta1: float = 0.9,
+) -> float:
+    """Loss scale of Adam's edge oscillation: ``lr^2 h_w / (2 edge^2 max_i P_i u_i^2)``.
+
+    When Adam reaches its adaptive edge along the top eigenvector ``u`` of
+    ``P^1/2 H P^1/2`` (eigenvalue ``h_w``), the instability grows until the gradient
+    refills the second moment of the first coordinate to saturate, i.e. until
+    ``|g_i| ~ 1/P_i`` for the coordinate maximizing ``P_i u_i^2``. The loss excursion
+    this costs is ``Delta L ~ lr^2 h_w / (2 edge^2 max_i P_i u_i^2)``. It is invariant to
+    a uniform rescaling of ``v``, so it can be evaluated with the current ``P``, and it
+    reduces to ``lr^2 h / (2 * 38^2)`` in one dimension. A direction spread over ``k``
+    comparable coordinates gives ``k`` times more, so at a fixed per-coordinate lr the
+    amplitude grows with model size. Observed peaks on quadratics are about 20x this
+    scale (study E9a).
+
+    Args:
+        whitened_eig: ``h_w``, top eigenvalue of ``P^1/2 H P^1/2``.
+        whitened_vec: Its unit eigenvector ``u`` (flat).
+        precond: Diagonal ``P`` (flat), e.g. ``1/(sqrt(v_hat)+eps)``.
+        lr, beta1: Adam step size and momentum.
+    """
+    u2p = (whitened_vec.reshape(-1).to(torch.float64) ** 2) * precond.reshape(-1).to(torch.float64)
+    m = float(u2p.max())
+    if m <= 0:
+        return float("inf")
+    edge = adam_edge_threshold(beta1)
+    return lr * lr * whitened_eig / (2.0 * edge * edge * m)
+
+
+def adam_reactivation_gain(
+    beta1: float,
+    beta2: float,
+    silence: float = math.inf,
+    return_ratio: float = 1.0,
+    horizon: int = 100_000,
+) -> float:
+    """Largest per-coordinate Adam step, in units of lr, after a gradient returns.
+
+    A coordinate whose gradient was zero for ``silence`` steps keeps only ``beta2^silence``
+    of its second moment ``v0`` (its first moment decays much faster and is taken as zero).
+    If a constant gradient ``g`` with ``g^2 = return_ratio * v0`` then returns, step ``k``
+    of the return has ``m_k = (1 - beta1^k) g`` and
+    ``v_k = beta2^(silence + k) v0 + (1 - beta2^k) g^2``. This returns ``max_k m_k/sqrt(v_k)``
+    (late training, bias corrections ~ 1). For an infinite silence it is
+    ``A = max_k (1 - beta1^k) / sqrt(1 - beta2^k)``, about ``0.8 sqrt((1-beta1)/(1-beta2))``
+    when ``1 - beta2 << 1 - beta1``: 1.1 for ``beta2 = 0.95``, 2.1 for 0.99 and 6.6 for
+    0.999 (``beta1 = 0.9``). A steady coordinate steps at most about 1 lr, so ``A``
+    measures how far a reactivated coordinate overshoots. It depends on
+    ``(1 - beta2)/(1 - beta1)``, the variable of the empirical (beta1, beta2) spike phase
+    diagram.
+
+    Args:
+        beta1, beta2: Adam moment decay rates.
+        silence: Steps without gradient before the return (``inf``: fully decayed memory).
+        return_ratio: ``g^2 / v0``, the returning gradient's energy relative to the
+            remembered one.
+        horizon: Number of return steps scanned.
+    """
+    k = torch.arange(1, horizon + 1, dtype=torch.float64)
+    decay = 0.0 if math.isinf(silence) else beta2 ** silence
+    v = decay * beta2 ** k / max(return_ratio, 1e-300) + (1 - beta2 ** k)
+    return float(((1 - beta1 ** k) / v.sqrt()).max())

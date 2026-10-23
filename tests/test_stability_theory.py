@@ -12,6 +12,8 @@ from snr_grad import (
     PreconditionedCurvature,
     adam_edge_ratio,
     adam_edge_threshold,
+    adam_memory_forecast,
+    adam_reactivation_gain,
     adam_stationary_preconditioner,
     dominant_mode_tail,
     noise_fluctuation_index,
@@ -147,3 +149,32 @@ def test_preconditioned_curvature_low_rank():
     dense = d.sqrt()[:, None] * h * d.sqrt()[None, :]
     low = LowRankCurvature.from_proxy(pc, [p], rank=3, power_iters=4)
     assert torch.allclose(low.eigenvalues, torch.linalg.eigvalsh(dense).flip(0)[:3], rtol=1e-6)
+
+
+def test_adam_memory_forecast():
+    f = adam_memory_forecast(0.1, 4.0, 0.999, batch_size=64)
+    assert not f["protected"]
+    assert f["critical_batch"] == pytest.approx(4.0)
+    assert f["onset_steps"] == pytest.approx(2 * math.log(10) / -math.log(0.999))
+    assert adam_memory_forecast(0.1, 0.5, 0.999)["onset_steps"] == float("inf")
+    assert adam_memory_forecast(1.2, 3.0, 0.99)["onset_steps"] == 0.0
+
+
+def test_adam_reactivation_gain():
+    a = adam_reactivation_gain(0.9, 0.999)
+    assert a == pytest.approx(6.57, abs=0.02)
+    assert adam_reactivation_gain(0.9, 0.95) == pytest.approx(1.10, abs=0.02)
+    # Matches PyTorch Adam on one coordinate after a long silence (bias corrections ~ 1).
+    x = nn.Parameter(torch.zeros(1, dtype=torch.float64))
+    opt = torch.optim.Adam([x], lr=1.0, betas=(0.9, 0.999), eps=0.0)
+    steps = []
+    for t in range(20000):
+        x.grad = torch.ones(1, dtype=torch.float64) if t < 5000 or t >= 19000 else torch.zeros(1, dtype=torch.float64)
+        before = float(x.detach())
+        opt.step()
+        if t >= 19000:
+            steps.append(abs(float(x.detach()) - before))
+    expected = adam_reactivation_gain(0.9, 0.999, silence=14000, return_ratio=1.0)
+    assert max(steps) == pytest.approx(expected, rel=1e-3)
+    # A short silence barely amplifies; the gain falls towards 1.
+    assert adam_reactivation_gain(0.9, 0.999, silence=10) < 1.05

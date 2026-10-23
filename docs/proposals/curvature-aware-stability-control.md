@@ -404,3 +404,23 @@ small, and Adam's whitening drops `w` to about 1e-3. Their scaling trends do not
 the gap. So the controller trial (M4) should target settings that pass a `w` / `Phi` /
 `kappa` screen, most likely SGD-trained models with aligned noise, rather than simply
 larger Adam LMs.
+
+### 12.3 Adam's memory spikes (study E9)
+
+A literature survey pointed to a different mechanism for Adam: the second-moment
+memory `v_hat` decays, the effective step grows, and the run overshoots. Study E9 found:
+- **Noise protects Adam on a quadratic, but not in a network.** The protection index
+  `R_floor` works on quadratics. In a tiny LM on a confident language, `beta2 = 0.999`
+  spikes in 5 of 5 seeds (severity up to 24.5) with `R_floor < 1`. The spikes are
+  carried by a few converged bias vectors.
+- **The curvature sensors of this proposal are blind to these spikes.** The edge
+  ratio was 0.05-0.13, and `Phi` and the simulator build on the same frozen-`P`
+  linearization.
+- **A cheap alternative signal exists.** The per-tensor overshoot `max |m|/sqrt(v_hat)`,
+  bounded by `A(beta1, beta2) = max_k (1-beta1^k)/sqrt(1-beta2^k)`, separated spiking
+  from quiet runs with AUROC 0.97 at no cost.
+
+For M4 with Adam, the controller should therefore watch the optimizer's memory as well
+as curvature and noise. The simulator could capture this mechanism only if it replayed
+`v_hat` over a horizon long enough for the memory to decay (hundreds to thousands of
+steps at `beta2 = 0.999`) on the coordinates that carry it.

@@ -470,11 +470,175 @@ Where to look instead:
   committing to an expensive run. That costs seconds to minutes per checkpoint on these
   models.
 
+## E9 - Adam from another angle: preconditioner memory and the noise floor (`e9_*.py`)
+
+E8 asked when *noise-driven* spikes get large and found that Adam's whitening keeps
+them small in tiny LMs. A literature survey
+([`docs/adam-spikes-literature.md`](../../docs/adam-spikes-literature.md)) points to a
+different, Adam-specific mechanism: the second-moment memory `v_hat` decays when the
+gradients it sees fall below what it remembers, the effective step `lr/sqrt(v_hat)`
+grows, and the run crosses Adam's adaptive edge (`lr * lambda_max(P H) = 38` for
+`beta1 = 0.9`). The gradient then grows, refills `v_hat`, and the run recovers: a spike.
+Reported risk factors are a large `beta2`, large batches, confident (low-loss)
+cross-entropy, and small `eps`.
+
+The new angle: **gradient noise puts a floor under that decay**, `v >= mu^2 + sigma^2/B`,
+so noise should *protect* Adam. Three checkpoint quantities follow
+(`snr_grad.adam_memory_forecast`, `snr_grad.adam_edge_amplitude`):
+
+| quantity | meaning |
+| --- | --- |
+| `R_act = lr * lambda_max(P^1/2 H P^1/2) / 38` | current distance to Adam's edge, with the actual `P = 1/sqrt(v_hat)` |
+| `R_floor` | the same with the noise-floor preconditioner `1/(sigma/sqrt(B))`: the closest the memory can bring the run to the edge. Below 1 the run is protected. Since `R_floor ~ sqrt(B)`, protection is lost above `B_crit = B / R_floor^2` |
+| `Delta L_edge = lr^2 h_w / (2 * 38^2 * max_i P_i u_i^2)` | loss scale of an oscillation at the edge: the gradient must refill `sqrt(v)` to about `lr h / 38` along the top whitened direction `u` |
+
+**E9a - noisy quadratic (`e9_noisy_quadratic.py`).** Adam on `L = h x^2/2` with
+gradient noise of standard deviation `s = lr / (38 R_floor)`, 16 seeds, late-phase
+statistics (second half of 8000 steps; 30000 for `beta2 = 0.999`).
+
+| R_floor | 0.25 | 0.5 | 1 | 2 | 4 | 16 | no noise |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| median `lr h / sqrt(v_hat)` (`beta2` 0.99) | 4.9 | 7.9 | 12.1 | 18.0 | 24.8 | 34.7 | 36.3-36.7 |
+| peak loss / `(lr^2 h / 2888)` (`beta2` 0.99) | 558 | 264 | 109 | 54 | 26 | 17-20 | 19-22 |
+
+- The effective step follows the floor smoothly (about `38 R_floor / (R_floor + 2)`;
+  an empirical fit) and pins just below the edge once the noise is weak. The values are
+  identical at lr 0.003, 0.01 and 0.03, as the scaling predicts.
+- With noise, the late loss is the ordinary stationary noise ball: a peak about 27-33x
+  its median at every `R_floor`, with no intermittent bursts.
+- Without noise, `beta2 = 0.99` sits at the edge with peak losses about 20x the
+  amplitude scale `lr^2 h / 2888`.
+- **Without noise and with `beta2 = 0.999`, the memory spikes of Bai et al. appear:**
+  the loss falls to about 1e-18 between bursts that reach 1.3e-5 (about 1e13x the
+  median). Any of the noise levels tested (`R_floor <= 16`) removes them completely.
+  So the protection effect is real and strong on the quadratic.
+
+**E9a-2 - amplitude in many dimensions (`e9_amplitude.py`).** Rotated quadratics in 20
+dimensions (log-spaced spectrum over two decades), with and without weak noise, at lr
+0.003-0.03. The observed late peak loss is 38-47x `Delta L_edge` for a random rotation
+and 25-27x when the top direction is spread evenly over all coordinates. The ratio is
+constant across a 100x range of `lr^2`. For the delocalized case the formula predicts
+20x (that is, `d` times) the one-dimensional scale, and the observed peaks are about 25x
+that prediction, as in one dimension. So **edge oscillations cost
+about 20-50 `Delta L_edge`**, and a relative spike size is predicted by
+`S = 30 Delta L_edge / L`.
+
+**E9b - tiny LM, E7/E8 language at lower temperature (`e9_lm_confident.py`).** Width
+64, sequence 32, 3000 AdamW steps; temperature 0.5, 0.1 and 0.03 (lower is more
+deterministic) x B in {4, 32} x `beta2` in {0.95, 0.999} x lr in {0.003, 0.01}, one seed
+each. The indices above were measured at steps 1000 and 2000 with a rank-4
+preconditioned GGN.
+- **No events in 24 runs**: severity 0.01-0.14. Lower temperature raises it slightly
+  (maxima 0.03, 0.12, 0.14), and B = 4 is noisier than B = 32.
+- **Adam sits on its noise floor and far from its edge.** `R_act` = 0.008-0.15, and
+  `R_act / R_floor` = 0.55-1.1. Here `v_hat` has already decayed to the gradient noise,
+  as the protection argument assumes. The predicted relative edge amplitude `S` is
+  below 4e-4.
+- The copy rule (probability 0.3) leaves an ambiguity the model cannot resolve, so the
+  loss stays at 0.31-0.37 nats at temperature 0.03, well above the 0.016 nats of the
+  Markov part. This language never becomes confident.
+- A first run estimated the per-sequence variance from single-sequence microbatches
+  at B = 4. That gave zero variance to rarely touched embedding rows and inflated
+  `R_floor` to 3-11. The variance now comes from 8-sequence microbatches at every B;
+  the numbers above use the corrected estimator.
+
+**E9c - a confident language: the first Adam spikes in a tiny LM (`e9_lm_confident.py
+--grid clean`, `e9_lm_repeat.py`).** Removing the copy rule at temperature 0.03 (entropy
+floor 0.023 nats; the runs plateau near 0.153) and adding B = 128:
+
+| B | `beta2` | lr | runs with an event | severity (per seed) | `R_act` at step 2000 | `R_floor` at step 2000 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 | 0.95 / 0.999 | 0.003-0.01 | 1 of 4 | 0.11-0.42 | 0.014-0.025 | 0.016-0.056 |
+| 32 | 0.95 | 0.01 | 1 of 5 | 0.09-2.20 | 0.03-0.42 | 0.06-0.43 |
+| 32 | 0.999 | 0.01 | **5 of 5** | **2.3, 3.0, 3.2, 4.9, 24.5** | 0.05-0.09 | 0.20-0.55 |
+| 128 | 0.999 | 0.01 | 2 of 4 | 0.05-9.5 | 0.12-0.13 | 1.4-6.6 |
+| 128 | 0.95 | 0.01 | 0 of 1 | 0.16 | 0.67 | 1.7 |
+| 32 / 128 | 0.95 / 0.999 | 0.003 | 0 of 4 | 0.02-0.17 | 0.03-0.10 | 0.04-0.52 |
+
+- These are real, isolated spikes: the held-out loss jumps up to 25x for fewer than 10
+  steps and then returns to its previous level.
+- **`beta2 = 0.999` is the main risk factor** (5 of 5 against 1 of 5 at B = 32), as the
+  literature reports. A larger lr also matters.
+- **The noise-protection prediction fails here.** At B = 32 the spikes occur with
+  `R_floor` 0.2-0.55, where the run should be protected, while B = 128 with
+  `beta2 = 0.95` has `R_floor` 1.7 and does not spike. The curvature sensor does not
+  see the spikes either: the measured edge ratio is only 0.05-0.13.
+- A rerun of the spiking seed without the index measurements (which changes the
+  trajectory slightly) also spikes, with severity 13 at step 1915. So the probe does not
+  cause the spikes.
+
+**E9d - mechanism (`e9_lm_diagnose.py`).** Per step we recorded the largest normalized
+update `max_i |Delta theta_i| / lr` of every parameter tensor. A natural guess was that
+the 60 tokens appearing only as the random first token have intermittently updated
+embedding rows. That guess is wrong:
+- Starting sequences inside the chain, so that those tokens never occur, still
+  spikes in 5 of 5 seeds (severity 0.5-29).
+- Giving the token embedding `beta2 = 0.95` still spikes in 3 of 5 seeds (2.0-32).
+
+What changes before each spike is the **bias vectors of the first block** (attention
+projection, MLP output, QKV, layer-norm biases). Their normalized updates jump from a
+median of 0.03 lr to 3-5 lr. These coordinates converge early, their gradients and
+gradient noise vanish, and `v_hat` (which remembers the larger early gradients) slowly
+follows. When a gradient returns, `m / sqrt(v_hat)` overshoots. That is the Bai et al.
+mechanism, carried by a small set of converged coordinates rather than by the
+curvature-dominant direction.
+
+How far can it overshoot? A coordinate whose memory has decayed, and whose gradient
+returns steadily, steps at most
+
+    A(beta1, beta2) = max_k (1 - beta1^k) / sqrt(1 - beta2^k)   ~ 0.8 sqrt((1 - beta1) / (1 - beta2))
+
+times lr (`snr_grad.adam_reactivation_gain`; checked against PyTorch Adam in the
+tests). A is 1.1 for `beta2 = 0.95`, 2.1 for 0.99 and 6.6 for 0.999, and it depends on
+`(1-beta2)/(1-beta1)`, the variable of the empirical spike phase diagram. Observed
+overshoots respect the bound: at most 5.9 lr at A = 6.6, and at most 1.06 at A = 1.1,
+where no run spiked.
+
+**E9e - dose response in (beta1, beta2) (`e9_lm_diagnose.py`, 5 seeds each).**
+
+| (beta1, beta2) | A | runs with an event | severity >= 1 | largest overshoot / lr (after step 500, or before the peak where marked "window") |
+| --- | --- | --- | --- | --- |
+| (0.9, 0.95) | 1.1 | 0 | 0 | 1.0-1.1 (window) |
+| (0.99, 0.999) | 2.1 | 0 | 0 | 0.3-0.7 |
+| (0.9, 0.99) | 2.1 | 2 | 1 (16.2) | 2.0-2.2 |
+| (0.98, 0.999) | 2.9 | 0 | 0 | 0.7-1.0 |
+| (0.9, 0.995) | 3.0 | 2 | 0 | 2.6-2.8 |
+| (0.95, 0.999) | 4.6 | 2 | 0 | 1.6-3.3 |
+| (0.9, 0.999) | 6.6 | 5 (+5 stationary, +3 of 5 embed_b2) | 4 | 4.5-5.5 (window) |
+
+- **A is an upper bound, not a predictor.** The pairs with equal A separate cleanly: at
+  `beta1 = 0.9` the realized overshoot reaches the bound and runs spike, while at
+  `beta1 = 0.98-0.99` it stays at 0.3-1.0 lr and no run spikes. A high `beta1` needs
+  the returning gradient to stay coherent for about `1/(1-beta1)` steps before `m`
+  builds up, and here it does not. This matches the reported mitigation "raise
+  `beta1`".
+- **The realized overshoot is the useful signal.** Across all 45 runs, the largest
+  normalized update in the 60 steps before the loss peak separates runs with an
+  event (severity >= 0.25) from the others with AUROC 0.97 (0.975 for severity >= 1).
+  - All 21 runs below 1.85 lr had no event; all 13 runs above 3.5 lr had one.
+  - It leads the loss by tens to about 150 steps in the two runs inspected in detail
+    (`results/e9_reactivation.png`, right).
+  - It is not specific in time: in the (0.9, 0.99) run it came within 15% of A several
+    times without a spike.
+- This signal is free: it is `max |m / (sqrt(v_hat) + eps)|` per tensor, read from the
+  optimizer state with no probe and no curvature.
+
+**Verdict on E9.** The literature angle was right that Adam spikes are a memory effect,
+and the tiny LM reproduces them once the targets are confident and `beta2` is large.
+The specific E9 prediction, protection by gradient noise (`R_floor < 1`), holds on the
+quadratic but fails in the network: the coordinates that carry the spikes are a small
+set of converged biases whose gradient *and* gradient noise vanish. A tensor-level
+noise floor is not visible in the network-level `R_floor`. The curvature-based
+sensors of this project (edge ratio, `Phi`, the simulator built on them) are blind to
+this mechanism; the overshoot `max |m|/sqrt(v_hat)` per tensor, bounded by
+`A(beta1, beta2)`, is the variable to watch for Adam.
+
 ## Library changes made during the study
 
 - `snr_grad.stability_theory`: `sgd_stochastic_edge`, `dominant_mode_tail`,
   `noise_fluctuation_index`, `adam_edge_threshold`, `adam_edge_ratio`,
-  `adam_stationary_preconditioner`, `preconditioned_top_eigenvalue`; plus
+  `adam_stationary_preconditioner`, `preconditioned_top_eigenvalue`,
+  `adam_memory_forecast`, `adam_edge_amplitude`, `adam_reactivation_gain`; plus
   `PreconditionedCurvature` in `snr_grad.curvature` (tests in
   `tests/test_stability_theory.py`).
 

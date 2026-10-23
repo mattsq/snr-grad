@@ -174,7 +174,44 @@ def e7():
         plt.close(fig)
 
 
+def e9():
+    rows = []
+    for name in ("e9_lm_diagnose_a.json", "e9_lm_diagnose_b.json", "e9_lm_dose_a.json",
+                 "e9_lm_dose_b.json", "e9_lm_dose_c.json"):
+        d = load(name)
+        rows += d["rows"] if d else []
+    if not rows:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+    for v in sorted({r["variant"] for r in rows}):
+        rs = [r for r in rows if r["variant"] == v]
+        axes[0].scatter([max(r["window_max_u"].values()) for r in rs], [r["severity"] for r in rs], s=16,
+                        label=f"{v} (A={rs[0]['gain_A']:.1f})")
+    axes[0].axhline(0.25, color="k", lw=0.8)
+    axes[0].set_xlabel("largest |update| / lr in the 60 steps before the loss peak")
+    axes[0].set_ylabel("max excursion (severity)")
+    axes[0].set_yscale("log")
+    axes[0].legend(fontsize=6)
+    r = next((r for r in rows if r["variant"] == "betas_0.9_0.99" and r["seed"] == 0), None)
+    if r:
+        pk = r["peak_step"]
+        steps = range(pk - 300, min(pk + 100, len(r["global_max_u"])))
+        axes[1].plot(list(steps), [r["global_max_u"][t - 1] for t in steps], lw=0.8, label="max |update| / lr")
+        ax2 = axes[1].twinx()
+        ev = [t for t in range(5, len(r["curve"]) * 5 + 1, 5) if steps.start <= t < steps.stop]
+        ax2.plot(ev, [r["curve"][t // 5 - 1] for t in ev], color="C3", lw=1.0, label="held-out loss")
+        ax2.set_yscale("log")
+        ax2.set_ylabel("held-out loss", color="C3")
+        axes[1].axhline(r["gain_A"], color="k", ls="--", lw=0.8)
+        axes[1].set_xlabel("step")
+        axes[1].set_ylabel("max |update| / lr (dashed: bound A)")
+        axes[1].set_title("beta = (0.9, 0.99), seed 0", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(R, "e9_reactivation.png"), dpi=120)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
-    for f in (e1, e2, e3, e4, e6, e7):
+    for f in (e1, e2, e3, e4, e6, e7, e9):
         f()
     print("figures written to", R)

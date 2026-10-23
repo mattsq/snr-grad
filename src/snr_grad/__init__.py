@@ -63,7 +63,10 @@ from snr_grad.stability import (
     spectrum_metrics,
 )
 from snr_grad.stability_theory import (
+    adam_edge_amplitude,
     adam_edge_ratio,
+    adam_memory_forecast,
+    adam_reactivation_gain,
     adam_edge_threshold,
     adam_stationary_preconditioner,
     dominant_mode_tail,
@@ -135,7 +138,10 @@ __all__ = [
     "ResampledProbeNoise",
     "SimulationDistribution",
     "clone_optimizer",
+    "adam_edge_amplitude",
     "adam_edge_ratio",
+    "adam_memory_forecast",
+    "adam_reactivation_gain",
     "adam_edge_threshold",
     "adam_stationary_preconditioner",
     "dominant_mode_tail",
