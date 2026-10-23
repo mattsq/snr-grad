@@ -165,6 +165,7 @@ class MemoryGuard:
         self.optimizer = optimizer
         self.config = config or MemoryGuardConfig()
         self._snapshot: dict[Tensor, Tensor] = {}
+        self._armed = False          # a snapshot was taken (it may be empty)
         self.last_stats: dict[str, float] = {}
 
     def _decoupled(self, group: dict) -> bool:
@@ -184,6 +185,7 @@ class MemoryGuard:
             for p in group["params"]
             if p.grad is not None
         }
+        self._armed = True
 
     @torch.no_grad()
     def guard_(self) -> dict[str, float]:
@@ -194,8 +196,9 @@ class MemoryGuard:
         ``refilled`` (coordinates whose second moment was raised); otherwise returns
         an empty dict.
         """
-        if not self._snapshot:
+        if not self._armed:
             raise RuntimeError("MemoryGuard.guard_() called without a preceding snapshot_()")
+        self._armed = False
         cfg = self.config
         track = cfg.track_stats
         ratios: list[Tensor] = []

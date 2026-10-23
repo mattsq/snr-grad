@@ -450,7 +450,9 @@ diagnostics side of
 [the curvature-aware stability proposal](docs/proposals/curvature-aware-stability-control.md).
 They are **read-only**: nothing here steps an optimizer, writes `.grad`, changes
 parameters, `requires_grad` or optimizer state, or shifts the training RNG (tests check
-all of this). No batch-size or learning-rate controller is shipped; the proposal makes
+all of this). Their forwards also skip the activation cache of a live `DoPr`
+(`isolated_activation_capture`), so probing between `backward()` and `step()` does not
+change the next activation-preconditioned update. No batch-size or learning-rate controller is shipped; the proposal makes
 that conditional on the sensors proving useful.
 
 At a checkpoint, with per-example gradient covariance `Sigma`, a frozen linearized

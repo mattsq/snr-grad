@@ -100,6 +100,8 @@ Limitations:
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
@@ -113,7 +115,33 @@ __all__ = [
     "ActivationCovarianceSnapshot",
     "ActivationPreconditioner",
     "DoPr",
+    "isolated_activation_capture",
 ]
+
+
+# ids of the preconditioners allowed to capture; None means no restriction.
+_CAPTURE_ALLOWED: contextvars.ContextVar[Optional[frozenset]] = contextvars.ContextVar(
+    "snr_grad_capture_allowed", default=None
+)
+
+
+@contextlib.contextmanager
+def isolated_activation_capture(*allowed: "ActivationPreconditioner"):
+    """Suspend activation capture for every preconditioner except ``allowed``.
+
+    Forwards inside the block do not reach the per-step cache of any live
+    :class:`ActivationPreconditioner` / :class:`DoPr` (except the ones listed), so a
+    diagnostic forward run between ``backward()`` and ``step()`` cannot change the
+    next activation-preconditioned update. Nested blocks intersect: a preconditioner
+    captures only if every enclosing block allows it.
+    """
+    outer = _CAPTURE_ALLOWED.get()
+    ids = frozenset(id(ap) for ap in allowed)
+    token = _CAPTURE_ALLOWED.set(ids if outer is None else outer & ids)
+    try:
+        yield
+    finally:
+        _CAPTURE_ALLOWED.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +438,9 @@ class ActivationPreconditioner:
             # next step's covariance and silently mis-precondition.
             if not torch.is_grad_enabled():
                 return
+            allowed = _CAPTURE_ALLOWED.get()
+            if allowed is not None and id(self) not in allowed:
+                return  # inside isolated_activation_capture (a diagnostic forward)
             if not args:
                 return
             z = args[0]

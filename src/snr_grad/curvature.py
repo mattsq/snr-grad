@@ -42,6 +42,7 @@ from snr_grad.activation import (
     ActivationCovarianceSnapshot,
     ActivationPrecondConfig,
     ActivationPreconditioner,
+    isolated_activation_capture,
 )
 
 __all__ = [
@@ -340,12 +341,13 @@ def collect_activation_snapshot(
     capture hook ignores no-grad forwards) and removes the hooks. No backward is
     run, ``.grad`` is untouched and (by default) the RNG state is restored
     afterwards, since dropout in the forward would otherwise consume it. Use this when there is no live DoPr whose
-    :meth:`~ActivationPreconditioner.covariance_snapshot` can be reused.
+    :meth:`~ActivationPreconditioner.covariance_snapshot` can be reused. A live
+    DoPr's per-step cache is not touched by this forward.
     """
     cfg = config if config is not None else ActivationPrecondConfig(distributed=False)
     ap = ActivationPreconditioner(model, cfg)
     try:
-        with preserved_rng(preserve_rng), torch.enable_grad():
+        with preserved_rng(preserve_rng), torch.enable_grad(), isolated_activation_capture(ap):
             run_forward(model)
         return ap.covariance_snapshot(source="batch")
     finally:
@@ -517,7 +519,8 @@ class _FunctionalCurvature(CurvatureProxy):
         from torch.func import functional_call
 
         state = {**self._buffers, **self._fixed, **dict(zip(self._names, primals))}
-        return functional_call(self.model, state, (inputs,))
+        with isolated_activation_capture():      # keep live DoPr caches untouched
+            return functional_call(self.model, state, (inputs,))
 
     def _tangents(self, update: ParamDict) -> tuple:
         return tuple(
@@ -567,12 +570,26 @@ class GGNCurvature(_FunctionalCurvature):
         )
 
     def _jvp_and_hout(self, update: ParamDict) -> tuple[Tensor, Tensor, Any]:
-        from torch.func import grad, jvp, vjp
+        from torch.func import jvp
 
         f = lambda *ps: self._call(ps, self.inputs)  # noqa: E731
         out, ju = jvp(f, self._primals, self._tangents(update))
-        _, hju = jvp(grad(self.output_loss), (out.detach(),), (ju,))
-        return ju, hju, f
+        return ju, self._output_hvp(out, ju), f
+
+    def _output_hvp(self, out: Tensor, v: Tensor) -> Tensor:
+        """``d^2 loss / d out^2 @ v`` by reverse-over-reverse autograd.
+
+        Forward-over-reverse (``jvp(grad(loss))``) fails for some built-in losses
+        (``F.mse_loss`` raises "ZeroTensors are immutable"), while double backward is
+        supported by every loss that has a second derivative.
+        """
+        with torch.enable_grad():
+            o = out.detach().requires_grad_(True)
+            (g,) = torch.autograd.grad(self.output_loss(o), o, create_graph=True)
+            if not g.requires_grad:                    # loss linear in the output
+                return torch.zeros_like(o)
+            (hv,) = torch.autograd.grad(g, o, grad_outputs=v.detach(), allow_unused=True)
+        return torch.zeros_like(o) if hv is None else hv.detach()
 
     def _matvec_uncounted(self, update: ParamDict) -> dict[Tensor, Tensor]:
         from torch.func import vjp
@@ -724,8 +741,9 @@ class LowRankCurvature(CurvatureProxy):
         params = list(params)
         n = sum(p.numel() for p in params)
         k = min(n, rank + oversample)
-        gen = torch.Generator().manual_seed(seed)
+        gen = torch.Generator().manual_seed(seed)       # CPU, private: samples move to `device`
         dtype = params[0].dtype
+        device = params[0].device
         t0 = time.perf_counter()
         calls = 0
 
@@ -733,12 +751,12 @@ class LowRankCurvature(CurvatureProxy):
             nonlocal calls
             cols = []
             for j in range(mat.shape[1]):
-                hv = proxy.matvec(unflatten_like(mat[:, j].to(dtype), params))
+                hv = proxy.matvec(unflatten_like(mat[:, j].to(device=device, dtype=dtype), params))
                 cols.append(flatten_params(hv, params).to(torch.float64))
                 calls += 1
             return torch.stack(cols, 1)
 
-        q, _ = torch.linalg.qr(torch.randn(n, k, generator=gen, dtype=torch.float64))
+        q, _ = torch.linalg.qr(torch.randn(n, k, generator=gen, dtype=torch.float64).to(device))
         for _ in range(power_iters):
             q, _ = torch.linalg.qr(apply(q))
         hq = apply(q)
@@ -752,7 +770,7 @@ class LowRankCurvature(CurvatureProxy):
             # Hutchinson on the deflated operator (I - V V^T) H (I - V V^T), whose
             # trace is the unexplained mass; projecting first removes the variance
             # contributed by the dominant eigenvalues (the Hutch++ idea).
-            z = (torch.randint(0, 2, (n, trace_probes), generator=gen) * 2 - 1).to(torch.float64)
+            z = (torch.randint(0, 2, (n, trace_probes), generator=gen) * 2 - 1).to(device, torch.float64)
             z = z - vec @ (vec.t() @ z)
             tr_rest = float((z * apply(z)).sum() / trace_probes)
             residual = max(0.0, tr_rest / (n - rank))

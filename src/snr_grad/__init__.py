@@ -27,6 +27,7 @@ from snr_grad.activation import (
     ActivationPrecondConfig,
     ActivationPreconditioner,
     DoPr,
+    isolated_activation_capture,
 )
 from snr_grad.variance import (
     VarianceEstimator,
@@ -110,6 +111,7 @@ __all__ = [
     "ActivationPrecondConfig",
     "ActivationPreconditioner",
     "DoPr",
+    "isolated_activation_capture",
     "VarianceEstimator",
     "ExactVarianceEstimator",
     "MicrobatchVarianceEstimator",

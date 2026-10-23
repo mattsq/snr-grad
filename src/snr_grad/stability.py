@@ -64,7 +64,7 @@ from snr_grad._core import (
     compute_gate,
     resolve_alpha,
 )
-from snr_grad.activation import ActivationCovarianceSnapshot, DoPr
+from snr_grad.activation import ActivationCovarianceSnapshot, DoPr, isolated_activation_capture
 from snr_grad.curvature import CurvatureProxy, ParamDict, preserved_rng
 from snr_grad.variance import tree_batch_size, tree_split
 
@@ -119,7 +119,8 @@ def collect_microbatch_gradients(
     Splits ``batch`` into ``num_splits`` equal contiguous chunks (the batch size
     must be divisible by ``num_splits`` so every chunk mean has the same
     variance). The existing ``.grad`` of every parameter and (when
-    ``preserve_rng``) the CPU / CUDA RNG state are restored afterwards, so a probe
+    ``preserve_rng``) the CPU / CUDA RNG state are restored afterwards, and the probe
+    forwards do not reach a live :class:`DoPr`'s activation cache, so a probe
     between training steps does not change training.
 
     **Correlated rows must stay in the same microbatch.** If copies of an example,
@@ -161,7 +162,7 @@ def collect_microbatch_gradients(
     saved_grads = {p: (None if p.grad is None else p.grad.detach().clone()) for p in all_params}
     out: list[dict[Tensor, Tensor]] = []
     try:
-        with preserved_rng(preserve_rng):
+        with preserved_rng(preserve_rng), isolated_activation_capture():
             for chunk in tree_split(batch, num_splits):
                 for p in all_params:
                     p.grad = None

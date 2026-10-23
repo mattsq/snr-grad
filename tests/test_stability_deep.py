@@ -227,3 +227,105 @@ def test_fused_low_rank_path_matches_generic():
     b = generic.run(3, 40, seed=11)
     assert torch.allclose(a.losses, b.losses, rtol=1e-9, atol=1e-12)
     assert torch.allclose(a.deterministic, b.deterministic, rtol=1e-9, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: read-only probing next to a live DoPr, and device placement
+# ---------------------------------------------------------------------------
+
+def _dopr_setup():
+    from snr_grad import DoPr
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(5, 8), nn.Tanh(), nn.Linear(8, 1))
+    opt = DoPr(torch.optim.Adam(model.parameters(), lr=1e-2), model)
+    x, y = torch.randn(32, 5), torch.randn(32, 1)
+    return model, opt, x, y
+
+
+def test_diagnostics_do_not_touch_live_dopr_cache():
+    from snr_grad import GGNCurvature, collect_microbatch_gradients
+    from snr_grad.curvature import collect_activation_snapshot
+
+    def loss_fn(m, chunk):
+        return nn.functional.mse_loss(m(chunk[0]), chunk[1])
+
+    results = []
+    for probe in (False, True):
+        model, opt, x, y = _dopr_setup()
+        opt.zero_grad()
+        loss_fn(model, (x, y)).backward()
+        before = {m: {k: (v.clone() if torch.is_tensor(v) else v) for k, v in acc.items()}
+                  for m, acc in opt.ap._accum.items()}
+        if probe:
+            xp, yp = torch.randn(16, 5) * 3, torch.randn(16, 1)
+            collect_microbatch_gradients(model, loss_fn, (xp, yp), num_splits=4)
+            ggn = GGNCurvature(model, xp, lambda out: nn.functional.mse_loss(out, yp))
+            ggn.matvec({p: torch.ones_like(p) for p in model.parameters()})
+            snap = collect_activation_snapshot(model, lambda m: m(xp))
+            assert len(snap) == 2          # the snapshot's own hooks still capture
+            assert opt.ap._accum.keys() == before.keys()
+            for m, acc in opt.ap._accum.items():
+                assert acc["count"] == before[m]["count"]
+                assert torch.equal(acc["gram"], before[m]["gram"])
+        opt.step()
+        results.append([p.detach().clone() for p in model.parameters()])
+    for a, b in zip(*results):
+        assert torch.equal(a, b)
+
+
+def test_isolated_capture_allows_listed_preconditioner_and_nests():
+    from snr_grad import isolated_activation_capture
+
+    model, opt, x, _ = _dopr_setup()
+    with isolated_activation_capture():
+        model(x)
+    assert not opt.ap._accum
+    with isolated_activation_capture(opt.ap):
+        with isolated_activation_capture():
+            model(x)                       # inner block allows nobody
+        assert not opt.ap._accum
+        model(x)
+    assert len(opt.ap._accum) == 2
+
+
+def test_noise_samples_follow_stored_device():
+    from snr_grad import CovarianceFactorNoise, ResampledProbeNoise
+
+    dev = torch.randn(4, 6, device="meta")
+    gen = torch.Generator().manual_seed(0)
+    for noise in (GaussianProbeNoise(dev, 2, 8), ResampledProbeNoise(dev, 2, 8, sign_flip=True),
+                  CovarianceFactorNoise(torch.randn(6, 3, device="meta"), 8)):
+        assert noise(None, 1.0, 0, gen).device.type == "meta"
+
+
+def test_low_rank_build_vectors_on_parameter_device():
+    """The private CPU generator's samples must reach the proxy on the parameters' device."""
+    from snr_grad import CurvatureProxy
+    from snr_grad.curvature import CurvatureMetadata
+
+    class Recorder(CurvatureProxy):
+        def __init__(self):
+            self.metadata = CurvatureMetadata(name="recorder", psd=True)
+            self.devices = []
+
+        def matvec(self, update):
+            self.devices += [u.device.type for u in update.values()]
+            raise RuntimeError("stop")
+
+    p = nn.Parameter(torch.zeros(6, device="meta"))
+    rec = Recorder()
+    with pytest.raises(RuntimeError, match="stop"):
+        LowRankCurvature.from_proxy(rec, [p], rank=2)
+    assert rec.devices == ["meta"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_low_rank_and_noise_on_cuda():
+    p = nn.Parameter(torch.zeros(8, device="cuda", dtype=torch.float64))
+    h = torch.diag(torch.arange(1.0, 9.0, dtype=torch.float64, device="cuda"))
+    low = LowRankCurvature.from_proxy(ExactQuadraticCurvature([p], h), [p], rank=3)
+    assert low.eigenvalues.device.type == "cuda"
+    assert low.eigenvalues[0].item() == pytest.approx(8.0, rel=1e-6)
+    noise = GaussianProbeNoise(torch.randn(4, 8, device="cuda", dtype=torch.float64), 2, 8)
+    assert noise(None, 1.0, 0, torch.Generator().manual_seed(0)).device.type == "cuda"

@@ -147,9 +147,10 @@ class GaussianProbeNoise(_ScaledNoise):
     def __call__(
         self, delta: Tensor, loss_ratio: float, step: int, generator: torch.Generator
     ) -> Tensor:
+        # Sampled on the (CPU) private generator, then moved to the stored tensor's device.
         z = torch.randn(
             self.deviations.shape[0], generator=generator, dtype=self.deviations.dtype
-        )
+        ).to(self.deviations.device)
         return self._scale(loss_ratio, generator) * self._coef * (z @ self.deviations)
 
 
@@ -199,10 +200,10 @@ class ResampledProbeNoise(_ScaledNoise):
         self, delta: Tensor, loss_ratio: float, step: int, generator: torch.Generator
     ) -> Tensor:
         k = self.deviations.shape[0]
-        idx = torch.randint(0, k, (self.m,), generator=generator)
+        idx = torch.randint(0, k, (self.m,), generator=generator).to(self.deviations.device)
         picked = self.deviations[idx]
         if self.sign_flip:
-            signs = torch.randint(0, 2, (self.m, 1), generator=generator).to(picked.dtype) * 2 - 1
+            signs = torch.randint(0, 2, (self.m, 1), generator=generator).to(picked.device, picked.dtype) * 2 - 1
             picked = picked * signs
         return self._scale(loss_ratio, generator) * self._coef * picked.sum(0)
 
@@ -228,7 +229,7 @@ class CovarianceFactorNoise(_ScaledNoise):
     def __call__(
         self, delta: Tensor, loss_ratio: float, step: int, generator: torch.Generator
     ) -> Tensor:
-        z = torch.randn(self.factor.shape[1], generator=generator, dtype=self.factor.dtype)
+        z = torch.randn(self.factor.shape[1], generator=generator, dtype=self.factor.dtype).to(self.factor.device)
         return self._scale(loss_ratio, generator) * (self.factor @ z) / math.sqrt(self.batch_size)
 
 

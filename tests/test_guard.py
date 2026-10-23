@@ -227,3 +227,14 @@ def test_invalid_config_and_misuse():
     guard = MemoryGuard(torch.optim.Adam([x], lr=0.1))
     with pytest.raises(RuntimeError):
         guard.guard_()
+
+
+def test_step_without_gradients_is_a_no_op():
+    x = nn.Parameter(torch.ones(3))
+    opt = GuardedOptimizer(torch.optim.AdamW([x], lr=0.1))
+    opt.zero_grad(set_to_none=True)
+    opt.step()                                  # no parameter has a gradient
+    assert torch.equal(x.detach(), torch.ones(3))
+    x.grad = torch.ones(3)
+    opt.step()                                  # and the next real step still works
+    assert float(x.detach().max()) < 1.0
