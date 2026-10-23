@@ -424,3 +424,15 @@ For M4 with Adam, the controller should therefore watch the optimizer's memory a
 as curvature and noise. The simulator could capture this mechanism only if it replayed
 `v_hat` over a horizon long enough for the memory to decay (hundreds to thousands of
 steps at `beta2 = 0.999`) on the coordinates that carry it.
+
+### 12.4 Mitigation (study E10)
+
+On the spiking configuration of E9, bounding Adam's per-coordinate update ratio
+`|m_hat|/(sqrt(v_hat)+eps)` at 1 removes the large spikes (6 of 6 runs spiking, up to
+24.5, becomes 2 of 6, at most 1.3) without changing the loss on either language tested.
+Refilling `v_hat` instead of clipping the step is slightly stronger. `beta1 = 0.98` and
+`beta2 = 0.95` also work but change the optimizer everywhere; AMSGrad only partly helps
+and `eps` on biases does not. For M4 with Adam, this suggests a simple default: a
+memory guard inside the optimizer, plus the overshoot signal as a monitor, with the
+curvature and noise machinery reserved for the noise-driven instabilities it was built
+for.

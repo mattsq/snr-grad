@@ -81,6 +81,27 @@ and gradient covariance are exact. Stability edges come from the first-round run
   - Along the way: the E7 sharpness rule used the SGD threshold (2) instead of Adam's
     (3.8); corrected.
 
+- **Adam from another angle: preconditioner memory (E9).** After a literature survey, we
+  tested whether gradient noise protects Adam from second-moment (memory) spikes.
+  - On a quadratic it does, completely, and the edge-oscillation amplitude follows a
+    closed form within a constant factor of 20-50.
+  - Tiny LMs on a *confident* language (no copy rule, temperature 0.03) produce the
+    first large Adam spikes of this study: severity 2.3-24.5 in 5 of 5 seeds at
+    `beta2 = 0.999`, against 1 of 5 at 0.95. The noise-protection index and every
+    curvature sensor miss them.
+  - The spikes are carried by a few converged bias vectors whose normalized update
+    jumps from 0.03 lr to 3-5 lr. That overshoot is bounded by
+    `A = max_k (1-beta1^k)/sqrt(1-beta2^k)` (6.6 at `beta2 = 0.999`, 1.1 at 0.95). At
+    equal A, a high `beta1` keeps it far below the bound and prevents spikes.
+  - The realized overshoot `max |m|/sqrt(v_hat)`, read for free from the optimizer
+    state, separates spiking from quiet runs with AUROC 0.97.
+
+- **Mitigation (E10).** Bounding Adam's per-coordinate update ratio at 1 (clipping it,
+  or refilling `v_hat` where it would exceed 1) cuts spiking runs from 6 of 6 to 2 of 6
+  and the largest severity from 24.5 to about 1, with no loss cost on either language.
+  `beta1 = 0.98` (0 of 6) and `beta2 = 0.95` (1 of 6) also work. AMSGrad only partly
+  helps (one spike of 19.4), and a larger `eps` on biases does not help at all.
+
 ## E0 - incremental information beyond sharpness (`e0_incremental.py`)
 
 Uses the first-round held-out checkpoints. It reports the partial Spearman correlation
@@ -632,6 +653,62 @@ noise floor is not visible in the network-level `R_floor`. The curvature-based
 sensors of this project (edge ratio, `Phi`, the simulator built on them) are blind to
 this mechanism; the overshoot `max |m|/sqrt(v_hat)` per tensor, bounded by
 `A(beta1, beta2)`, is the variable to watch for Adam.
+
+## E10 - mitigating the Adam memory spikes (`e10_mitigation.py`)
+
+**Settings.**
+- Spiking setting: the E9c configuration (confident language, B = 32, lr = 0.01,
+  `(beta1, beta2) = (0.9, 0.999)`, 3000 steps), with 6 seeds per variant. All variants
+  use the same seeds and data order.
+- Progress check: the standard E7/E8 language (temperature 0.5, copy rule 0.3), where
+  nothing spikes, with 2 seeds per variant.
+- "Overshoot" is the largest `|Delta theta| / lr` over all coordinates after step 500.
+- "Late loss" is the median held-out loss over steps 2000-3000. For AdamW it is 0.1548
+  on the confident language and 1.680 on the standard one.
+- The guarded optimizer with no limit reproduces torch Adam (difference 2e-16).
+
+| variant | runs with an event | severity >= 1 | largest severity | late loss, paired change vs AdamW | standard language: late loss change | overshoot |
+| --- | --- | --- | --- | --- | --- | --- |
+| AdamW (baseline) | 6 of 6 | 6 | 24.5 (median 4.1) | - | - | 5.1-6.0 |
+| **cap**: clip `|m_hat|/(sqrt(v_hat)+eps)` at 1 per coordinate | 2 of 6 | 1 | 1.3 | -0.0004 | +0.0001 | 1.0 |
+| **refill**: where that ratio exceeds 1, raise `v_hat` to make it 1 | 2 of 6 | 0 | 0.9 | -0.0006 | -0.0004 | 1.0 |
+| AMSGrad (`v_hat` never decreases) | 2 of 6 | 2 | 19.4 | -0.0005 | -0.0050 | 2.0-5.7 |
+| `eps = 1e-4` on 1-D parameters | 5 of 6 | 5 | 14.0 | -0.0002 | +0.0009 | 4.5-6.0 |
+| `eps = 1e-5` on 1-D parameters | 5 of 6 | 5 | 14.1 | -0.0003 | +0.0004 | 3.4-5.9 |
+| `beta1 = 0.98` | **0 of 6** | 0 | 0.07 | -0.0008 | +0.0012 | 0.7-1.1 |
+| `beta2 = 0.95` | 1 of 6 | 1 | 2.2 | -0.0014 | -0.0022 | 1.1 |
+
+- **Limiting the per-coordinate update ratio removes the large spikes at no cost.**
+  - The cap and the refill both bound the overshoot at 1 lr.
+  - The remaining events are small (severity 0.26-1.3).
+  - The loss is unchanged on both languages (all changes within 0.001 nats).
+  - The refill is slightly stronger, because it also corrects the stale memory for the
+    following steps.
+  - This is a per-coordinate form of the update clipping used in Adafactor and
+    StableAdamW, which clip the RMS of the update per tensor.
+- **`beta1 = 0.98` (0 of 6) and `beta2 = 0.95` (1 of 6) also work,** as E9e predicted.
+  `beta1 = 0.98` is slightly slower early on the standard language (loss at step 1000:
+  1.720 vs 1.710).
+- **AMSGrad helps only partly** (2 of 6, one of severity 19.4). Keeping the maximum
+  `v_hat` stops the memory from decaying. It does not bound the step when a gradient
+  larger than anything remembered arrives, and the overshoot still reached 5.7.
+- **`eps` on the biases and layer norms does not help,** even at the scale of their
+  typical `sqrt(v_hat)` (about 1e-4). Overshoots of 3-6 lr persist, so the stale
+  coordinates are not only the 1-D parameters that E9d's per-tensor diagnostic
+  highlighted.
+- **Correction to E9: spikes do not strictly require an overshoot.**
+  - One `beta2 = 0.95` run reached severity 2.2 with a largest update of 1.08 lr, and a
+    capped run reached 1.3.
+  - Large overshoots remain the signature of the large spikes: every event above
+    severity 3 had an overshoot of at least 3.7 lr.
+  - Smaller events can come from another mechanism.
+
+**Verdict.** On this setting, a one-line change to Adam removes the memory spikes with
+no measurable cost: bound the per-coordinate update ratio, preferably by refilling
+`v_hat`. Changing `beta1` or `beta2` does nearly as well, but it changes the optimizer
+everywhere, while the guard acts only on coordinates whose memory is stale. These are
+small models with 6 seeds per variant, so a test at a larger scale should come before
+treating this as a general recommendation.
 
 ## Library changes made during the study
 

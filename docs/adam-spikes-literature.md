@@ -105,5 +105,11 @@ Details are in the study README (section E9).
   well below the bound, which matches the mitigations reported by Bai et al. and the
   phase diagram's dependence on `(1-beta2)/(1-beta1)`.
 - **A free sensor.** The realized overshoot `max |m|/sqrt(v_hat)` per tensor separates
-  spiking from quiet runs with AUROC 0.97. It is a near-necessary condition (no run
-  below 1.85 lr spiked) but not a precise timer.
+  spiking from quiet runs with AUROC 0.97. Among E9's runs no run below 1.85 lr
+  spiked, but E10 found two smaller events (severity 1.3 and 2.2) at about 1 lr, so it
+  marks the large spikes, not every event. It is not a precise timer either.
+- **Mitigation (E10).** Bounding the per-coordinate update ratio at 1, by clipping or
+  by refilling `v_hat`, removed the large spikes at no loss cost; `beta1 = 0.98` and
+  `beta2 = 0.95` also worked, AMSGrad only partly, and `eps` on biases not at all. The
+  guard is a per-coordinate relative of the update clipping in Adafactor and
+  StableAdamW.
