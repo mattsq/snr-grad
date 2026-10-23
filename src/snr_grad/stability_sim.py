@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 
@@ -597,6 +598,16 @@ class QuadraticStabilitySimulator:
             modes = modes.to(self.theta0.dtype)
         det, _, _ = self._trajectory(horizon, None, lr, lr_schedule, None, divergence_factor)
         det_t = torch.tensor(det, dtype=torch.float64)
+        if self.loss0 >= 0 and float(det_t.min()) < 0:
+            warnings.warn(
+                f"QuadraticStabilitySimulator: the noiseless surrogate loss fell to "
+                f"{float(det_t.min()):.3g} (< 0, from {self.loss0:.3g}). The curvature has "
+                f"directions with almost no restoring force (e.g. a GGN on fewer samples x "
+                f"outputs than parameters), so excursion statistics are unreliable. Pass "
+                f"subspace= (e.g. LowRankCurvature.from_proxy(...).eigenvectors).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         ex_kw = {"window": max(5, horizon // 20), "divergence_factor": divergence_factor}
         ex_kw.update(excursion_kwargs or {})
         all_losses, all_gates, all_proj, reports, excess = [], [], [], [], []

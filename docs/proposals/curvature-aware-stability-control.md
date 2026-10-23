@@ -343,3 +343,33 @@ AdamW, SNRAdamW; 240 held-out checkpoints):
   well (0.96), but it costs more than running them; the activation-proxy simulator fails.
 - **M4 was not attempted**, per the go/no-go rule. The useful deliverable so far is the
   diagnostic and the benchmark, as section 10 anticipated.
+
+## 12. Follow-up study
+
+[`studies/stability_study`](../../studies/stability_study/README.md) tests the first-round
+conclusions more deeply. The findings that change the picture:
+
+- **H1 holds once noise varies independently of sharpness.** At a fixed learning rate,
+  varying only the batch size leaves SGD's sharpness constant (it cannot rank), while
+  the noise penalty and the simulator rank severity at about 0.95.
+- **One-step sensors are not enough for Adam.** On a concentrated spectrum, AdamW spike
+  severity *increases* with batch size (B=2: 5.0, B=64: 8.4). Only the multi-step
+  simulator ranks every (optimizer, spectrum) cell correctly. This supports H3, and it
+  argues against any controller that responds to spike risk by simply raising the batch
+  size.
+- **The simulator is calibrated on PLRF.** Resampled noise from 128 microbatches with
+  loss-proportional scaling gives an event-fraction error of 0.07-0.09 and no bias; the
+  oracle noise gives 0.045 (M3 is strengthened).
+- **SNR gating (Stage 2):** it suppresses spikes and improves progress at a moderately
+  concentrated spectrum. At the most concentrated spectrum the default gate does not
+  suppress them, and a slow variance EMA (`rho=0.999`) produces rare but very large
+  excursions. The soft gate suppresses spikes at a modest cost in progress.
+- **Networks:** truncated curvature (low-rank, or a GGN on fewer samples x outputs than
+  parameters) makes the surrogate unbounded below unless the dynamics are projected
+  onto the curvature subspace. With projection, a rank 4-16 GGN ranks MLP severity at
+  0.85-0.98 up to 284k parameters. A cost advantage over real continuations is not yet
+  shown.
+
+M4 (a controller) remains unstarted. The evidence now favours a simulator-based risk
+check over one-step sensors, but the cost case needs a model where real steps are
+expensive.

@@ -193,7 +193,8 @@ def test_low_rank_simulation_projects_onto_subspace():
     low = LowRankCurvature.from_proxy(ExactQuadraticCurvature([p], h), [p], rank=4)
     g0 = torch.randn(n, generator=gen, dtype=torch.float64)
     unprojected = QuadraticStabilitySimulator([p], opt, low, g0, None, loss0=1.0, subspace=None)
-    s_bad = unprojected.run(1, 200).summary()
+    with pytest.warns(RuntimeWarning, match="surrogate loss fell"):
+        s_bad = unprojected.run(1, 200).summary()
     assert s_bad["surrogate_below_zero"]
     auto = QuadraticStabilitySimulator([p], opt, low, g0, None, loss0=1.0)
     assert auto.subspace is not None
