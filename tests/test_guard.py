@@ -370,6 +370,8 @@ def test_geometry_detection():
     assert _is_orthogonalized(w, {"ns_steps": 5}, "auto")
     assert _is_orthogonalized(w, {"muon_ns_steps": 5}, "auto")
     assert _is_orthogonalized(conv, {"use_muon": True}, "auto")
+    assert not _is_orthogonalized(conv, {"muon_ns_steps": 5}, "auto")   # SNRMuon steps convs per coordinate
+    assert not _is_orthogonalized(conv, {"ns_steps": 5}, "auto")
     assert not _is_orthogonalized(w, {"use_muon": False, "ns_steps": 5}, "auto")
     assert not _is_orthogonalized(b, {"ns_steps": 5}, "auto")
     assert not _is_orthogonalized(w, {"betas": (0.9, 0.999)}, "auto")
@@ -404,7 +406,7 @@ def test_muon_with_aux_adam_style_optimizer():
                         buf.lerp_(p.grad, 1 - group["momentum"])
                         mat = p.grad.lerp(buf, group["momentum"]).reshape(p.shape[0], -1)
                         u, _, vh = torch.linalg.svd(mat, full_matrices=False)
-                        scale = max(1.0, mat.shape[0] / mat.shape[1]) ** 0.5
+                        scale = max(1.0, p.grad.size(-2) / p.grad.size(-1)) ** 0.5   # Keller: 1 for square kernels
                         p.add_((u @ vh).reshape(p.shape), alpha=-group["lr"] * scale)
                     else:
                         if not st:
@@ -419,7 +421,7 @@ def test_muon_with_aux_adam_style_optimizer():
                         v_hat = st["exp_avg_sq"] / (1 - b2 ** st["step"])
                         p.add_(m_hat / (v_hat.sqrt() + group["eps"]), alpha=-group["lr"])
 
-    conv = nn.Parameter(torch.randn(8, 3, 2, 2, dtype=torch.float64))
+    conv = nn.Parameter(torch.randn(16, 2, 2, 2, dtype=torch.float64))   # (16, 8) flattened: rows/cols = 2
     bias = nn.Parameter(torch.zeros(8, dtype=torch.float64))
     opt = GuardedOptimizer(MuonWithAuxAdam([
         dict(params=[conv], use_muon=True, lr=0.02, momentum=0.95, weight_decay=0.01),
@@ -429,11 +431,48 @@ def test_muon_with_aux_adam_style_optimizer():
     gen = torch.Generator().manual_seed(8)
     for t, g in enumerate(grads):
         before_c, before_b = conv.detach().clone(), bias.detach().clone()
-        conv.grad = torch.randn(8, 3, 2, 2, generator=gen, dtype=torch.float64)
+        conv.grad = torch.randn(16, 2, 2, 2, generator=gen, dtype=torch.float64)
         bias.grad = g
         opt.step()
-        dc = (conv.detach() - before_c * (1 - 0.02 * 0.01)).reshape(8, -1)
+        dc = (conv.detach() - before_c * (1 - 0.02 * 0.01)).reshape(16, -1)
         assert _spec(dc) <= 0.02 * (1 + 1e-6)          # exact SVD steps: power iteration is exact here
         assert float((bias.detach() - before_b).abs().max()) <= 0.01 * (1 + 1e-9)
     assert opt.guard_stats["max_spectral_ratio"] == pytest.approx(1.0, abs=1e-6)   # an exact polar factor
     assert max(adam_update_overshoot(opt).values()) <= 1.0 + 1e-9
+
+
+def test_stacked_matrices_are_capped_per_slice():
+    """A 3-D ``use_muon`` parameter is a stack of matrices (Keller's batched Newton-Schulz)."""
+
+    class StackedMuon(torch.optim.Optimizer):
+        def __init__(self, params, lr):
+            super().__init__(params, dict(lr=lr, use_muon=True, weight_decay=0.0))
+
+        @torch.no_grad()
+        def step(self):
+            for group in self.param_groups:
+                for p in group["params"]:
+                    u, _, vh = torch.linalg.svd(p.grad, full_matrices=False)    # batched polar factor
+                    p.sub_(group["lr"] * (u @ vh))
+                    p[0].sub_(group["lr"] * 3.0 * (u[0] @ vh[0]))              # slice 0 overshoots 4x
+
+    w = nn.Parameter(torch.zeros(3, 16, 16, dtype=torch.float64))
+    opt = GuardedOptimizer(StackedMuon([w], lr=0.1), MemoryGuardConfig(power_iters=None, track_stats=True))
+    for g in _muon_grads(5, (3, 16, 16), seed=4):
+        before = w.detach().clone()
+        w.grad = g
+        opt.step()
+        steps = [_spec(w.detach()[i] - before[i]) / 0.1 for i in range(3)]
+        assert steps[0] == pytest.approx(1.25, rel=1e-9)                # capped
+        assert steps[1] == pytest.approx(1.0, rel=1e-9) and steps[2] == pytest.approx(1.0, rel=1e-9)
+        assert opt.guard_stats["rescaled"] == 1
+        assert opt.guard_stats["max_spectral_ratio"] == pytest.approx(4.0, rel=1e-9)
+
+
+def test_exact_norm_passes_non_finite_steps_through():
+    """With ``power_iters=None`` a NaN gradient gives a NaN step, as in the base, not an SVD error."""
+    w = nn.Parameter(torch.randn(8, 6, dtype=torch.float64))
+    opt = GuardedOptimizer(torch.optim.Muon([w], lr=0.02), MemoryGuardConfig(power_iters=None, track_stats=True))
+    w.grad = torch.full((8, 6), float("nan"), dtype=torch.float64)
+    opt.step()
+    assert bool(torch.isnan(w.detach()).all())

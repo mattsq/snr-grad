@@ -611,14 +611,18 @@ for opt in (muon, adamw):
 muon_update_gain()    # 1.2024: the largest Muon step, in units of lr_eff
 ```
 
-- **Detection** (`geometry="auto"`). A matrix is treated in spectral norm when its
-  parameter group has `use_muon=True` (Keller Jordan's `MuonWithAuxAdam` and its
-  descendants, so one wrapper covers both halves), or has `ns_steps`
-  (`torch.optim.Muon`) or `muon_ns_steps` (`SNRMuon`). `geometry="spectral"` or
-  `"coordinate"` overrides the detection.
+- **Detection** (`geometry="auto"`). A parameter is treated in spectral norm when its
+  group has `use_muon=True` (Keller Jordan's `MuonWithAuxAdam` and its descendants, so
+  one wrapper covers both halves), or when it is 2-D and its group has `ns_steps`
+  (`torch.optim.Muon`) or `muon_ns_steps` (`SNRMuon`, which steps conv kernels per
+  coordinate). Keller's single-device `Muon` has neither key; pass
+  `geometry="spectral"` for it. `geometry="spectral"` or `"coordinate"` overrides the
+  detection.
+- **Shapes.** As in Keller's Muon, a 3-D parameter is a stack of matrices, each capped
+  on its own, and a conv kernel is flattened to `(out, rest)`.
 - **Nominal step.** `lr_eff` follows `torch.optim.Muon`'s `adjust_lr_fn`, and Jordan's
-  `sqrt(max(1, rows/cols))` for `use_muon` groups. `spectral_lr_scale(param, group)`
-  covers other conventions.
+  `sqrt(max(1, shape[-2]/shape[-1]))` for `use_muon` groups. `spectral_lr_scale(param,
+  group)` covers other conventions.
 - **Plain Muon is untouched by default.** Newton-Schulz output never exceeds
   `muon_update_gain()`: 1.2024 for the standard coefficients, at any number of
   iterations. The default `spectral_limit=1.25` sits just above that, and the tests
@@ -627,7 +631,8 @@ muon_update_gain()    # 1.2024: the largest Muon step, in units of lr_eff
     row- or element-wise second moments as in NorMuon, gates, custom scalings.
   - `spectral_limit=1.0` enforces the nominal step. Use it with `power_iters=None`:
     power iteration converges slowly on Muon's nearly flat spectrum, and with 3
-    iterations steps exceeded the bound by up to 13%.
+    iterations steps exceeded the bound by up to 13%. For bfloat16 or float16 parameters the cap stays
+    approximate even then, because the result is rounded back onto the parameter's grid.
 - **What it does not do.** Muon's documented failure is cumulative: flat update spectra
   grow weight norms and attention logits over many bounded steps (Musec,
   arXiv:2609.11655; Kimi K2's QK-Clip, arXiv:2507.20534). A per-step guard cannot see

@@ -55,7 +55,10 @@ coordinate; it is on the ``lr`` scale in spectral norm (Muon is steepest descent
 spectral norm). So for matrices that a Muon-style optimizer orthogonalizes, the guard
 bounds the step's *spectral norm* instead: ``||delta W||_2 <= spectral_limit * lr_eff``,
 where ``lr_eff`` is the lr after Muon's shape-dependent adjustment. A step above the bound
-is scaled down as a whole. Such matrices have no second moment, so nothing is refilled.
+is scaled down as a whole. Plain Muon keeps no second moment on its matrices, so nothing
+is refilled there; an optimizer that keeps Adam state on them (:class:`SNRMuon`, whose
+Newton-Schulz input is ``m_hat / (sqrt(v_hat) + eps)``) is refilled as usual, which stops a
+stale coordinate from dominating the orthogonalized direction.
 For plain Muon this is a safety net rather than a correction: Newton-Schulz output never
 exceeds :func:`snr_grad.muon_update_gain` (1.20 for the standard coefficients), and the
 default ``spectral_limit=1.25`` sits just above it. It bounds variants whose step can grow
@@ -66,11 +69,15 @@ half still overshot to 3-5 lr under Muon; guarding it left no loss events. Muon'
 failure at high lr, cumulative growth of weight norms and attention logits, happens
 over many bounded steps; a per-step guard does not address it (weight decay does).
 
-A matrix counts as orthogonalized (``geometry="auto"``) when its parameter group has a
+A parameter counts as orthogonalized (``geometry="auto"``) when its group has a
 ``use_muon`` flag set to True (Keller Jordan's ``MuonWithAuxAdam`` and its descendants),
-or, without that flag, a Newton-Schulz setting: ``ns_steps`` (``torch.optim.Muon``) or
-``muon_ns_steps`` (:class:`SNRMuon`). ``geometry="spectral"`` or ``"coordinate"`` forces
-one treatment for every parameter with two or more dimensions.
+or, without that flag, is 2-D and its group has a Newton-Schulz setting: ``ns_steps``
+(``torch.optim.Muon``) or ``muon_ns_steps`` (:class:`SNRMuon`, which orthogonalizes only
+2-D parameters). Keller's single-device ``Muon`` has neither key; use
+``geometry="spectral"`` for it. ``geometry="spectral"`` or ``"coordinate"`` forces one
+treatment for every parameter with two or more dimensions. As in Keller's Muon, a 3-D
+parameter is a stack of matrices, each capped on its own, and a parameter with four or
+more dimensions (a conv kernel) is flattened to ``(out, rest)``.
 
 Scope: optimizers whose parameters hold the iterate. Per coordinate:
 ``torch.optim.Adam`` / ``AdamW`` (including ``amsgrad``, ``foreach`` and ``fused``),
@@ -122,14 +129,17 @@ class MemoryGuardConfig:
             ``lr`` and the nominal spectral step of ``param``. ``None`` follows the base:
             ``torch.optim.Muon``'s ``adjust_lr_fn`` (``"original"``:
             ``sqrt(max(1, rows/cols))``; ``"match_rms_adamw"``: ``0.2 sqrt(max(rows, cols))``),
-            ``sqrt(max(1, rows/cols))`` for ``use_muon`` groups, and 1 otherwise.
+            ``sqrt(max(1, shape[-2]/shape[-1]))`` for ``use_muon`` groups (Keller's rule), and 1
+            otherwise.
         power_iters: Power-iteration steps per matrix and step for ``||delta W||_2``,
             warm-started from the previous step. The estimate approaches the norm from
             below. It is accurate when one direction dominates the step (the overshoot
             the default cap is for), but slow on Muon's nearly flat spectrum: with
             ``spectral_limit=1`` (inside Muon's own range) steps exceeded the bound by up
             to 13% at 3 iterations and 4% at 20. ``None`` computes the norm exactly (one
-            SVD per matrix and step) for a strict cap.
+            SVD per matrix and step) for a strict cap; for bfloat16 or float16 parameters
+            the cap is still approximate, because the result is rounded back onto the
+            parameter's grid.
     """
 
     limit: float = 1.0
@@ -188,12 +198,19 @@ def _is_orthogonalized(p: Tensor, group: dict, geometry: str) -> bool:
         return True
     if "use_muon" in group:
         return bool(group["use_muon"])
-    return "ns_steps" in group or "muon_ns_steps" in group
+    return p.ndim == 2 and ("ns_steps" in group or "muon_ns_steps" in group)
+
+
+def _as_matrices(t: Tensor) -> Tensor:
+    """``t`` as a batch of matrices: 2-D -> 1 matrix, 3-D -> a stack, more -> ``(out, rest)``."""
+    if t.ndim == 3:
+        return t
+    return t.reshape(1, t.shape[0], -1)
 
 
 def _default_spectral_lr_scale(p: Tensor, group: dict) -> float:
     """Factor between ``group["lr"]`` and the nominal spectral step of ``p``."""
-    rows, cols = p.shape[0], p.numel() // max(p.shape[0], 1)
+    rows, cols = p.shape[-2], p.shape[-1]           # as torch Muon and Keller's muon_update
     if "adjust_lr_fn" in group:                   # torch.optim.Muon; None means "original"
         fn = group["adjust_lr_fn"] or "original"
     else:
@@ -333,41 +350,49 @@ class MemoryGuard:
 
     def _cap_spectral(self, p: Tensor, anchor: Tensor, group: dict, lr: float,
                       ratios: Optional[list[Tensor]], rescaled: list[Tensor]) -> None:
-        """Scale this step's update of matrix ``p`` so that ``||delta W||_2 <= spectral_limit * lr_eff``."""
+        """Scale this step's update of ``p`` so that ``||delta W||_2 <= spectral_limit * lr_eff`` per matrix."""
         scale_fn = self.config.spectral_lr_scale or _default_spectral_lr_scale
         nominal = lr * float(scale_fn(p, group))
         bound = self.config.spectral_limit * nominal
         if not math.isfinite(bound) and ratios is None:
             return
         delta = p.sub_(anchor)                            # p now holds this step's update
-        sigma = self._spectral_norm(p, delta.reshape(delta.shape[0], -1))
+        sigma = self._spectral_norm(p, _as_matrices(delta))           # one norm per matrix
         if ratios is not None:
-            ratios.append(sigma / nominal)
+            ratios.append((sigma / nominal).max())
             if math.isfinite(bound):
                 rescaled.append((sigma > bound).sum())
         if math.isfinite(bound):
-            delta.mul_((bound / sigma).clamp_(max=1.0).to(delta.dtype))   # sigma = 0 gives inf -> 1
+            factor = (bound / sigma).clamp_(max=1.0)                   # sigma = 0 gives inf -> 1
+            delta.mul_(factor.view(-1, 1, 1) if delta.ndim == 3 else factor.reshape(()))
         delta.add_(anchor)
 
-    def _spectral_norm(self, p: Tensor, mat: Tensor) -> Tensor:
-        """Warm-started power-iteration estimate of ``||mat||_2`` (a 0-d tensor, no sync)."""
-        dtype = mat.dtype if mat.dtype in (torch.float32, torch.float64) else torch.float32
-        m = mat.to(dtype)
+    def _spectral_norm(self, p: Tensor, mats: Tensor) -> Tensor:
+        """``||M||_2`` for each matrix of the batch ``mats`` (shape ``(batch,)``, no sync).
+
+        Warm-started power iteration, or exact with ``power_iters=None``. A matrix with a
+        non-finite entry gets a NaN norm, so a NaN step stays NaN as in the base.
+        """
+        dtype = mats.dtype if mats.dtype in (torch.float32, torch.float64) else torch.float32
+        m = mats.to(dtype)
         if self.config.power_iters is None:
-            return torch.linalg.matrix_norm(m, ord=2)
+            finite = torch.isfinite(m)
+            sigma = torch.linalg.matrix_norm(torch.where(finite, m, 0.0), ord=2)   # SVD rejects inf/NaN
+            return torch.where(finite.flatten(1).all(1), sigma, float("nan"))
         v = self._vectors.get(p)
-        if v is None or v.shape[0] != m.shape[1] or v.dtype != dtype:
+        if v is None or v.shape != (m.shape[0], m.shape[2]) or v.dtype != dtype or v.device != m.device:
             g = torch.Generator().manual_seed(0)
-            v = torch.randn(m.shape[1], generator=g, dtype=torch.float64).to(m.device, dtype)
-            v = v / v.norm()
+            v = torch.randn(m.shape[0], m.shape[2], generator=g, dtype=torch.float64).to(m.device, dtype)
+            v = v / v.norm(dim=1, keepdim=True)
         tiny = torch.finfo(dtype).tiny
-        sigma = torch.zeros((), dtype=dtype, device=m.device)
+        sigma = torch.zeros(m.shape[0], dtype=dtype, device=m.device)
         for _ in range(self.config.power_iters):
-            u = m @ v
-            u = u / u.norm().clamp_min(tiny)
-            w = m.T @ u
-            sigma = w.norm()
-            v = torch.where(sigma > 0, w / sigma.clamp_min(tiny), v)    # keep the start on a zero step
+            u = (m @ v.unsqueeze(-1)).squeeze(-1)
+            u = u / u.norm(dim=1, keepdim=True).clamp_min(tiny)
+            w = (m.transpose(1, 2) @ u.unsqueeze(-1)).squeeze(-1)
+            sigma = w.norm(dim=1)
+            s = sigma.unsqueeze(1)
+            v = torch.where(s > 0, w / s.clamp_min(tiny), v)            # keep the start on a zero step
         self._vectors[p] = v
         return sigma
 
