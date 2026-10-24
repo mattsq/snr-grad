@@ -418,3 +418,34 @@ def adam_reactivation_gain(
     decay = 0.0 if math.isinf(silence) else beta2 ** silence
     v = decay * beta2 ** k / max(return_ratio, 1e-300) + (1 - beta2 ** k)
     return float(((1 - beta1 ** k) / v.sqrt()).max())
+
+
+def muon_update_gain(
+    ns_coefficients: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
+    steps: int = 5,
+    grid: int = 1_000_001,
+) -> float:
+    """Largest singular value of a Muon step, in units of its (adjusted) lr.
+
+    Muon divides the momentum ``M`` by its Frobenius norm, so every singular value lies in
+    ``(0, 1]``, and then applies ``steps`` Newton-Schulz iterations
+    ``x <- a x + b x^3 + c x^5`` to each singular value. This returns the maximum of the
+    iterated polynomial over ``(0, 1]``: the most a Muon step can exceed its nominal
+    spectral size ``lr``, whatever the momentum or its history. It is Muon's counterpart of
+    :func:`adam_reactivation_gain`, with two differences: it does not depend on the
+    momentum or on a silence, because Muon keeps no second-moment memory, and it is
+    small: 1.2024 for the default quintic coefficients of Jordan et al. (which trade exact
+    convergence for speed) and 1 for a convergent iteration such as the cubic
+    ``(1.5, -0.5, 0)``. Rounding in bfloat16 can add a little to it.
+
+    Args:
+        ns_coefficients: ``(a, b, c)`` of the quintic iteration.
+        steps: Number of iterations.
+        grid: Number of points scanned on ``(0, 1]``.
+    """
+    a, b, c = (float(x) for x in ns_coefficients)
+    x = torch.linspace(1.0 / grid, 1.0, grid, dtype=torch.float64)
+    for _ in range(steps):
+        x2 = x * x
+        x = x * (a + x2 * (b + c * x2))
+    return float(x.max())

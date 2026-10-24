@@ -587,13 +587,78 @@ Cost:
   and 12% longer. The share falls as forward and backward dominate.
 - `track_stats=True` adds one device sync per step.
 
-Scope: per-coordinate optimizers whose parameters hold the iterate (`Adam`, `AdamW`,
-including `amsgrad`, `foreach` and `fused`; `SNRAdamW`; `MARSSNRAdamW`; `DoPr` around one
-of these). It is not meaningful for the Muon family, whose orthogonalized
-per-coordinate step is not on the `lr` scale, or for the schedule-free optimizers,
-whose parameters hold an interpolation. Like `DoPr`, `GuardedOptimizer` is not a
-`torch.optim.Optimizer` subclass, so attach schedulers to the base. The wrapper calls
-a `closure` once itself, so LBFGS-style optimizers are not supported.
+### Muon-style optimizers
+
+Muon's lr is a step size in *spectral* norm: each step is about `lr_eff * U V^T`, the
+orthogonalized momentum. `lr_eff` is the lr after Muon's shape-dependent adjustment. A
+per-coordinate cap therefore does not fit it. Under `adjust_lr_fn="match_rms_adamw"` a
+typical Muon coordinate already moves about 1.1 lr per step, so a cap at 1 would clip
+every step. For the matrices a Muon-style optimizer orthogonalizes, the guard instead
+bounds `||delta W||_2` at `spectral_limit * lr_eff`, scaling a larger step down as a
+whole. It refills nothing, because there is no second moment. The other parameters
+keep the per-coordinate guard and refill.
+
+```python
+from snr_grad import GuardedOptimizer, MemoryGuardConfig, muon_update_gain
+
+matrices = [p for n, p in model.named_parameters() if p.ndim == 2 and "blocks" in n]
+others = [p for p in model.parameters() if all(p is not m for m in matrices)]
+muon = GuardedOptimizer(torch.optim.Muon(matrices, lr=0.02, adjust_lr_fn="match_rms_adamw"))
+adamw = GuardedOptimizer(torch.optim.AdamW(others, lr=3e-4))      # the Adam memory guard
+for opt in (muon, adamw):
+    opt.step()
+
+muon_update_gain()    # 1.2024: the largest Muon step, in units of lr_eff
+```
+
+- **Detection** (`geometry="auto"`). A parameter is treated in spectral norm when its
+  group has `use_muon=True` (Keller Jordan's `MuonWithAuxAdam` and its descendants, so
+  one wrapper covers both halves), or when it is 2-D and its group has `ns_steps`
+  (`torch.optim.Muon`) or `muon_ns_steps` (`SNRMuon`, which steps conv kernels per
+  coordinate). Keller's single-device `Muon` has neither key; pass
+  `geometry="spectral"` for it. `geometry="spectral"` or `"coordinate"` overrides the
+  detection.
+- **Shapes.** As in Keller's Muon, a 3-D parameter is a stack of matrices, each capped
+  on its own, and a conv kernel is flattened to `(out, rest)`.
+- **Nominal step.** `lr_eff` follows `torch.optim.Muon`'s `adjust_lr_fn`, and Jordan's
+  `sqrt(max(1, shape[-2]/shape[-1]))` for `use_muon` groups. `spectral_lr_scale(param,
+  group)` covers other conventions.
+- **Plain Muon is untouched by default.** Newton-Schulz output never exceeds
+  `muon_update_gain()`: 1.2024 for the standard coefficients, at any number of
+  iterations. The default `spectral_limit=1.25` sits just above that, and the tests
+  check that wrapped Muon matches plain Muon exactly.
+  - The cap is a safety net for variants whose step can exceed the polar factor:
+    row- or element-wise second moments as in NorMuon, gates, custom scalings.
+  - `spectral_limit=1.0` enforces the nominal step. Use it with `power_iters=None`:
+    power iteration converges slowly on Muon's nearly flat spectrum, and with 3
+    iterations steps exceeded the bound by up to 13%. For bfloat16 or float16 parameters the cap stays
+    approximate even then, because the result is rounded back onto the parameter's grid.
+- **What it does not do.** Muon's documented failure is cumulative: flat update spectra
+  grow weight norms and attention logits over many bounded steps (Musec,
+  arXiv:2609.11655; Kimi K2's QK-Clip, arXiv:2507.20534). A per-step guard cannot see
+  that; weight decay bounds it.
+
+Evidence ([study E11](studies/stability_study/README.md); same setting as E10; Muon on
+the hidden matrices, AdamW on the rest):
+- Muon alone removed the large spikes: 1 of 6 runs with an event (severity 0.36),
+  against 6 of 6 for AdamW (up to 13.0). The AdamW half still overshot to 3.4-5.3 lr.
+- With both halves wrapped, 0 of 6 runs had an event, and the loss was unchanged.
+- At Muon lr 0.3 the weight spectral norm reached about 550, and the loss degraded
+  from 0.154 to 0.19-0.24 without isolated spikes. The guard made no difference, as
+  expected. Weight decay 0.1 kept the norm at 25 but did not restore the loss.
+- Literature notes: [`docs/muon-spikes-literature.md`](docs/muon-spikes-literature.md).
+
+Scope: optimizers whose parameters hold the iterate.
+- Per coordinate: `Adam`, `AdamW` (including `amsgrad`, `foreach` and `fused`),
+  `SNRAdamW`, `MARSSNRAdamW`, and `DoPr` around one of these.
+- In spectral norm: `torch.optim.Muon`, `MuonWithAuxAdam`-style optimizers, and the 2-D
+  parameters of `SNRMuon`.
+- Not meaningful for the schedule-free optimizers, whose parameters hold an
+  interpolation.
+
+Like `DoPr`, `GuardedOptimizer` is not a `torch.optim.Optimizer` subclass, so attach
+schedulers to the base. The wrapper calls a `closure` once itself, so LBFGS-style
+optimizers are not supported.
 
 ## Experimental extensions
 
@@ -1114,9 +1179,10 @@ See [Adam memory guard](#adam-memory-guard----preventing-preconditioner-memory-s
 
 - **`GuardedOptimizer(base_optimizer, config=None)`** -- Delegating wrapper: snapshot, `base.step()`, then clip (and refill). Exposes `guard_stats`; other attributes forward to the base.
 - **`MemoryGuard(optimizer, config=None)`** -- External form: `.snapshot_()` before and `.guard_()` after the base step; `.last_stats`.
-- **`MemoryGuardConfig(limit=1.0, mode="refill", decoupled_weight_decay=None, track_stats=False)`** -- `mode` is `"refill"` or `"cap"`; `decoupled_weight_decay=None` auto-detects (`torch.optim.Adam` is coupled, everything else decoupled unless the group says otherwise).
+- **`MemoryGuardConfig(limit=1.0, mode="refill", decoupled_weight_decay=None, track_stats=False, spectral_limit=1.25, geometry="auto", spectral_lr_scale=None, power_iters=3)`** -- `mode` is `"refill"` or `"cap"`; `decoupled_weight_decay=None` auto-detects (`torch.optim.Adam` is coupled, everything else decoupled unless the group says otherwise). `spectral_limit` bounds `||delta W||_2 / lr_eff` for orthogonalized (Muon) matrices; `geometry` is `"auto"`, `"spectral"` or `"coordinate"`; `spectral_lr_scale(param, group)` overrides the factor between the group lr and the nominal spectral step; `power_iters=None` computes `||delta W||_2` exactly (SVD) instead of by warm-started power iteration.
 - **`adam_update_overshoot(optimizer)`** -- Per-parameter `max |m_hat| / (sqrt(v_hat) + eps)` from Adam-style state; a free spike monitor.
 - **`adam_reactivation_gain(beta1, beta2, silence=inf, return_ratio=1.0)`** -- The bound `A` on a reactivated coordinate's step, in units of `lr`.
+- **`muon_update_gain(ns_coefficients=(3.4445, -4.7750, 2.0315), steps=5)`** -- The largest singular value of a Muon step, in units of its adjusted lr (1.2024 for the standard coefficients; 1 for a convergent iteration).
 
 ### Variance estimation (`snr_grad.variance`)
 
